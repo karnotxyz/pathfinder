@@ -112,8 +112,9 @@ pub mod from_parts {
     }
 }
 
-
-pub fn compute_cairo_hinted_class_hash(contract_definition: &json::CairoContractDefinition) -> Result<Felt> {
+pub fn compute_cairo_hinted_class_hash(
+    contract_definition: &json::CairoContractDefinition<'_>,
+) -> Result<Felt> {
     use std::io::Write;
 
     // It's less efficient than tweaking the formatter to emit the encoding but I
@@ -140,18 +141,21 @@ pub fn compute_cairo_hinted_class_hash(contract_definition: &json::CairoContract
     Ok(truncated_keccak(<[u8; 32]>::from(hash.finalize())))
 }
 
-/// Prepares the JSON contract definition for hash calculation by removing unnecessary fields and
-/// ensuring consistency in formatting.
+/// Prepares the JSON contract definition for hash calculation by removing
+/// unnecessary fields and ensuring consistency in formatting.
 ///
-/// This function modifies the input `contract_definition` to ensure it is in a suitable state for
-/// calculating the class hash. It removes the `debug_info` field, checks and removes "accessible_scopes"
-/// and "flow_tracking_data" fields if they are empty or null, and applies a backwards compatibility
-/// hack for missing `compiler_version` by adding extra space to named tuple type definitions.
+/// This function modifies the input `contract_definition` to ensure it is in a
+/// suitable state for calculating the class hash. It removes the `debug_info`
+/// field, checks and removes "accessible_scopes" and "flow_tracking_data"
+/// fields if they are empty or null, and applies a backwards compatibility hack
+/// for missing `compiler_version` by adding extra space to named tuple type
+/// definitions.
 ///
 /// # Errors
 ///
-/// This function returns an error if it fails to modify the contract definition, such as when an
-/// attribute is not an object or when "accessible_scopes" is not an array type.
+/// This function returns an error if it fails to modify the contract
+/// definition, such as when an attribute is not an object or when
+/// "accessible_scopes" is not an array type.
 pub fn prepare_json_contract_definition(
     contract_definition: &mut json::CairoContractDefinition<'_>,
 ) -> Result<(), anyhow::Error> {
