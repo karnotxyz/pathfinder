@@ -5,22 +5,9 @@ use anyhow::{anyhow, Context};
 use futures::{StreamExt, TryStreamExt};
 use pathfinder_common::state_update::{ContractClassUpdate, StateUpdateData};
 use pathfinder_common::{
-    BlockCommitmentSignature,
-    BlockHash,
-    BlockNumber,
-    CasmHash,
-    Chain,
-    ChainId,
-    ClassHash,
-    EventCommitment,
-    PublicKey,
-    ReceiptCommitment,
-    SierraHash,
-    StarknetVersion,
-    StateCommitment,
-    StateDiffCommitment,
-    StateUpdate,
-    TransactionCommitment,
+    BlockCommitmentSignature, BlockHash, BlockNumber, CasmHash, Chain, ChainId, ClassHash,
+    EventCommitment, PublicKey, ReceiptCommitment, SierraHash, StarknetVersion, StateCommitment,
+    StateDiffCommitment, StateUpdate, TransactionCommitment,
 };
 use pathfinder_storage::Storage;
 use starknet_gateway_client::GatewayApi;
@@ -30,11 +17,8 @@ use tokio::sync::mpsc;
 use tracing::Instrument;
 
 use crate::state::block_hash::{
-    calculate_event_commitment,
-    calculate_receipt_commitment,
-    calculate_transaction_commitment,
-    verify_block_hash,
-    BlockHeaderData,
+    calculate_event_commitment, calculate_receipt_commitment, calculate_transaction_commitment,
+    verify_block_hash, BlockHeaderData,
 };
 use crate::state::sync::class::{download_class, DownloadedClass};
 use crate::state::sync::SyncEvent;
@@ -286,9 +270,6 @@ where
             }
         };
 
-        println!(">> block hash : {:?}", block.block_hash);
-        println!(">> block hash (signature) : {:?}", signature.block_hash);
-
         // An extra sanity check for the signature API.
         anyhow::ensure!(
             block.block_hash == signature.block_hash,
@@ -496,8 +477,6 @@ async fn download_block(
             // sure these are correct first.
             let (send, recv) = tokio::sync::oneshot::channel();
             rayon::spawn(move || {
-                println!(">>> block.block_number {:?}", block.block_number);
-                println!(">>> block.transactions {:?}", block.transactions);
                 let result = block
                     .transactions
                     .par_iter()
@@ -934,9 +913,6 @@ fn verify_block_and_state_update(
     )
     .context("Verify block hash")?;
 
-    println!(">>> block : {:?}", block.block_number);
-    println!(">>> chain id : {:?}", chain_id);
-
     let (transaction_commitment, event_commitment, receipt_commitment) =
         match (block.status, verify_result, mode) {
             (Status::AcceptedOnL1 | Status::AcceptedOnL2, VerifyResult::Match(commitments), _) => {
@@ -948,7 +924,6 @@ fn verify_block_and_state_update(
                 BlockValidationMode::AllowMismatch,
             ) => Ok(Default::default()),
             (_, VerifyResult::Mismatch, BlockValidationMode::Strict) => {
-                println!(">>> block _ number : {:?}", block.block_number);
                 Err(anyhow!("Block hash mismatch"))
             }
             _ => Err(anyhow!(
@@ -1185,30 +1160,15 @@ mod tests {
         use assert_matches::assert_matches;
         use pathfinder_common::macro_prelude::*;
         use pathfinder_common::{
-            BlockHash,
-            BlockId,
-            BlockNumber,
-            BlockTimestamp,
-            Chain,
-            ChainId,
-            ClassHash,
-            ContractAddress,
-            GasPrice,
-            PublicKey,
-            SequencerAddress,
-            StarknetVersion,
-            StateCommitment,
-            StateUpdate,
-            StorageAddress,
-            StorageValue,
+            BlockHash, BlockId, BlockNumber, BlockTimestamp, Chain, ChainId, ClassHash,
+            ContractAddress, GasPrice, PublicKey, SequencerAddress, StarknetVersion,
+            StateCommitment, StateUpdate, StorageAddress, StorageValue,
         };
         use pathfinder_crypto::Felt;
         use pathfinder_storage::StorageBuilder;
         use starknet_gateway_client::MockGatewayApi;
         use starknet_gateway_types::error::{
-            KnownStarknetErrorCode,
-            SequencerError,
-            StarknetError,
+            KnownStarknetErrorCode, SequencerError, StarknetError,
         };
         use starknet_gateway_types::reply;
         use starknet_gateway_types::reply::GasPrices;

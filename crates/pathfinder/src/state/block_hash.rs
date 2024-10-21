@@ -5,32 +5,18 @@ use anyhow::{Context, Result};
 use pathfinder_common::event::Event;
 use pathfinder_common::hash::{FeltHash, PedersenHash, PoseidonHash};
 use pathfinder_common::receipt::{ExecutionStatus, Receipt};
+use pathfinder_common::transaction::TransactionVariant::DeclareV0;
 use pathfinder_common::transaction::{Transaction, TransactionVariant};
 use pathfinder_common::{
-    felt_bytes,
-    BlockHash,
-    BlockHeader,
-    BlockNumber,
-    BlockTimestamp,
-    Chain,
-    ChainId,
-    EventCommitment,
-    GasPrice,
-    L1DataAvailabilityMode,
-    ReceiptCommitment,
-    SequencerAddress,
-    StarknetVersion,
-    StateCommitment,
-    StateDiffCommitment,
-    TransactionCommitment,
-    TransactionHash,
+    felt_bytes, BlockHash, BlockHeader, BlockNumber, BlockTimestamp, Chain, ChainId,
+    EventCommitment, GasPrice, L1DataAvailabilityMode, ReceiptCommitment, SequencerAddress,
+    StarknetVersion, StateCommitment, StateDiffCommitment, TransactionCommitment, TransactionHash,
     TransactionSignatureElem,
 };
 use pathfinder_crypto::hash::{pedersen_hash, poseidon_hash_many, HashChain, PoseidonHasher};
 use pathfinder_crypto::{Felt, MontFelt};
 use pathfinder_merkle_tree::TransactionOrEventTree;
 use sha3::Digest;
-use pathfinder_common::transaction::TransactionVariant::DeclareV0;
 use starknet_gateway_types::reply::Block;
 
 const V_0_11_1: StarknetVersion = StarknetVersion::new(0, 11, 1, 0);
@@ -460,9 +446,6 @@ pub fn calculate_transaction_commitment(
     let final_hashes = transactions
         .par_iter()
         .map(|tx| {
-
-            println!(">>>> TXN_VERSION : {:?}", version);
-
             if version < V_0_11_1 {
                 calculate_transaction_hash_with_signature_pre_0_11_1(tx)
             } else if version < StarknetVersion::V_0_13_2 {
@@ -472,8 +455,6 @@ pub fn calculate_transaction_commitment(
             }
         })
         .collect();
-
-    println!(">>> final hashes : {:?}", final_hashes);
 
     if version < StarknetVersion::V_0_13_2 {
         calculate_commitment_root::<PedersenHash>(final_hashes).map(TransactionCommitment)
@@ -638,13 +619,11 @@ fn calculate_transaction_hash_with_signature(tx: &Transaction) -> Felt {
         signature
     };
 
-    println!(">>>> signature: {:?} | tx : {:?}", signature, tx);
-
     let mut hasher = PoseidonHasher::new();
     hasher.write(tx.hash.0.into());
 
     match tx.variant {
-        DeclareV0(_) => {},
+        DeclareV0(_) => {}
         _ => {
             for elem in signature {
                 hasher.write(elem.0.into());
@@ -741,18 +720,10 @@ mod tests {
     use pathfinder_common::macro_prelude::*;
     use pathfinder_common::receipt::{ExecutionResources, L1Gas, L2ToL1Message};
     use pathfinder_common::transaction::{
-        EntryPointType,
-        InvokeTransactionV0,
-        InvokeTransactionV3,
+        EntryPointType, InvokeTransactionV0, InvokeTransactionV3,
     };
     use pathfinder_common::{
-        felt,
-        ContractAddress,
-        EventData,
-        EventKey,
-        Fee,
-        L2ToL1MessagePayloadElem,
-        TransactionHash,
+        felt, ContractAddress, EventData, EventKey, Fee, L2ToL1MessagePayloadElem, TransactionHash,
     };
     use pathfinder_crypto::Felt;
     use starknet_gateway_test_fixtures::v0_13_2;
