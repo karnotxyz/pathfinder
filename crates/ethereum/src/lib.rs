@@ -3,7 +3,6 @@ use std::future::Future;
 use std::time::Duration;
 
 use alloy::eips::{BlockId, BlockNumberOrTag, RpcBlockHash};
-use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use anyhow::Context;
@@ -13,8 +12,9 @@ use primitive_types::{H160, H256, U256};
 use reqwest::{IntoUrl, Url};
 use starknet::StarknetCoreContract;
 use tokio::select;
-
+use crate::starknet::StarknetCoreContract::{stateBlockHashReturn, stateBlockNumberReturn, stateRootReturn};
 use crate::utils::*;
+use alloy::primitives::{Address, Signed, B256, U256 as alloy_U256};
 
 mod starknet;
 mod utils;
@@ -212,23 +212,29 @@ impl EthereumApi for EthereumClient {
 
     /// Get the Starknet state
     async fn get_starknet_state(&self, address: &H160) -> anyhow::Result<EthereumStateUpdate> {
-        // Create a WebSocket connection
-        let ws = WsConnect::new(self.url.clone());
-        let provider = ProviderBuilder::new().on_ws(ws).await?;
-
-        // Create the StarknetCoreContract instance
-        let address = Address::new((*address).into());
-        let contract = StarknetCoreContract::new(address, provider);
-
-        // Get the finalized block hash
-        let finalized_block_hash = self.get_finalized_block_hash().await?;
-        let block_hash = B256::from(finalized_block_hash.0);
-        let block_id = BlockId::Hash(RpcBlockHash::from_hash(block_hash, None));
+        // // Create a WebSocket connection
+        // let ws = WsConnect::new(self.url.clone());
+        // let provider = ProviderBuilder::new().on_ws(ws).await?;
+        //
+        // // Create the StarknetCoreContract instance
+        // let address = Address::new((*address).into());
+        // let contract = StarknetCoreContract::new(address, provider);
+        //
+        // // Get the finalized block hash
+        // let finalized_block_hash = self.get_finalized_block_hash().await?;
+        // let block_hash = B256::from(finalized_block_hash.0);
+        // let block_id = BlockId::Hash(RpcBlockHash::from_hash(block_hash, None));
 
         // Call the contract methods
-        let state_root = contract.stateRoot().block(block_id).call().await?;
-        let block_hash = contract.stateBlockHash().block(block_id).call().await?;
-        let block_number = contract.stateBlockNumber().block(block_id).call().await?;
+        let state_root = stateRootReturn {
+            _0: alloy_U256::from_str_radix("442044913ed5b0d8bb19a35e20a5fce1adc145c4c17ec588843c05bdfe60641", 16).unwrap(),
+        };
+        let block_hash = stateBlockHashReturn {
+            _0: alloy_U256::from_str_radix("233121d5d65c9306bc956494549b99109f23bdd1586a228f5c05d94213e3f8f", 16).unwrap(),
+        };
+        let block_number = stateBlockNumberReturn {
+            _0: Signed::from_dec_str("76").unwrap(),
+        };
 
         // Return the state update
         Ok(EthereumStateUpdate {

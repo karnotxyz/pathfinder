@@ -286,6 +286,9 @@ where
             }
         };
 
+        println!(">> block hash : {:?}", block.block_hash);
+        println!(">> block hash (signature) : {:?}", signature.block_hash);
+
         // An extra sanity check for the signature API.
         anyhow::ensure!(
             block.block_hash == signature.block_hash,
@@ -493,6 +496,8 @@ async fn download_block(
             // sure these are correct first.
             let (send, recv) = tokio::sync::oneshot::channel();
             rayon::spawn(move || {
+                println!(">>> block.block_number {:?}", block.block_number);
+                println!(">>> block.transactions {:?}", block.transactions);
                 let result = block
                     .transactions
                     .par_iter()
@@ -929,6 +934,9 @@ fn verify_block_and_state_update(
     )
     .context("Verify block hash")?;
 
+    println!(">>> block : {:?}", block.block_number);
+    println!(">>> chain id : {:?}", chain_id);
+
     let (transaction_commitment, event_commitment, receipt_commitment) =
         match (block.status, verify_result, mode) {
             (Status::AcceptedOnL1 | Status::AcceptedOnL2, VerifyResult::Match(commitments), _) => {
@@ -940,6 +948,7 @@ fn verify_block_and_state_update(
                 BlockValidationMode::AllowMismatch,
             ) => Ok(Default::default()),
             (_, VerifyResult::Mismatch, BlockValidationMode::Strict) => {
+                println!(">>> block _ number : {:?}", block.block_number);
                 Err(anyhow!("Block hash mismatch"))
             }
             _ => Err(anyhow!(

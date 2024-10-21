@@ -30,6 +30,7 @@ use pathfinder_crypto::hash::{pedersen_hash, poseidon_hash_many, HashChain, Pose
 use pathfinder_crypto::{Felt, MontFelt};
 use pathfinder_merkle_tree::TransactionOrEventTree;
 use sha3::Digest;
+use pathfinder_common::transaction::TransactionVariant::DeclareV0;
 use starknet_gateway_types::reply::Block;
 
 const V_0_11_1: StarknetVersion = StarknetVersion::new(0, 11, 1, 0);
@@ -459,6 +460,9 @@ pub fn calculate_transaction_commitment(
     let final_hashes = transactions
         .par_iter()
         .map(|tx| {
+
+            println!(">>>> TXN_VERSION : {:?}", version);
+
             if version < V_0_11_1 {
                 calculate_transaction_hash_with_signature_pre_0_11_1(tx)
             } else if version < StarknetVersion::V_0_13_2 {
@@ -468,6 +472,8 @@ pub fn calculate_transaction_commitment(
             }
         })
         .collect();
+
+    println!(">>> final hashes : {:?}", final_hashes);
 
     if version < StarknetVersion::V_0_13_2 {
         calculate_commitment_root::<PedersenHash>(final_hashes).map(TransactionCommitment)
@@ -632,11 +638,20 @@ fn calculate_transaction_hash_with_signature(tx: &Transaction) -> Felt {
         signature
     };
 
+    println!(">>>> signature: {:?} | tx : {:?}", signature, tx);
+
     let mut hasher = PoseidonHasher::new();
     hasher.write(tx.hash.0.into());
-    for elem in signature {
-        hasher.write(elem.0.into());
+
+    match tx.variant {
+        DeclareV0(_) => {},
+        _ => {
+            for elem in signature {
+                hasher.write(elem.0.into());
+            }
+        }
     }
+
     hasher.finish().into()
 }
 
