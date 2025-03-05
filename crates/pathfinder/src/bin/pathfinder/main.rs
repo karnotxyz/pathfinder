@@ -810,7 +810,6 @@ mod pathfinder_context {
             gateway_timeout: Duration,
         ) -> anyhow::Result<Self> {
             use pathfinder_crypto::Felt;
-            use starknet_gateway_client::GatewayApi;
 
             let gateway = GatewayClient::with_urls(gateway, feeder, gateway_timeout)
                 .context("Creating gateway client")?
@@ -819,12 +818,14 @@ mod pathfinder_context {
             let network_id =
                 ChainId(Felt::from_be_slice(chain_id.as_bytes()).context("Parsing chain ID")?);
 
-            let l1_core_address = gateway
-                .eth_contract_addresses()
-                .await
-                .context("Downloading starknet L1 address from gateway for proxy check")?
-                .starknet
-                .0;
+            // let reply_contract_addresses = gateway
+            //     .eth_contract_addresses()
+            //     .await
+            //     .context("Downloading starknet L1 address from gateway for proxy check")?;
+            // let l1_core_address = reply_contract_addresses.starknet.0;
+            let l1_core_address: H160 = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
+                .parse()
+                .unwrap();
 
             // Check for proxies by comparing the core address against those of the known
             // networks.
@@ -891,9 +892,7 @@ async fn verify_database(
 
     if let Some(database_genesis) = db_genesis {
         use pathfinder_common::consts::{
-            MAINNET_GENESIS_HASH,
-            SEPOLIA_INTEGRATION_GENESIS_HASH,
-            SEPOLIA_TESTNET_GENESIS_HASH,
+            MAINNET_GENESIS_HASH, SEPOLIA_INTEGRATION_GENESIS_HASH, SEPOLIA_TESTNET_GENESIS_HASH,
         };
 
         let db_network = match database_genesis {
