@@ -500,14 +500,13 @@ pub mod transaction {
     #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct L1ToL2Message {
-        #[serde_as(as = "EthereumAddressAsHexStr")]
-        pub from_address: EthereumAddress,
+        pub from_address: ContractAddress,
         #[serde_as(as = "Vec<L1ToL2MessagePayloadElemAsDecimalStr>")]
         pub payload: Vec<L1ToL2MessagePayloadElem>,
         pub selector: EntryPoint,
         pub to_address: ContractAddress,
         #[serde(default)]
-        pub nonce: Option<L1ToL2MessageNonce>,
+        pub nonce: Option<u64>,
     }
 
     impl<T> Dummy<T> for L1ToL2Message {
