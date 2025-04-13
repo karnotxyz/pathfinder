@@ -1614,7 +1614,7 @@ dependencies = [
 [[package]]
 name = "blockifier"
 version = "0.8.0-rc.3"
-source = "git+https://github.com/eqlabs/sequencer?branch=eqlabs/main-v0.13.2#2e59ae0f7c0da559cd77bd9db794309a8e3fe99a"
+source = "git+https://github.com/bytezorvin/sequencer?branch=madara-monorepo#17c3525dc5ab20dc6a6e6a26a26d6234c7c9afbb"
 dependencies = [
  "anyhow",
  "ark-ec",
@@ -1639,6 +1639,8 @@ dependencies = [
  "once_cell",
  "paste",
  "phf",
+ "rand",
+ "rstest 0.17.0",
  "serde",
  "serde_json",
  "sha2",
@@ -7161,7 +7163,7 @@ dependencies = [
  "prost 0.13.2",
  "rand",
  "rayon",
- "rstest",
+ "rstest 0.18.2",
  "serde",
  "serde_json",
  "sha2",
@@ -7220,7 +7222,7 @@ dependencies = [
  "libp2p",
  "libp2p-plaintext",
  "libp2p-swarm-test",
- "rstest",
+ "rstest 0.18.2",
  "test-log",
  "tokio",
  "tracing",
@@ -7381,7 +7383,7 @@ dependencies = [
  "rand_chacha",
  "rayon",
  "reqwest",
- "rstest",
+ "rstest 0.18.2",
  "semver 1.0.23",
  "serde",
  "serde_json",
@@ -7427,7 +7429,7 @@ dependencies = [
  "pathfinder-crypto",
  "primitive-types",
  "rand",
- "rstest",
+ "rstest 0.18.2",
  "serde",
  "serde_json",
  "serde_with",
@@ -7451,7 +7453,7 @@ dependencies = [
  "num-bigint 0.4.6",
  "pathfinder-common",
  "pathfinder-crypto",
- "rstest",
+ "rstest 0.18.2",
  "semver 1.0.23",
  "serde",
  "serde_json",
@@ -7575,7 +7577,7 @@ dependencies = [
  "primitive-types",
  "rayon",
  "reqwest",
- "rstest",
+ "rstest 0.18.2",
  "serde",
  "serde_json",
  "serde_with",
@@ -7637,7 +7639,7 @@ dependencies = [
  "r2d2",
  "r2d2_sqlite",
  "rand",
- "rstest",
+ "rstest 0.18.2",
  "rusqlite",
  "serde",
  "serde_json",
@@ -8588,14 +8590,40 @@ dependencies = [
 
 [[package]]
 name = "rstest"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de1bb486a691878cd320c2f0d319ba91eeaa2e894066d8b5f8f117c000e9d962"
+dependencies = [
+ "futures",
+ "futures-timer",
+ "rstest_macros 0.17.0",
+ "rustc_version 0.4.1",
+]
+
+[[package]]
+name = "rstest"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97eeab2f3c0a199bc4be135c36c924b6590b88c377d416494288c14f2db30199"
 dependencies = [
  "futures",
  "futures-timer",
- "rstest_macros",
+ "rstest_macros 0.18.2",
  "rustc_version 0.4.1",
+]
+
+[[package]]
+name = "rstest_macros"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "290ca1a1c8ca7edb7c3283bd44dc35dd54fdec6253a3912e201ba1072018fca8"
+dependencies = [
+ "cfg-if",
+ "proc-macro2",
+ "quote",
+ "rustc_version 0.4.1",
+ "syn 1.0.109",
+ "unicode-ident",
 ]
 
 [[package]]
@@ -9510,7 +9538,7 @@ dependencies = [
  "primitive-types",
  "rand",
  "reqwest",
- "rstest",
+ "rstest 0.18.2",
  "serde",
  "serde_json",
  "serde_with",
@@ -9538,7 +9566,7 @@ dependencies = [
 [[package]]
 name = "starknet_api"
 version = "0.13.0-rc.1"
-source = "git+https://github.com/eqlabs/sequencer?branch=eqlabs/main-v0.13.2#2e59ae0f7c0da559cd77bd9db794309a8e3fe99a"
+source = "git+https://github.com/bytezorvin/sequencer?branch=madara-monorepo#17c3525dc5ab20dc6a6e6a26a26d6234c7c9afbb"
 dependencies = [
  "bitvec",
  "cairo-lang-starknet-classes",

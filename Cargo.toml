@@ -1,33 +1,33 @@
 [workspace]
 members = [
-    "crates/block-hashes",
-    "crates/common",
-    "crates/compiler",
-    "crates/crypto",
-    "crates/ethereum",
-    "crates/executor",
-    "crates/gateway-client",
-    "crates/gateway-test-fixtures",
-    "crates/gateway-test-utils",
-    "crates/gateway-types",
-    "crates/make-stream",
-    "crates/merkle-tree",
-    "crates/p2p",
-    "crates/p2p_proto",
-    "crates/p2p_proto_derive",
-    "crates/p2p_stream",
-    "crates/pathfinder",
-    "crates/retry",
-    "crates/rpc",
-    "crates/serde",
-    "crates/storage",
-    "crates/tagged",
-    "crates/tagged-debug-derive",
+  "crates/block-hashes",
+  "crates/common",
+  "crates/compiler",
+  "crates/crypto",
+  "crates/ethereum",
+  "crates/executor",
+  "crates/gateway-client",
+  "crates/gateway-test-fixtures",
+  "crates/gateway-test-utils",
+  "crates/gateway-types",
+  "crates/make-stream",
+  "crates/merkle-tree",
+  "crates/p2p",
+  "crates/p2p_proto",
+  "crates/p2p_proto_derive",
+  "crates/p2p_stream",
+  "crates/pathfinder",
+  "crates/retry",
+  "crates/rpc",
+  "crates/serde",
+  "crates/storage",
+  "crates/tagged",
+  "crates/tagged-debug-derive",
 ]
 exclude = [
-    "crates/load-test",
-    "crates/stark_hash_python",
-    "utils/pathfinder-probe",
+  "crates/load-test",
+  "crates/stark_hash_python",
+  "utils/pathfinder-probe",
 ]
 resolver = "2"
 
@@ -58,7 +58,9 @@ axum = "0.7.5"
 base64 = "0.13.1"
 bincode = "2.0.0-rc.3"
 bitvec = "1.0.1"
-blockifier = { git = "https://github.com/eqlabs/sequencer", branch = "eqlabs/main-v0.13.2" }
+blockifier = { git = "https://github.com/bytezorvin/sequencer", branch = "madara-monorepo", features = [
+  "testing",
+] }
 bloomfilter = "1.0.12"
 bytes = "1.4.0"
 cached = "0.44.0"
@@ -112,9 +114,9 @@ rand = "0.8.5"
 rand_chacha = "0.3.1"
 rayon = "1.8.0"
 reqwest = { version = "0.12.5", default-features = false, features = [
-    "http2",
-    "rustls-tls-native-roots",
-    "charset",
+  "http2",
+  "rustls-tls-native-roots",
+  "charset",
 ] }
 rstest = "0.18.2"
 rusqlite = "0.32.1"
@@ -125,9 +127,15 @@ serde_with = "3.7.0"
 sha2 = "0.10.7"
 sha3 = "0.10"
 # This one needs to match the version used by blockifier
-starknet_api = { git = "https://github.com/eqlabs/sequencer", branch = "eqlabs/main-v0.13.2" }
+starknet_api = { git = "https://github.com/byteZorvin/sequencer", branch = "madara-monorepo", features = [
+  "testing",
+] }
 # This one needs to match the version used by blockifier
-starknet-types-core = "=0.1.5"
+starknet-types-core = { version = "0.1.5", features = [
+  "hash",
+  "prime-bigint",
+  "std",
+] }
 syn = "1.0"
 tempfile = "3.8"
 test-log = { version = "0.2.12", features = ["trace"] }
