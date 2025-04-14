@@ -4,6 +4,7 @@ use blockifier::transaction::transactions::ExecutableTransaction;
 use super::error::TransactionExecutionError;
 use super::execution_state::ExecutionState;
 use super::types::FeeEstimate;
+use super::error_stack::{ErrorStack, Frame};
 
 pub fn estimate(
     execution_state: ExecutionState<'_>,
@@ -42,7 +43,7 @@ pub fn estimate(
                     return Err(TransactionExecutionError::ExecutionError {
                         transaction_index: transaction_idx,
                         error: revert_string,
-                        error_stack: revert_error.into(),
+                        error_stack: ErrorStack(Vec::from([Frame::StringFrame(revert_error.to_string())])),
                     });
                 }
 

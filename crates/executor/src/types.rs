@@ -342,8 +342,7 @@ impl From<blockifier::execution::call_info::CallInfo> for FunctionInvocation {
                 .map(IntoFelt::into_felt)
                 .collect(),
             contract_address: ContractAddress::new_or_panic(
-                call_info.call.storage_address.0.key().into_felt(),
-            ),
+                call_info.call.storage_address.0.key().into_felt()),
             selector: call_info.call.entry_point_selector.0.into_felt(),
             call_type: call_info.call.call_type.into(),
             caller_address: call_info.call.caller_address.0.key().into_felt(),
@@ -419,7 +418,7 @@ fn ordered_l2_to_l1_messages(
             MsgToL1 {
                 order: *order,
                 payload: message.payload.0.iter().map(IntoFelt::into_felt).collect(),
-                to_address: Felt::from_be_slice(message.to_address.0.as_bytes())
+                to_address: Felt::from_be_slice(message.to_address.0.key().into_felt().to_be_bytes().as_slice())
                     .expect("Ethereum address should fit into felt"),
                 from_address: call_info.call.storage_address.0.key().into_felt(),
             },
