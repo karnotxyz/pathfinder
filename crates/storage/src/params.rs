@@ -308,7 +308,7 @@ pub trait RowExt {
         let num = self.get_i64(index)?;
         let mode = match num {
             0 => L1DataAvailabilityMode::Calldata,
-            1 => L1DataAvailabilityMode::Calldata,
+            1 => L1DataAvailabilityMode::Blob,
             _ => {
                 return Err(rusqlite::types::FromSqlError::Other(
                     anyhow::anyhow!("invalid L1 data availability mode {num}").into(),
