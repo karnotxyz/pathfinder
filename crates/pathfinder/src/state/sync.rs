@@ -163,7 +163,7 @@ impl Gossiper {
 /// Implements the main sync loop, where L1 and L2 sync results are combined.
 pub async fn sync<Ethereum, SequencerClient, F1, F2, L1Sync, L2Sync>(
     context: SyncContext<SequencerClient, Ethereum>,
-    mut l1_sync: L1Sync,
+    _l1_sync: L1Sync,
     l2_sync: L2Sync,
 ) -> anyhow::Result<()>
 where
@@ -181,7 +181,7 @@ where
         ) -> F2
         + Copy,
 {
-    let l1_context = L1SyncContext::from(&context);
+    // let l1_context = L1SyncContext::from(&context);
     let l2_context = L2SyncContext::from(&context);
 
     let SyncContext {
@@ -255,7 +255,7 @@ where
 
     // Start L1 producer task. Clone the event sender so that the channel remains
     // open even if the producer task fails.
-    let mut l1_handle = tokio::spawn(l1_sync(event_sender.clone(), l1_context.clone()));
+    // let mut l1_handle = tokio::spawn(l1_sync(event_sender.clone(), l1_context.clone()));
 
     // Fetch latest blocks from storage
     let latest_blocks = latest_n_blocks(&mut db_conn, block_cache_size)
@@ -314,34 +314,34 @@ where
                 tracing::error!("Tracking chain tip task ended unexpectedly");
                 tracing::debug!("Shutting down other tasks");
 
-                l1_handle.abort();
+                // l1_handle.abort();
                 l2_handle.abort();
                 consumer_handle.abort();
                 pending_handle.abort();
 
-                _ = l1_handle.await;
+                // _ = l1_handle.await;
                 _ = l2_handle.await;
                 _ = consumer_handle.await;
                 _ = pending_handle.await;
 
                 anyhow::bail!("Sync process terminated");
             },
-            l1_producer_result = &mut l1_handle => {
-                match l1_producer_result.context("Join L1 sync process handle")? {
-                    Ok(()) => {
-                        tracing::error!("L1 sync process terminated without an error.");
-                    }
-                    Err(e) => {
-                        tracing::warn!("L1 sync process terminated with: {e:?}");
-                    }
-                }
+            // l1_producer_result = &mut l1_handle => {
+            //     match l1_producer_result.context("Join L1 sync process handle")? {
+            //         Ok(()) => {
+            //             tracing::error!("L1 sync process terminated without an error.");
+            //         }
+            //         Err(e) => {
+            //             tracing::warn!("L1 sync process terminated with: {e:?}");
+            //         }
+            //     }
 
-                let fut = l1_sync(event_sender.clone(), l1_context.clone());
-                l1_handle = tokio::spawn(async move {
-                    tokio::time::sleep(RESET_DELAY_ON_FAILURE).await;
-                    fut.await
-                });
-            },
+            //     let fut = l1_sync(event_sender.clone(), l1_context.clone());
+            //     l1_handle = tokio::spawn(async move {
+            //         tokio::time::sleep(RESET_DELAY_ON_FAILURE).await;
+            //         fut.await
+            //     });
+            // },
             l2_producer_result = &mut l2_handle => {
                 // L2 sync process failed; restart it.
                 match l2_producer_result.context("Join L2 sync process handle")? {
@@ -388,25 +388,25 @@ where
 
                 // Shutdown the other processes.
                 tracing::debug!("Shutting down L1 and L2 sync producer tasks");
-                l1_handle.abort();
+                // l1_handle.abort();
                 l2_handle.abort();
                 pending_handle.abort();
                 latest_handle.abort();
 
-                match l1_handle.await {
-                    Ok(Ok(())) => {
-                        tracing::debug!("L1 sync task exited gracefully");
-                    },
-                    Ok(Err(e)) => {
-                        tracing::error!(reason=?e, "L1 sync task terminated with an error");
-                    }
-                    Err(e) if e.is_cancelled() => {
-                        tracing::debug!("L1 sync task cancelled successfully");
-                    },
-                    Err(panic) => {
-                        tracing::error!(%panic, "L1 sync task panic'd");
-                    }
-                }
+                // match l1_handle.await {
+                //     Ok(Ok(())) => {
+                //         tracing::debug!("L1 sync task exited gracefully");
+                //     },
+                //     Ok(Err(e)) => {
+                //         tracing::error!(reason=?e, "L1 sync task terminated with an error");
+                //     }
+                //     Err(e) if e.is_cancelled() => {
+                //         tracing::debug!("L1 sync task cancelled successfully");
+                //     },
+                //     Err(panic) => {
+                //         tracing::error!(%panic, "L1 sync task panic'd");
+                //     }
+                // }
 
                 match l2_handle.await {
                     Ok(Ok(())) => {
