@@ -7,12 +7,7 @@ use blockifier::context::{BlockContext, ChainInfo};
 use blockifier::state::cached_state::CachedState;
 use blockifier::versioned_constants::VersionedConstants;
 use pathfinder_common::{
-    contract_address,
-    BlockHeader,
-    ChainId,
-    ContractAddress,
-    L1DataAvailabilityMode,
-    StateUpdate,
+    contract_address, BlockHeader, ChainId, ContractAddress, L1DataAvailabilityMode, StateUpdate,
 };
 use starknet_api::core::PatriciaKey;
 
@@ -28,6 +23,8 @@ pub const STRK_FEE_TOKEN_ADDRESS: ContractAddress =
 
 mod versioned_constants {
     use std::borrow::Cow;
+    use std::env;
+    use std::fs;
     use std::sync::LazyLock;
 
     use pathfinder_common::StarknetVersion;
@@ -54,24 +51,69 @@ mod versioned_constants {
 
     const STARKNET_VERSION_0_13_2_1: StarknetVersion = StarknetVersion::new(0, 13, 2, 1);
 
+    fn load_versioned_constants_data(constant_name: &str, default_data: &[u8]) -> Vec<u8> {
+        if let Ok(file_path) = env::var(constant_name) {
+            match fs::read(file_path.clone()) {
+                Ok(data) => {
+                    tracing::info!(
+                        constant = constant_name,
+                        path = file_path,
+                        "Found EVN variable for file, reading and using it",
+                    );
+                    data
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        constant = constant_name,
+                        "Failed to load versioned constants from file, falling back to default"
+                    );
+                    default_data.to_vec()
+                }
+            }
+        } else {
+            tracing::warn!(
+                constant = constant_name,
+                "Didn't find the ENV variable for file, falling back to default"
+            );
+            default_data.to_vec()
+        }
+    }
+
     pub static BLOCKIFIER_VERSIONED_CONSTANTS_0_13_0: LazyLock<VersionedConstants> =
         LazyLock::new(|| {
-            serde_json::from_slice(BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_0).unwrap()
+            let data = load_versioned_constants_data(
+                "BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_0",
+                BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_0,
+            );
+            serde_json::from_slice(&data).unwrap()
         });
 
     pub static BLOCKIFIER_VERSIONED_CONSTANTS_0_13_1: LazyLock<VersionedConstants> =
         LazyLock::new(|| {
-            serde_json::from_slice(BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_1).unwrap()
+            let data = load_versioned_constants_data(
+                "BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_1",
+                BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_1,
+            );
+            serde_json::from_slice(&data).unwrap()
         });
 
     pub static BLOCKIFIER_VERSIONED_CONSTANTS_0_13_1_1: LazyLock<VersionedConstants> =
         LazyLock::new(|| {
-            serde_json::from_slice(BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_1_1).unwrap()
+            let data = load_versioned_constants_data(
+                "BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_1_1",
+                BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_1_1,
+            );
+            serde_json::from_slice(&data).unwrap()
         });
 
     pub static BLOCKIFIER_VERSIONED_CONSTANTS_0_13_2: LazyLock<VersionedConstants> =
         LazyLock::new(|| {
-            serde_json::from_slice(BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_2).unwrap()
+            let data = load_versioned_constants_data(
+                "BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_2",
+                BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_2,
+            );
+            serde_json::from_slice(&data).unwrap()
         });
 
     pub(super) fn for_version(
