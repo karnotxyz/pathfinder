@@ -473,6 +473,7 @@ pub mod transaction {
         pub selector: EntryPoint,
         pub to_address: ContractAddress,
         #[serde(default)]
+        // Changing this back to L1ToL2MessageNonce from u64 as it was not able to parse L1Handler txn receipts
         pub nonce: Option<L1ToL2MessageNonce>,
     }
 
