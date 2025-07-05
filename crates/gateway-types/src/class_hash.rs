@@ -60,9 +60,7 @@ pub mod from_parts {
 
     use anyhow::Result;
     use pathfinder_common::class_definition::{
-        EntryPointType,
-        SelectorAndOffset,
-        SierraEntryPoints,
+        EntryPointType, SelectorAndOffset, SierraEntryPoints,
     };
     use pathfinder_common::ClassHash;
     use pathfinder_crypto::Felt;
@@ -141,6 +139,30 @@ pub fn compute_cairo_hinted_class_hash(
     Ok(truncated_keccak(<[u8; 32]>::from(hash.finalize())))
 }
 
+fn sort_attributes_keys(attributes: &mut Vec<serde_json::Value>) -> Result<(), anyhow::Error> {
+    println!("sorting attributes keys {:?}", attributes);
+    for attr in attributes.iter_mut() {
+        if let serde_json::Value::Object(obj) = attr {
+            // Create a new sorted map
+            let mut sorted_map = serde_json::Map::new();
+
+            // Collect all key-value pairs and sort them by key
+            let mut pairs: Vec<_> = obj.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+            // Insert sorted pairs into the new map
+            for (key, value) in pairs {
+                sorted_map.insert(key.clone(), value.clone());
+            }
+
+            // Replace the original object with the sorted one
+            *attr = serde_json::Value::Object(sorted_map);
+        }
+    }
+    println!("sorted attributes keys {:?}", attributes);
+    Ok(())
+}
+
 /// Prepares the JSON contract definition for hash calculation by removing
 /// unnecessary fields and ensuring consistency in formatting.
 ///
@@ -199,6 +221,8 @@ pub fn prepare_json_contract_definition(
 
             Ok(())
         })?;
+
+    sort_attributes_keys(&mut contract_definition.program.attributes)?;
 
     fn add_extra_space_to_cairo_named_tuples(value: &mut serde_json::Value) {
         match value {
@@ -529,9 +553,7 @@ pub mod json {
     use std::collections::{BTreeMap, HashMap};
 
     use pathfinder_common::class_definition::{
-        EntryPointType,
-        SelectorAndFunctionIndex,
-        SelectorAndOffset,
+        EntryPointType, SelectorAndFunctionIndex, SelectorAndOffset,
     };
 
     pub enum ContractDefinition<'a> {
