@@ -1,13 +1,6 @@
 use anyhow::Context;
-use pathfinder_common::state_update::{ReverseContractUpdate, StorageRef};
-use pathfinder_common::{
-    BlockNumber,
-    ClassHash,
-    ContractAddress,
-    ContractNonce,
-    ContractRoot,
-    ContractStateHash,
-};
+use pathfinder_common::prelude::*;
+use pathfinder_common::state_update::{ReverseContractUpdate, StateUpdateError, StorageRef};
 use pathfinder_crypto::hash::pedersen_hash;
 use pathfinder_crypto::Felt;
 use pathfinder_storage::{Transaction, TrieUpdate};
@@ -55,7 +48,7 @@ pub fn update_contract_state(
     transaction: &Transaction<'_>,
     verify_hashes: bool,
     block: BlockNumber,
-) -> anyhow::Result<ContractStateUpdateResult> {
+) -> Result<ContractStateUpdateResult, StateUpdateError> {
     // Load the contract tree and insert the updates.
     let (new_root, trie_update) = if !updates.is_empty() {
         let mut contract_tree = match block.parent() {
@@ -86,8 +79,8 @@ pub fn update_contract_state(
     };
 
     let class_hash = if contract_address.is_system_contract() {
-        // This is a special system contract at address 0x1, which doesn't have a class
-        // hash.
+        // This is a special system contract at address 0x1 or 0x2, which doesn't have a
+        // class hash.
         ClassHash::ZERO
     } else if let Some(class_hash) = new_class_hash {
         class_hash
@@ -95,12 +88,7 @@ pub fn update_contract_state(
         transaction
             .contract_class_hash(block.into(), contract_address)
             .context("Querying contract's class hash")?
-            .with_context(|| {
-                format!(
-                    "Contract's class hash is missing, block: {block}, contract_address: \
-                     {contract_address}"
-                )
-            })?
+            .ok_or(StateUpdateError::ContractClassHashMissing(contract_address))?
     };
 
     let nonce = if let Some(nonce) = new_nonce {

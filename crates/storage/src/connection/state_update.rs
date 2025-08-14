@@ -2,26 +2,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
+use pathfinder_common::prelude::*;
 use pathfinder_common::state_update::{
     ContractClassUpdate,
     ContractUpdate,
     ReverseContractUpdate,
     StateUpdateData,
     SystemContractUpdate,
-};
-use pathfinder_common::{
-    BlockHash,
-    BlockNumber,
-    CasmHash,
-    ClassHash,
-    ContractAddress,
-    ContractNonce,
-    SierraHash,
-    StateCommitment,
-    StateUpdate,
-    StorageAddress,
-    StorageCommitment,
-    StorageValue,
 };
 
 use crate::prelude::*;
@@ -266,8 +253,12 @@ impl Transaction<'_> {
     ) -> anyhow::Result<Option<(BlockNumber, BlockHash, StateCommitment, StateCommitment)>> {
         use const_format::formatcp;
 
-        const PREFIX: &str = r"SELECT b1.number, b1.hash, b1.storage_commitment, b1.class_commitment, b2.storage_commitment, b2.class_commitment FROM block_headers b1 
-            LEFT OUTER JOIN block_headers b2 ON b2.number = b1.number - 1";
+        const PREFIX: &str = r"
+            SELECT b1.number, b1.hash, b1.state_commitment, b2.state_commitment
+            FROM block_headers b1
+            LEFT OUTER JOIN block_headers b2 
+            ON b2.number = b1.number - 1
+        ";
 
         const LATEST: &str = formatcp!("{PREFIX} ORDER BY b1.number DESC LIMIT 1");
         const NUMBER: &str = formatcp!("{PREFIX} WHERE b1.number = ?");
@@ -276,19 +267,16 @@ impl Transaction<'_> {
         let handle_row = |row: &rusqlite::Row<'_>| {
             let number = row.get_block_number(0)?;
             let hash = row.get_block_hash(1)?;
-            let storage_commitment = row.get_storage_commitment(2)?;
-            let class_commitment = row.get_class_commitment(3)?;
+            let state_commitment = row.get_state_commitment(2)?;
             // The genesis block would not have a value.
-            let parent_storage_commitment =
-                row.get_optional_storage_commitment(4)?.unwrap_or_default();
-            let parent_class_commitment = row.get_optional_class_commitment(5)?.unwrap_or_default();
-
-            let state_commitment = StateCommitment::calculate(storage_commitment, class_commitment);
-            let parent_state_commitment = if parent_storage_commitment == StorageCommitment::ZERO {
-                StateCommitment::ZERO
-            } else {
-                StateCommitment::calculate(parent_storage_commitment, parent_class_commitment)
-            };
+            let parent_state_commitment =
+                row.get_optional_state_commitment(3)?.unwrap_or_else(|| {
+                    // Block at the tip of blockchain history (see `pruning.rs`) would also not have
+                    // a parent, but this case should be handled at the RPC
+                    // layer.
+                    assert_eq!(number, BlockNumber::GENESIS);
+                    Default::default()
+                });
 
             Ok((number, hash, state_commitment, parent_state_commitment))
         };
@@ -371,7 +359,7 @@ impl Transaction<'_> {
             .transpose()
             .context("Iterating over storage query rows")?
         {
-            state_update = if address == ContractAddress::ONE {
+            state_update = if address.is_system_contract() {
                 state_update.with_system_storage_update(address, key, value)
             } else {
                 state_update.with_storage_update(address, key, value)
@@ -635,7 +623,7 @@ impl Transaction<'_> {
                     JOIN contract_addresses ON contract_addresses.id = storage_updates.contract_address_id
                     JOIN storage_addresses ON storage_addresses.id = storage_updates.storage_address_id
                     WHERE contract_address = ? AND storage_address = ? AND block_number <= (
-                        SELECT number FROM canonical_blocks WHERE hash = ?
+                        SELECT number FROM block_headers WHERE hash = ?
                     )
                     ORDER BY block_number DESC LIMIT 1
                     ",
@@ -668,7 +656,7 @@ impl Transaction<'_> {
                 let mut stmt = self.inner().prepare_cached(
                     r"SELECT EXISTS(
                         SELECT 1 FROM contract_updates WHERE contract_address = ? AND block_number <= (
-                            SELECT number FROM canonical_blocks WHERE hash = ?
+                            SELECT number FROM block_headers WHERE hash = ?
                         )
                     )",
                 )?;
@@ -726,7 +714,7 @@ impl Transaction<'_> {
                     SELECT nonce FROM nonce_updates
                     JOIN contract_addresses ON contract_addresses.id = nonce_updates.contract_address_id
                     WHERE contract_address = ? AND block_number <= (
-                        SELECT number FROM canonical_blocks WHERE hash = ?
+                        SELECT number FROM block_headers WHERE hash = ?
                     )
                     ORDER BY block_number DESC LIMIT 1
                     ",
@@ -768,7 +756,7 @@ impl Transaction<'_> {
                 let mut stmt = self.inner().prepare_cached(
                     r"SELECT class_hash FROM contract_updates
                 WHERE contract_address = ? AND block_number <= (
-                    SELECT number FROM canonical_blocks WHERE hash = ?
+                    SELECT number FROM block_headers WHERE hash = ?
                 )
                 ORDER BY block_number DESC LIMIT 1",
                 )?;
@@ -1221,8 +1209,13 @@ mod tests {
                 )
                 .with_system_storage_update(
                     ContractAddress::ONE,
-                    storage_address_bytes!(b"key"),
-                    storage_value_bytes!(b"value"),
+                    storage_address_bytes!(b"key 1"),
+                    storage_value_bytes!(b"value 1"),
+                )
+                .with_system_storage_update(
+                    ContractAddress::TWO,
+                    storage_address_bytes!(b"key 2"),
+                    storage_value_bytes!(b"value 2"),
                 )
                 .with_deployed_contract(
                     contract_address_bytes!(b"contract addr 2"),
@@ -1315,7 +1308,18 @@ mod tests {
                         ContractAddress::ONE,
                         ReverseContractUpdate::Updated(ContractUpdate {
                             storage: HashMap::from([(
-                                storage_address_bytes!(b"key"),
+                                storage_address_bytes!(b"key 1"),
+                                StorageValue::ZERO
+                            )]),
+                            nonce: None,
+                            class: None
+                        })
+                    ),
+                    (
+                        ContractAddress::TWO,
+                        ReverseContractUpdate::Updated(ContractUpdate {
+                            storage: HashMap::from([(
+                                storage_address_bytes!(b"key 2"),
                                 StorageValue::ZERO
                             )]),
                             nonce: None,

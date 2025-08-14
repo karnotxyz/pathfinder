@@ -228,7 +228,7 @@ impl<'a> Request<'a, stage::Params> {
     }
 }
 
-impl<'a> Request<'a, stage::Final> {
+impl Request<'_, stage::Final> {
     /// Sends the Sequencer request as a REST `GET` operation and parses the
     /// response into `T`.
     pub async fn get<T>(self) -> Result<T, SequencerError>
@@ -655,7 +655,6 @@ mod tests {
     }
 
     mod invalid_starknet_error_variant {
-        use gateway_test_utils::GATEWAY_TIMEOUT;
         use warp::http::response::Builder;
         use warp::Filter;
 
@@ -673,9 +672,7 @@ mod tests {
             let (_jh, addr) = server();
             let mut url = reqwest::Url::parse("http://localhost/").unwrap();
             url.set_port(Some(addr.port())).unwrap();
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT)
-                .unwrap()
-                .disable_retry_for_tests();
+            let client = Client::for_test(url).unwrap().disable_retry_for_tests();
             let error = client
                 .block_header(pathfinder_common::BlockId::Latest)
                 .await
@@ -689,7 +686,6 @@ mod tests {
 
     mod api_key_is_set_when_configured {
         use fake::{Fake, Faker};
-        use gateway_test_utils::GATEWAY_TIMEOUT;
         use httpmock::prelude::*;
         use httpmock::Mock;
         use serde_json::json;
@@ -704,7 +700,7 @@ mod tests {
                 then.status(200).json_body(json!({}));
             });
 
-            let client = Client::with_base_url(server.base_url().parse().unwrap(), GATEWAY_TIMEOUT)
+            let client = Client::for_test(server.base_url().parse().unwrap())
                 .unwrap()
                 .with_api_key(Some(api_key.clone()));
 

@@ -40,11 +40,11 @@ pub enum Notification {
     TransactionHash(TransactionHash),
 }
 
-impl crate::dto::serialize::SerializeForVersion for Notification {
+impl crate::dto::SerializeForVersion for Notification {
     fn serialize(
         &self,
-        serializer: crate::dto::serialize::Serializer,
-    ) -> Result<crate::dto::serialize::Ok, crate::dto::serialize::Error> {
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
         match self {
             Notification::Transaction(transaction) => {
                 crate::dto::TransactionWithHash(transaction).serialize(serializer)
@@ -136,30 +136,18 @@ impl RpcSubscriptionFlow for SubscribePendingTransactions {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use axum::extract::ws::Message;
+    use pathfinder_common::macro_prelude::*;
+    use pathfinder_common::prelude::*;
     use pathfinder_common::transaction::{DeclareTransactionV0V1, Transaction, TransactionVariant};
-    use pathfinder_common::{
-        contract_address,
-        transaction_hash,
-        BlockNumber,
-        ChainId,
-        ContractAddress,
-        TransactionHash,
-    };
-    use pathfinder_ethereum::EthereumClient;
+    use pathfinder_crypto::Felt;
     use pathfinder_storage::StorageBuilder;
-    use primitive_types::H160;
-    use starknet_gateway_client::Client;
     use starknet_gateway_types::reply::PendingBlock;
     use tokio::sync::{mpsc, watch};
 
-    use crate::context::{RpcConfig, RpcContext};
+    use crate::context::RpcContext;
     use crate::jsonrpc::{handle_json_rpc_socket, RpcResponse};
-    use crate::pending::PendingWatcher;
-    use crate::types::syncing::Syncing;
-    use crate::{v08, Notifications, PendingData, SyncState};
+    use crate::{v08, Notifications, PendingData};
 
     #[tokio::test]
     async fn no_filtering_no_details() {
@@ -184,7 +172,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => {
                 panic!("Expected text message");
@@ -273,7 +261,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => {
                 panic!("Expected text message");
@@ -326,7 +314,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => {
                 panic!("Expected text message");
@@ -375,7 +363,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => {
                 panic!("Expected text message");
@@ -441,7 +429,7 @@ mod tests {
             "method":"starknet_subscriptionPendingTransactions",
             "params": {
                 "result": hash,
-                "subscription_id": subscription_id
+                "subscription_id": subscription_id.to_string()
             }
         })
     }
@@ -464,40 +452,34 @@ mod tests {
                     "type": "DECLARE",
                     "version": "0x0"
                 },
-                "subscription_id": subscription_id
+                "subscription_id": subscription_id.to_string()
             }
         })
     }
 
+    fn sample_header(block_number: u64) -> BlockHeader {
+        BlockHeader {
+            hash: BlockHash(Felt::from_u64(block_number)),
+            number: BlockNumber::new_or_panic(block_number),
+            parent_hash: BlockHash::ZERO,
+            ..Default::default()
+        }
+    }
+
     fn setup() -> Setup {
         let storage = StorageBuilder::in_memory().unwrap();
+        {
+            let mut conn = storage.connection().unwrap();
+            let db = conn.transaction().unwrap();
+            db.insert_block_header(&sample_header(0)).unwrap();
+            db.commit().unwrap();
+        }
         let (pending_data_tx, pending_data) = tokio::sync::watch::channel(Default::default());
         let notifications = Notifications::default();
-        let ctx = RpcContext {
-            cache: Default::default(),
-            storage,
-            execution_storage: StorageBuilder::in_memory().unwrap(),
-            pending_data: PendingWatcher::new(pending_data),
-            sync_status: SyncState {
-                status: Syncing::False(false).into(),
-            }
-            .into(),
-            chain_id: ChainId::MAINNET,
-            core_contract_address: H160::from(pathfinder_ethereum::core_addr::MAINNET),
-            sequencer: Client::mainnet(Duration::from_secs(10)),
-            websocket: None,
-            notifications,
-            ethereum: EthereumClient::new("wss://eth-sepolia.g.alchemy.com/v2/just-for-tests")
-                .unwrap(),
-            config: RpcConfig {
-                batch_concurrency_limit: 1.try_into().unwrap(),
-                get_events_max_blocks_to_scan: 1.try_into().unwrap(),
-                get_events_max_uncached_bloom_filters_to_load: 1.try_into().unwrap(),
-                #[cfg(feature = "aggregate_bloom")]
-                get_events_max_bloom_filters_to_load: 1.try_into().unwrap(),
-                custom_versioned_constants: None,
-            },
-        };
+        let ctx = RpcContext::for_tests()
+            .with_storage(storage)
+            .with_notifications(notifications)
+            .with_pending_data(pending_data);
         let router = v08::register_routes().build(ctx);
         let (sender_tx, sender_rx) = mpsc::channel(1024);
         let (receiver_tx, receiver_rx) = mpsc::channel(1024);

@@ -29,15 +29,9 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Args, Parser};
+use pathfinder_common::prelude::*;
 use pathfinder_common::state_update::ContractClassUpdate;
-use pathfinder_common::{
-    BlockCommitmentSignature,
-    BlockCommitmentSignatureElem,
-    BlockHash,
-    BlockNumber,
-    Chain,
-    ClassHash,
-};
+use pathfinder_common::Chain;
 use pathfinder_lib::state::block_hash::calculate_receipt_commitment;
 use pathfinder_storage::BlockId;
 use primitive_types::H160;
@@ -456,6 +450,10 @@ fn resolve_block(
             price_in_wei: header.eth_l1_data_gas_price,
             price_in_fri: header.strk_l1_data_gas_price,
         },
+        l2_gas_price: Some(GasPrices {
+            price_in_wei: header.eth_l2_gas_price,
+            price_in_fri: header.strk_l2_gas_price,
+        }),
         parent_block_hash: header.parent_hash,
         sequencer_address: Some(header.sequencer_address),
         state_commitment: header.state_commitment,

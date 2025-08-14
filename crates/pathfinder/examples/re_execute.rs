@@ -1,12 +1,14 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use anyhow::Context;
 use pathfinder_common::receipt::Receipt;
 use pathfinder_common::transaction::Transaction;
 use pathfinder_common::{BlockHeader, BlockNumber, ChainId};
-use pathfinder_executor::ExecutionState;
+use pathfinder_executor::{ExecutionState, NativeClassCache};
+use pathfinder_rpc::context::{ETH_FEE_TOKEN_ADDRESS, STRK_FEE_TOKEN_ADDRESS};
 use pathfinder_storage::{BlockId, Storage};
 use rayon::prelude::*;
+use util::percentage::Percentage;
 
 // The Cairo VM allocates felts on the stack, so during execution it's making
 // a huge number of allocations. We get roughly two times better execution
@@ -60,6 +62,8 @@ fn main() -> anyhow::Result<()> {
     let start_time = std::time::Instant::now();
     let mut num_transactions: usize = 0;
 
+    let native_class_cache = NativeClassCache::spawn(NonZeroUsize::new(512).unwrap());
+
     (first_block..=last_block)
         .map(|block_number| {
             let transaction = db.transaction().unwrap();
@@ -86,7 +90,12 @@ fn main() -> anyhow::Result<()> {
             }
         })
         .par_bridge()
-        .for_each_with(storage, |storage, block| execute(storage, chain_id, block));
+        .for_each_with(
+            (storage, native_class_cache),
+            |(storage, native_class_cache), block| {
+                execute(storage, chain_id, block, native_class_cache.clone())
+            },
+        );
 
     let elapsed = start_time.elapsed();
 
@@ -124,15 +133,28 @@ struct Work {
     receipts: Vec<Receipt>,
 }
 
-fn execute(storage: &mut Storage, chain_id: ChainId, work: Work) {
+fn execute(
+    storage: &mut Storage,
+    chain_id: ChainId,
+    work: Work,
+    native_class_cache: NativeClassCache,
+) {
     let start_time = std::time::Instant::now();
     let num_transactions = work.transactions.len();
 
-    let mut connection = storage.connection().unwrap();
+    let mut db_conn = storage.connection().unwrap();
 
-    let db_tx = connection.transaction().expect("Create transaction");
+    let db_tx = db_conn.transaction().expect("Create transaction");
 
-    let execution_state = ExecutionState::trace(&db_tx, chain_id, work.header.clone(), None, None);
+    let execution_state = ExecutionState::trace(
+        chain_id,
+        work.header.clone(),
+        None,
+        Default::default(),
+        ETH_FEE_TOKEN_ADDRESS,
+        STRK_FEE_TOKEN_ADDRESS,
+        Some(native_class_cache),
+    );
 
     let transactions = work
         .transactions
@@ -148,7 +170,7 @@ fn execute(storage: &mut Storage, chain_id: ChainId, work: Work) {
         }
     };
 
-    match pathfinder_executor::simulate(execution_state, transactions, false, false) {
+    match pathfinder_executor::simulate(db_tx, execution_state, transactions, Percentage::new(0)) {
         Ok(simulations) => {
             for (simulation, (receipt, transaction)) in simulations
                 .iter()
@@ -172,38 +194,25 @@ fn execute(storage: &mut Storage, chain_id: ChainId, work: Work) {
 
                 let estimate = &simulation.fee_estimation;
 
-                let (gas_price, data_gas_price) = match estimate.unit {
-                    pathfinder_executor::types::PriceUnit::Wei => (
-                        work.header.eth_l1_gas_price.0,
-                        work.header.eth_l1_data_gas_price.0,
-                    ),
-                    pathfinder_executor::types::PriceUnit::Fri => (
-                        work.header.strk_l1_gas_price.0,
-                        work.header.strk_l1_data_gas_price.0,
-                    ),
-                };
-
                 let actual_data_gas_consumed =
-                    receipt.execution_resources.data_availability.l1_data_gas;
-                let actual_gas_consumed =
-                    if receipt.execution_resources.total_gas_consumed.l1_gas == 0 {
-                        (actual_fee - actual_data_gas_consumed.saturating_mul(data_gas_price))
-                            / gas_price.max(1)
-                    } else {
-                        receipt.execution_resources.total_gas_consumed.l1_gas
-                    };
+                    receipt.execution_resources.total_gas_consumed.l1_data_gas;
+                let actual_gas_consumed = receipt.execution_resources.total_gas_consumed.l1_gas;
+                let actual_l2_gas_consumed = receipt.execution_resources.l2_gas.0;
 
                 let estimated_gas_consumed = estimate.l1_gas_consumed.as_u128();
                 let estimated_data_gas_consumed = estimate.l1_data_gas_consumed.as_u128();
+                let estimated_l2_gas_consumed = estimate.l2_gas_consumed.as_u128();
 
                 let gas_diff = actual_gas_consumed.abs_diff(estimated_gas_consumed);
                 let data_gas_diff = actual_data_gas_consumed.abs_diff(estimated_data_gas_consumed);
+                let l2_gas_diff = actual_l2_gas_consumed.abs_diff(estimated_l2_gas_consumed);
                 let estimate_diff = estimate.overall_fee.abs_diff(actual_fee.into());
 
-                if gas_diff > 0 || data_gas_diff > 0 || estimate_diff > 0.into() {
-                    tracing::warn!(block_number=%work.header.number, transaction_hash=%receipt.transaction_hash, execution_status=?receipt.execution_status, transaction=?transaction.variant, %estimated_gas_consumed, %actual_gas_consumed, %estimated_data_gas_consumed, %actual_data_gas_consumed, estimated_fee=%estimate.overall_fee, %actual_fee, "Estimation mismatch");
+                if gas_diff > 0 || data_gas_diff > 0 || l2_gas_diff > 0 || estimate_diff > 0.into()
+                {
+                    tracing::warn!(block_number=%work.header.number, transaction_hash=%receipt.transaction_hash, execution_status=?receipt.execution_status, transaction=?transaction.variant, %estimated_gas_consumed, %actual_gas_consumed, %estimated_data_gas_consumed, %actual_data_gas_consumed, %estimated_l2_gas_consumed, %actual_l2_gas_consumed, estimated_fee=%estimate.overall_fee, %actual_fee, "Estimation mismatch");
                 } else {
-                    tracing::debug!(block_number=%work.header.number, transaction_hash=%receipt.transaction_hash, %estimated_gas_consumed, %actual_gas_consumed, %estimated_data_gas_consumed, %actual_data_gas_consumed, estimated_fee=%estimate.overall_fee, %actual_fee, "Estimation matches");
+                    tracing::debug!(block_number=%work.header.number, transaction_hash=%receipt.transaction_hash, %estimated_gas_consumed, %actual_gas_consumed, %estimated_data_gas_consumed, %actual_data_gas_consumed, %estimated_l2_gas_consumed, %actual_l2_gas_consumed, estimated_fee=%estimate.overall_fee, %actual_fee, "Estimation matches");
                 }
             }
         }

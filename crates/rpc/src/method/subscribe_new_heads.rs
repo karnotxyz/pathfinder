@@ -1,20 +1,20 @@
 use std::sync::Arc;
 
 use axum::async_trait;
-use pathfinder_common::{BlockId, BlockNumber};
+use pathfinder_common::BlockNumber;
 use tokio::sync::mpsc;
 
 use super::REORG_SUBSCRIPTION_NAME;
 use crate::context::RpcContext;
-use crate::error::ApplicationError;
 use crate::jsonrpc::{CatchUp, RpcError, RpcSubscriptionFlow, SubscriptionMessage};
+use crate::types::request::SubscriptionBlockId;
 use crate::Reorg;
 
 pub struct SubscribeNewHeads;
 
 #[derive(Debug, Clone)]
 pub struct Params {
-    block_id: Option<BlockId>,
+    block_id: Option<SubscriptionBlockId>,
 }
 
 impl crate::dto::DeserializeForVersion for Option<Params> {
@@ -25,7 +25,7 @@ impl crate::dto::DeserializeForVersion for Option<Params> {
         }
         value.deserialize_map(|value| {
             Ok(Some(Params {
-                block_id: value.deserialize_optional_serde("block_id")?,
+                block_id: value.deserialize_optional("block_id")?,
             }))
         })
     }
@@ -37,13 +37,13 @@ pub enum Notification {
     Reorg(Arc<Reorg>),
 }
 
-impl crate::dto::serialize::SerializeForVersion for Notification {
+impl crate::dto::SerializeForVersion for Notification {
     fn serialize(
         &self,
-        serializer: crate::dto::serialize::Serializer,
-    ) -> Result<crate::dto::serialize::Ok, crate::dto::serialize::Error> {
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
         match self {
-            Self::BlockHeader(header) => crate::dto::BlockHeader(header).serialize(serializer),
+            Self::BlockHeader(header) => header.serialize(serializer),
             Self::Reorg(reorg) => reorg.serialize(serializer),
         }
     }
@@ -56,20 +56,11 @@ impl RpcSubscriptionFlow for SubscribeNewHeads {
     type Params = Option<Params>;
     type Notification = Notification;
 
-    fn validate_params(params: &Self::Params) -> Result<(), RpcError> {
-        if let Some(params) = params {
-            if let Some(BlockId::Pending) = params.block_id {
-                return Err(RpcError::ApplicationError(ApplicationError::CallOnPending));
-            }
-        }
-        Ok(())
-    }
-
-    fn starting_block(params: &Self::Params) -> BlockId {
+    fn starting_block(params: &Self::Params) -> SubscriptionBlockId {
         params
             .as_ref()
             .and_then(|req| req.block_id)
-            .unwrap_or(BlockId::Latest)
+            .unwrap_or(SubscriptionBlockId::Latest)
     }
 
     async fn catch_up(
@@ -79,7 +70,7 @@ impl RpcSubscriptionFlow for SubscribeNewHeads {
         to: BlockNumber,
     ) -> Result<CatchUp<Self::Notification>, RpcError> {
         let storage = state.storage.clone();
-        let headers = tokio::task::spawn_blocking(move || -> Result<_, RpcError> {
+        let headers = util::task::spawn_blocking(move |_| -> Result<_, RpcError> {
             let mut conn = storage.connection().map_err(RpcError::InternalError)?;
             let db = conn.transaction().map_err(RpcError::InternalError)?;
             db.block_range(from, to).map_err(RpcError::InternalError)
@@ -168,45 +159,36 @@ mod tests {
     use std::time::Duration;
 
     use axum::extract::ws::Message;
-    use pathfinder_common::{felt, BlockHash, BlockHeader, BlockNumber, ChainId};
+    use pathfinder_common::{felt, BlockHash, BlockHeader, BlockNumber};
     use pathfinder_crypto::Felt;
-    use pathfinder_ethereum::EthereumClient;
     use pathfinder_storage::StorageBuilder;
-    use primitive_types::H160;
-    use starknet_gateway_client::Client;
     use tokio::sync::mpsc;
 
-    use crate::context::{RpcConfig, RpcContext};
-    use crate::jsonrpc::{handle_json_rpc_socket, RpcResponse, RpcRouter, CATCH_UP_BATCH_SIZE};
-    use crate::pending::PendingWatcher;
-    use crate::types::syncing::Syncing;
-    use crate::{v08, Notifications, Reorg, SubscriptionId, SyncState};
+    use super::*;
+    use crate::context::RpcContext;
+    use crate::jsonrpc::{handle_json_rpc_socket, RpcResponse, RpcRouter};
+    use crate::{v08, Notifications, Reorg, SubscriptionId};
 
     #[tokio::test]
     async fn happy_path_with_historic_blocks() {
-        happy_path_test(2000).await;
+        happy_path_test(SubscribeNewHeads::CATCH_UP_BATCH_SIZE + 10).await;
     }
 
     #[tokio::test]
     async fn happy_path_with_historic_blocks_no_batching() {
-        happy_path_test(CATCH_UP_BATCH_SIZE - 5).await;
+        happy_path_test(SubscribeNewHeads::CATCH_UP_BATCH_SIZE - 5).await;
     }
 
     #[tokio::test]
     async fn happy_path_with_historic_blocks_batching_edge_cases() {
-        happy_path_test(2 * CATCH_UP_BATCH_SIZE).await;
-        happy_path_test(2 * (CATCH_UP_BATCH_SIZE - 1)).await;
-        happy_path_test(2 * (CATCH_UP_BATCH_SIZE + 1)).await;
-    }
-
-    #[tokio::test]
-    async fn happy_path_with_no_historic_blocks() {
-        happy_path_test(0).await;
+        happy_path_test(2 * SubscribeNewHeads::CATCH_UP_BATCH_SIZE).await;
+        happy_path_test(2 * (SubscribeNewHeads::CATCH_UP_BATCH_SIZE - 1)).await;
+        happy_path_test(2 * (SubscribeNewHeads::CATCH_UP_BATCH_SIZE + 1)).await;
     }
 
     #[tokio::test]
     async fn reorg() {
-        let (_, mut rx, subscription_id, router) = happy_path_test(0).await;
+        let (_, mut rx, subscription_id, router) = happy_path_test(1).await;
         router
             .context
             .notifications
@@ -238,7 +220,7 @@ mod tests {
                         "last_block_hash": "0x2",
                         "last_block_number": 2
                     },
-                    "subscription_id": subscription_id.0
+                    "subscription_id": subscription_id.0.to_string()
                 }
             })
         );
@@ -269,7 +251,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -336,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_no_params() {
-        let router = setup(0).await;
+        let router = setup(1).await;
         let (sender_tx, mut sender_rx) = mpsc::channel(1024);
         let (receiver_tx, receiver_rx) = mpsc::channel(1024);
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
@@ -357,10 +339,20 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => panic!("Expected text message"),
         };
+
+        // receive latest header
+        let header = sender_rx.recv().await.unwrap().unwrap();
+        let json: serde_json::Value = match header {
+            Message::Text(json) => serde_json::from_str(&json).unwrap(),
+            _ => panic!("Expected text message"),
+        };
+        let expected = sample_new_heads_message(0, subscription_id);
+        assert_eq!(json, expected);
+
         for i in 0..10 {
             retry(|| {
                 router
@@ -384,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_empty_params() {
-        let router = setup(0).await;
+        let router = setup(1).await;
         let (sender_tx, mut sender_rx) = mpsc::channel(1024);
         let (receiver_tx, receiver_rx) = mpsc::channel(1024);
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
@@ -406,10 +398,20 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => panic!("Expected text message"),
         };
+
+        // receive latest header
+        let header = sender_rx.recv().await.unwrap().unwrap();
+        let json: serde_json::Value = match header {
+            Message::Text(json) => serde_json::from_str(&json).unwrap(),
+            _ => panic!("Expected text message"),
+        };
+        let expected = sample_new_heads_message(0, subscription_id);
+        assert_eq!(json, expected);
+
         for i in 0..10 {
             retry(|| {
                 router
@@ -433,13 +435,13 @@ mod tests {
 
     #[tokio::test]
     async fn unsubscribe() {
-        let (tx, mut rx, subscription_id, router) = happy_path_test(0).await;
+        let (tx, mut rx, subscription_id, router) = happy_path_test(1).await;
         tx.send(Ok(Message::Text(
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 100,
                 "method": "starknet_unsubscribe",
-                "params": {"subscription_id": subscription_id.0}
+                "params": {"subscription_id": subscription_id.0.to_string()}
             })
             .to_string(),
         )))
@@ -471,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_with_pending_block() {
-        let router = setup(0).await;
+        let router = setup(1).await;
         let (sender_tx, mut sender_rx) = mpsc::channel(1024);
         let (receiver_tx, receiver_rx) = mpsc::channel(1024);
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
@@ -503,14 +505,18 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "error": {
-                    "code": 69,
-                    "message": "This method does not support being called on the pending block"
+                    "code": -32602,
+                    "message": "Invalid params",
+                    "data": {
+                        "reason": "Invalid block id"
+                    }
                 }
             })
         );
     }
 
     async fn setup(num_blocks: u64) -> RpcRouter {
+        assert!(num_blocks > 0);
         let storage = StorageBuilder::in_memory().unwrap();
         tokio::task::spawn_blocking({
             let storage = storage.clone();
@@ -528,31 +534,10 @@ mod tests {
         .unwrap();
         let (_, pending_data) = tokio::sync::watch::channel(Default::default());
         let notifications = Notifications::default();
-        let ctx = RpcContext {
-            cache: Default::default(),
-            storage,
-            execution_storage: StorageBuilder::in_memory().unwrap(),
-            pending_data: PendingWatcher::new(pending_data),
-            sync_status: SyncState {
-                status: Syncing::False(false).into(),
-            }
-            .into(),
-            chain_id: ChainId::MAINNET,
-            core_contract_address: H160::from(pathfinder_ethereum::core_addr::MAINNET),
-            sequencer: Client::mainnet(Duration::from_secs(10)),
-            websocket: None,
-            notifications,
-            ethereum: EthereumClient::new("wss://eth-sepolia.g.alchemy.com/v2/just-for-tests")
-                .unwrap(),
-            config: RpcConfig {
-                batch_concurrency_limit: 1.try_into().unwrap(),
-                get_events_max_blocks_to_scan: 1.try_into().unwrap(),
-                get_events_max_uncached_bloom_filters_to_load: 1.try_into().unwrap(),
-                #[cfg(feature = "aggregate_bloom")]
-                get_events_max_bloom_filters_to_load: 1.try_into().unwrap(),
-                custom_versioned_constants: None,
-            },
-        };
+        let ctx = RpcContext::for_tests()
+            .with_storage(storage)
+            .with_notifications(notifications)
+            .with_pending_data(pending_data);
         v08::register_routes().build(ctx)
     }
 
@@ -595,7 +580,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -663,7 +648,7 @@ mod tests {
                     "starknet_version": "",
                     "timestamp": 0
                 },
-                "subscription_id": subscription_id
+                "subscription_id": subscription_id.to_string()
             }
         })
     }

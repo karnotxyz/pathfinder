@@ -5,35 +5,21 @@ use std::sync::Arc;
 use anyhow::Context;
 use p2p::libp2p::PeerId;
 use p2p::PeerData;
+use pathfinder_common::prelude::*;
 use pathfinder_common::state_update::{
     self,
     ContractClassUpdate,
     ContractUpdate,
     StateUpdateData,
+    StateUpdateError,
     StateUpdateRef,
     SystemContractUpdate,
-};
-use pathfinder_common::{
-    BlockHash,
-    BlockHeader,
-    BlockNumber,
-    CasmHash,
-    ClassCommitment,
-    ClassHash,
-    ContractAddress,
-    SierraHash,
-    StarknetVersion,
-    StateCommitment,
-    StateDiffCommitment,
-    StateUpdate,
-    StorageCommitment,
 };
 use pathfinder_merkle_tree::contract_state::ContractStateUpdateResult;
 use pathfinder_merkle_tree::starknet_state::update_starknet_state;
 use pathfinder_merkle_tree::StorageCommitmentTree;
 use pathfinder_storage::{Storage, TrieUpdate};
 use tokio::sync::mpsc;
-use tokio::task::spawn_blocking;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::storage_adapters;
@@ -46,7 +32,7 @@ pub(super) async fn next_missing(
     storage: Storage,
     head: BlockNumber,
 ) -> anyhow::Result<Option<BlockNumber>> {
-    spawn_blocking(move || {
+    util::task::spawn_blocking(move |_| {
         let mut db = storage
             .connection()
             .context("Creating database connection")?;
@@ -146,21 +132,13 @@ impl ProcessStage for VerifyCommitment {
 mod multi_block {
     use std::collections::{HashMap, HashSet};
 
+    use pathfinder_common::prelude::*;
     use pathfinder_common::state_update::{
         ContractClassUpdate,
         ContractUpdateRef,
         StateUpdateRef,
         StorageRef,
         SystemContractUpdateRef,
-    };
-    use pathfinder_common::{
-        CasmHash,
-        ClassHash,
-        ContractAddress,
-        ContractNonce,
-        SierraHash,
-        StorageAddress,
-        StorageValue,
     };
 
     #[derive(Default, Debug, Clone, PartialEq)]
@@ -260,7 +238,7 @@ pub async fn batch_update_starknet_state(
     verify_tree_hashes: bool,
     state_updates: Vec<PeerData<(StateUpdateData, BlockNumber)>>,
 ) -> Result<PeerData<BlockNumber>, SyncError> {
-    tokio::task::spawn_blocking(move || {
+    util::task::spawn_blocking(move |_| {
         let mut db = storage
             .connection()
             .context("Creating database connection")?;
@@ -286,7 +264,15 @@ pub async fn batch_update_starknet_state(
             tail,
             storage.clone(),
         )
-        .context("Updating Starknet state")?;
+        .map_err(|error| match error {
+            StateUpdateError::ContractClassHashMissing(for_contract) => {
+                tracing::debug!(%for_contract, "Contract class hash is missing");
+                SyncError::ContractClassMissing(peer)
+            }
+            StateUpdateError::StorageError(error) => SyncError::Fatal(Arc::new(
+                error.context(format!("Updating Starknet state, tail {tail}")),
+            )),
+        })?;
         let state_commitment = StateCommitment::calculate(storage_commitment, class_commitment);
         let expected_state_commitment = db
             .state_commitment(tail.into())
@@ -303,8 +289,6 @@ pub async fn batch_update_starknet_state(
             "State root mismatch");
             return Err(SyncError::StateRootMismatch(peer));
         }
-        db.update_storage_and_class_commitments(tail, storage_commitment, class_commitment)
-            .context("Updating storage and class commitments")?;
         db.commit().context("Committing db transaction")?;
 
         Ok(PeerData::new(peer, tail))

@@ -103,16 +103,8 @@ mod tests {
 
     use assert_matches::assert_matches;
     use pathfinder_common::macro_prelude::*;
+    use pathfinder_common::prelude::*;
     use pathfinder_common::transaction::{L1HandlerTransaction, Transaction, TransactionVariant};
-    use pathfinder_common::{
-        BlockHash,
-        BlockNumber,
-        BlockTimestamp,
-        GasPrice,
-        StarknetVersion,
-        StateCommitment,
-        StateUpdate,
-    };
     use pathfinder_storage::StorageBuilder;
     use starknet_gateway_client::MockGatewayApi;
     use starknet_gateway_types::reply::{
@@ -135,6 +127,7 @@ mod tests {
         block_number: BlockNumber::new_or_panic(1),
         l1_gas_price: Default::default(),
         l1_data_gas_price: Default::default(),
+        l2_gas_price: Default::default(),
         parent_block_hash: PARENT_HASH,
         sequencer_address: None,
         state_commitment: PARENT_ROOT,

@@ -19,8 +19,6 @@ pub struct Peer {
     pub min_ping: Option<Duration>,
     pub evicted: bool,
     pub useful: bool,
-    // TODO are we still able to maintain info about peers' sync heads?
-    // sync_status: Option<p2p_proto_v0::sync::Status>,
 }
 
 impl Peer {
@@ -39,7 +37,7 @@ impl Peer {
     pub fn is_relayed(&self) -> bool {
         self.addr
             .as_ref()
-            .map_or(false, |addr| addr.iter().any(|p| p == Protocol::P2pCircuit))
+            .is_some_and(|addr| addr.iter().any(|p| p == Protocol::P2pCircuit))
     }
 
     pub fn ip_addr(&self) -> Option<IpAddr> {

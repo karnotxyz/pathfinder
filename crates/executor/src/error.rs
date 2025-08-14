@@ -1,9 +1,10 @@
+use blockifier::blockifier::transaction_executor::TransactionExecutorError as BlockifierTransactionExecutorError;
 use blockifier::execution::errors::{
     ConstructorEntryPointExecutionError,
     EntryPointExecutionError as BlockifierEntryPointExecutionError,
     PreExecutionError,
 };
-use blockifier::execution::stack_trace::gen_transaction_execution_error_trace;
+use blockifier::execution::stack_trace::gen_tx_execution_error_trace;
 use blockifier::state::errors::StateError;
 use blockifier::transaction::errors::TransactionExecutionError as BlockifierTransactionExecutionError;
 
@@ -22,14 +23,15 @@ impl From<BlockifierTransactionExecutionError> for CallError {
     fn from(value: BlockifierTransactionExecutionError) -> Self {
         use BlockifierTransactionExecutionError::*;
 
-        let error_stack = gen_transaction_execution_error_trace(&value);
+        let error_stack = gen_tx_execution_error_trace(&value);
 
         match value {
             ContractConstructorExecutionFailed(
                 ConstructorEntryPointExecutionError::ExecutionError { error, .. },
             ) => match error {
                 BlockifierEntryPointExecutionError::PreExecutionError(
-                    PreExecutionError::EntryPointNotFound(_),
+                    PreExecutionError::EntryPointNotFound(_)
+                    | PreExecutionError::NoEntryPointOfTypeFound(_),
                 ) => Self::InvalidMessageSelector,
                 BlockifierEntryPointExecutionError::PreExecutionError(
                     PreExecutionError::UninitializedStorageAddress(_),
@@ -38,7 +40,8 @@ impl From<BlockifierTransactionExecutionError> for CallError {
             },
             ExecutionError { error, .. } => match error {
                 BlockifierEntryPointExecutionError::PreExecutionError(
-                    PreExecutionError::EntryPointNotFound(_),
+                    PreExecutionError::EntryPointNotFound(_)
+                    | PreExecutionError::NoEntryPointOfTypeFound(_),
                 ) => Self::InvalidMessageSelector,
                 BlockifierEntryPointExecutionError::PreExecutionError(
                     PreExecutionError::UninitializedStorageAddress(_),
@@ -47,7 +50,8 @@ impl From<BlockifierTransactionExecutionError> for CallError {
             },
             ValidateTransactionError { error, .. } => match error {
                 BlockifierEntryPointExecutionError::PreExecutionError(
-                    PreExecutionError::EntryPointNotFound(_),
+                    PreExecutionError::EntryPointNotFound(_)
+                    | PreExecutionError::NoEntryPointOfTypeFound(_),
                 ) => Self::InvalidMessageSelector,
                 BlockifierEntryPointExecutionError::PreExecutionError(
                     PreExecutionError::UninitializedStorageAddress(_),
@@ -98,6 +102,31 @@ impl From<anyhow::Error> for CallError {
 }
 
 #[derive(Debug)]
+pub struct TransactionExecutorError {
+    pub transaction_index: usize,
+    pub error: BlockifierTransactionExecutorError,
+}
+
+impl TransactionExecutorError {
+    pub fn new(transaction_index: usize, error: BlockifierTransactionExecutorError) -> Self {
+        Self {
+            transaction_index,
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for TransactionExecutorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Executor error (transaction index: {}): {}",
+            self.transaction_index, self.error
+        )
+    }
+}
+
+#[derive(Debug)]
 pub enum TransactionExecutionError {
     ExecutionError {
         transaction_index: usize,
@@ -106,6 +135,20 @@ pub enum TransactionExecutionError {
     },
     Internal(anyhow::Error),
     Custom(anyhow::Error),
+}
+
+impl From<TransactionExecutorError> for TransactionExecutionError {
+    fn from(error: TransactionExecutorError) -> Self {
+        match error.error {
+            BlockifierTransactionExecutorError::TransactionExecutionError(err) => {
+                TransactionExecutionError::new(error.transaction_index, err)
+            }
+            _ => TransactionExecutionError::Custom(anyhow::anyhow!(
+                "Transaction execution error: {}",
+                error
+            )),
+        }
+    }
 }
 
 impl From<StateError> for TransactionExecutionError {
@@ -131,7 +174,7 @@ impl From<anyhow::Error> for TransactionExecutionError {
 
 impl TransactionExecutionError {
     pub fn new(transaction_index: usize, error: BlockifierTransactionExecutionError) -> Self {
-        let error_stack = gen_transaction_execution_error_trace(&error);
+        let error_stack = gen_tx_execution_error_trace(&error);
 
         Self::ExecutionError {
             transaction_index,

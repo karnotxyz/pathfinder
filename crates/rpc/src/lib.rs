@@ -11,14 +11,15 @@ mod pathfinder;
 mod pending;
 #[cfg(test)]
 mod test_setup;
+mod tracker;
 pub mod types;
 pub mod v06;
 pub mod v07;
 pub mod v08;
+pub mod v09;
 
 use std::net::SocketAddr;
 use std::result::Result;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Context;
 use axum::error_handling::HandleErrorLayer;
@@ -48,6 +49,7 @@ pub enum RpcVersion {
     #[default]
     V07,
     V08,
+    V09,
     PathfinderV01,
 }
 
@@ -57,6 +59,7 @@ impl RpcVersion {
             RpcVersion::V06 => "v0.6",
             RpcVersion::V07 => "v0.7",
             RpcVersion::V08 => "v0.8",
+            RpcVersion::V09 => "v0.9",
             RpcVersion::PathfinderV01 => "v0.1",
         }
     }
@@ -109,7 +112,7 @@ impl RpcServer {
             Err(e) => {
                 return Err(e).context(format!(
                     "RPC address {} is already in use.
-    
+
             Hint: This usually means you are already running another instance of pathfinder.
             Hint: If this happens when upgrading, make sure to shut down the first one first.
             Hint: If you are looking to run two instances of pathfinder, you must configure them \
@@ -167,12 +170,14 @@ impl RpcServer {
         let v06_routes = v06::register_routes().build(self.context.clone());
         let v07_routes = v07::register_routes().build(self.context.clone());
         let v08_routes = v08::register_routes().build(self.context.clone());
+        let v09_routes = v09::register_routes().build(self.context.clone());
         let pathfinder_routes = pathfinder::register_routes().build(self.context.clone());
 
         let default_router = match self.default_version {
             RpcVersion::V06 => v06_routes.clone(),
             RpcVersion::V07 => v07_routes.clone(),
             RpcVersion::V08 => v08_routes.clone(),
+            RpcVersion::V09 => v09_routes.clone(),
             RpcVersion::PathfinderV01 => {
                 anyhow::bail!("Did not expect default RPC version to be Pathfinder v0.1")
             }
@@ -187,9 +192,10 @@ impl RpcServer {
             .with_state(v06_routes.clone())
             .route("/rpc/v0_7", post(rpc_handler))
             .with_state(v07_routes.clone())
-            // TODO Uncomment once RPC 0.8 is ready.
             .route("/rpc/v0_8", post(rpc_handler).get(rpc_handler))
             .with_state(v08_routes.clone())
+            .route("/rpc/v0_9", post(rpc_handler).get(rpc_handler))
+            .with_state(v09_routes.clone())
             .route("/rpc/pathfinder/v0.1", post(rpc_handler))
             .route("/rpc/pathfinder/v0_1", post(rpc_handler))
             .with_state(pathfinder_routes.clone());
@@ -202,6 +208,10 @@ impl RpcServer {
                 .with_state(v06_routes)
                 .route("/ws/rpc/v0_7", get(websocket_handler))
                 .with_state(v07_routes)
+                .route("/ws/rpc/v0_8", post(rpc_handler).get(rpc_handler))
+                .with_state(v08_routes)
+                .route("/ws/rpc/v0_9", post(rpc_handler).get(rpc_handler))
+                .with_state(v09_routes)
                 .route("/ws/rpc/pathfinder/v0_1", get(websocket_handler))
                 .with_state(pathfinder_routes)
         } else {
@@ -210,8 +220,9 @@ impl RpcServer {
 
         let router = router.layer(middleware);
 
-        let server_handle = tokio::spawn(async move {
+        let server_handle = util::task::spawn(async move {
             axum::serve(listener, router.into_make_service())
+                .with_graceful_shutdown(util::task::cancellation_token().cancelled_owned())
                 .await
                 .map_err(Into::into)
         });
@@ -234,18 +245,31 @@ pub struct SyncState {
 impl Default for SyncState {
     fn default() -> Self {
         Self {
-            status: RwLock::new(Syncing::False(false)),
+            status: RwLock::new(Syncing::False),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
 pub(crate) struct SubscriptionId(pub u32);
 
-impl SubscriptionId {
-    pub fn next() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        SubscriptionId(COUNTER.fetch_add(1, Ordering::Relaxed))
+impl crate::dto::SerializeForVersion for SubscriptionId {
+    fn serialize(
+        &self,
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
+        serializer.serialize_str(self.0.to_string().as_str())
+    }
+}
+
+impl crate::dto::DeserializeForVersion for SubscriptionId {
+    fn deserialize(value: crate::dto::Value) -> Result<Self, serde_json::Error> {
+        let id: String = value.deserialize()?;
+        let id: u32 = id.parse().map_err(|_| {
+            use serde::de::Error;
+            serde_json::Error::custom(format!("Failed to parse subscription id: {id:?}"))
+        })?;
+        Ok(Self(id))
     }
 }
 
@@ -269,6 +293,43 @@ pub mod test_utils {
     use starknet_gateway_types::reply::GasPrices;
 
     use crate::pending::PendingData;
+
+    #[macro_export]
+    macro_rules! fixture {
+        ($version:expr, $file_name:literal) => {{
+            match $version {
+                $crate::RpcVersion::V06 => {
+                    include_str!(concat!("../../fixtures/0.6.0/", $file_name))
+                }
+                $crate::RpcVersion::V07 => {
+                    include_str!(concat!("../../fixtures/0.7.0/", $file_name))
+                }
+                $crate::RpcVersion::V08 => {
+                    include_str!(concat!("../../fixtures/0.8.0/", $file_name))
+                }
+                $crate::RpcVersion::V09 => {
+                    include_str!(concat!("../../fixtures/0.9.0/", $file_name))
+                }
+                _ => unreachable!(),
+            }
+        }};
+    }
+
+    #[macro_export]
+    macro_rules! assert_json_matches_fixture {
+        ($output_json:expr, $version:expr, $file_name:literal) => {{
+            let expected_str = $crate::fixture!($version, $file_name);
+            let expected_json: serde_json::Value =
+                serde_json::from_str(expected_str).expect("Failed to parse fixture as JSON");
+
+            pretty_assertions_sorted::assert_eq!(
+                $output_json,
+                expected_json,
+                "\nExpected fixture content from {}\nGot output",
+                $file_name
+            );
+        }};
+    }
 
     // Creates storage for tests
     pub fn setup_storage(trie_prune_mode: pathfinder_storage::TriePruneMode) -> Storage {
@@ -379,9 +440,7 @@ pub mod test_utils {
             .unwrap();
         let header0 = BlockHeader::builder()
             .number(BlockNumber::GENESIS)
-            .storage_commitment(storage_commitment0)
-            .class_commitment(class_commitment0)
-            .calculated_state_commitment()
+            .calculated_state_commitment(storage_commitment0, class_commitment0)
             .finalize_with_hash(block_hash_bytes!(b"genesis"));
         db_txn.insert_block_header(&header0).unwrap();
         db_txn
@@ -421,9 +480,7 @@ pub mod test_utils {
         let header1 = header0
             .child_builder()
             .timestamp(BlockTimestamp::new_or_panic(1))
-            .storage_commitment(storage_commitment1)
-            .class_commitment(class_commitment1)
-            .calculated_state_commitment()
+            .calculated_state_commitment(storage_commitment1, class_commitment1)
             .eth_l1_gas_price(GasPrice::from(1))
             .sequencer_address(sequencer_address_bytes!(&[1u8]))
             .finalize_with_hash(block_hash_bytes!(b"block 1"));
@@ -507,9 +564,7 @@ pub mod test_utils {
         let header2 = header1
             .child_builder()
             .timestamp(BlockTimestamp::new_or_panic(2))
-            .storage_commitment(storage_commitment2)
-            .class_commitment(class_commitment2)
-            .calculated_state_commitment()
+            .calculated_state_commitment(storage_commitment2, class_commitment2)
             .eth_l1_gas_price(GasPrice::from(2))
             .sequencer_address(sequencer_address_bytes!(&[2u8]))
             .finalize_with_hash(block_hash_bytes!(b"latest"));
@@ -737,8 +792,8 @@ pub mod test_utils {
             ),
         ];
 
-        let transactions = transactions.into_iter().map(Into::into).collect();
-        let transaction_receipts = transaction_receipts.into_iter().map(Into::into).collect();
+        let transactions = transactions.into_iter().collect();
+        let transaction_receipts = transaction_receipts.into_iter().collect();
 
         let contract1 = contract_address_bytes!(b"pending contract 1 address");
         let state_update = StateUpdate::default()
@@ -825,6 +880,7 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    use dto::DeserializeForVersion;
     use serde_json::json;
 
     use super::*;
@@ -834,9 +890,7 @@ mod tests {
         use crate::types::syncing::{NumberedBlock, Status, Syncing};
 
         let examples = [
-            (line!(), "false", Syncing::False(false)),
-            // this shouldn't exist but it exists now
-            (line!(), "true", Syncing::False(true)),
+            (line!(), "false", Syncing::False),
             (
                 line!(),
                 r#"{"starting_block_hash":"0xa","starting_block_num":"0x1","current_block_hash":"0xb","current_block_num":"0x2","highest_block_hash":"0xc","highest_block_num":"0x3"}"#,
@@ -849,11 +903,10 @@ mod tests {
         ];
 
         for (line, input, expected) in examples {
-            let parsed = serde_json::from_str::<Syncing>(input).unwrap();
-            let output = serde_json::to_string(&parsed).unwrap();
-
+            let parsed =
+                Syncing::deserialize(crate::dto::Value::from_str(input, RpcVersion::V07).unwrap())
+                    .unwrap();
             assert_eq!(parsed, expected, "example from line {line}");
-            assert_eq!(&output, input, "example from line {line}");
         }
     }
 
@@ -912,15 +965,51 @@ mod tests {
 
     #[rustfmt::skip]
     #[rstest::rstest]
-    #[case::root_api("/", "v06/starknet_api_openrpc.json",       &[], Api::HttpOnly)]
-    #[case::root_api_websocket("/ws", "v06/starknet_api_openrpc.json",       &[], Api::WebsocketOnly)]
-    #[case::root_trace("/", "v06/starknet_trace_api_openrpc.json", &[], Api::HttpOnly)]
-    #[case::root_trace_websocket("/ws", "v06/starknet_trace_api_openrpc.json", &[], Api::WebsocketOnly)]
-    #[case::root_write("/", "v06/starknet_write_api.json",         &[], Api::HttpOnly)]
-    #[case::root_write_websocket("/ws", "v06/starknet_write_api.json",         &[], Api::WebsocketOnly)]
+    #[case::root_api("/", "v07/starknet_api_openrpc.json",       &[], Api::HttpOnly)]
+    #[case::root_api_websocket("/ws", "v07/starknet_api_openrpc.json",       &[], Api::WebsocketOnly)]
+    #[case::root_trace("/", "v07/starknet_trace_api_openrpc.json", &[], Api::HttpOnly)]
+    #[case::root_trace_websocket("/ws", "v07/starknet_trace_api_openrpc.json", &[], Api::WebsocketOnly)]
+    #[case::root_write("/", "v07/starknet_write_api.json",         &[], Api::HttpOnly)]
+    #[case::root_write_websocket("/ws", "v07/starknet_write_api.json",         &[], Api::WebsocketOnly)]
     // get_transaction_status is now part of the official spec, so we are phasing it out.
     #[case::root_pathfinder("/", "pathfinder_rpc_api.json", &["pathfinder_version", "pathfinder_getTransactionStatus"], Api::HttpOnly)]
     #[case::root_pathfinder_websocket("/ws", "pathfinder_rpc_api.json", &["pathfinder_version", "pathfinder_getTransactionStatus"], Api::WebsocketOnly)]
+
+    #[case::v0_9_api("/rpc/v0_9", "v09/starknet_api_openrpc.json", &[], Api::Both)]
+    #[case::v0_9_executables("/rpc/v0_9", "v09/starknet_executables.json", &[], Api::Both)]
+    #[case::v0_9_trace("/rpc/v0_9", "v09/starknet_trace_api_openrpc.json", &[], Api::Both)]
+    #[case::v0_9_write("/rpc/v0_9", "v09/starknet_write_api.json", &[], Api::Both)]
+    #[case::v0_9_websocket(
+        "/rpc/v0_9",
+        "v09/starknet_ws_api.json",
+        // "starknet_subscription*" methods are in fact notifications
+        &[
+            "starknet_subscriptionNewHeads",
+            "starknet_subscriptionPendingTransactions",
+            "starknet_subscriptionTransactionStatus",
+            "starknet_subscriptionEvents",
+            "starknet_subscriptionReorg"
+        ],
+        Api::WebsocketOnly)]
+
+    #[case::v0_9_api_alternative_path("/ws/rpc/v0_9", "v09/starknet_api_openrpc.json", &[], Api::Both)]
+    #[case::v0_9_executables_alternative_path("/ws/rpc/v0_9", "v09/starknet_executables.json", &[], Api::Both)]
+    #[case::v0_9_trace_alternative_path("/ws/rpc/v0_9", "v09/starknet_trace_api_openrpc.json", &[], Api::Both)]
+    #[case::v0_9_write_alternative_path("/ws/rpc/v0_9", "v09/starknet_write_api.json", &[], Api::Both)]
+    #[case::v0_9_websocket_alternative_path(
+        "/ws/rpc/v0_9",
+        "v09/starknet_ws_api.json",
+        // "starknet_subscription*" methods are in fact notifications
+        &[
+            "starknet_subscriptionNewHeads",
+            "starknet_subscriptionPendingTransactions",
+            "starknet_subscriptionTransactionStatus",
+            "starknet_subscriptionEvents",
+            "starknet_subscriptionReorg"
+        ],
+        Api::WebsocketOnly)]
+    // get_transaction_status is now part of the official spec, so we are phasing it out.
+    #[case::v0_9_pathfinder("/rpc/v0_9", "pathfinder_rpc_api.json", &["pathfinder_version", "pathfinder_getTransactionStatus"], Api::Both)]
 
     #[case::v0_8_api("/rpc/v0_8", "v08/starknet_api_openrpc.json", &[], Api::Both)]
     #[case::v0_8_executables("/rpc/v0_8", "v08/starknet_executables.json", &[], Api::Both)]
@@ -928,6 +1017,23 @@ mod tests {
     #[case::v0_8_write("/rpc/v0_8", "v08/starknet_write_api.json", &[], Api::Both)]
     #[case::v0_8_websocket(
         "/rpc/v0_8",
+        "v08/starknet_ws_api.json",
+        // "starknet_subscription*" methods are in fact notifications
+        &[
+            "starknet_subscriptionNewHeads",
+            "starknet_subscriptionPendingTransactions",
+            "starknet_subscriptionTransactionStatus",
+            "starknet_subscriptionEvents",
+            "starknet_subscriptionReorg"
+        ],
+        Api::WebsocketOnly)]
+
+    #[case::v0_8_api_alternative_path("/ws/rpc/v0_8", "v08/starknet_api_openrpc.json", &[], Api::Both)]
+    #[case::v0_8_executables_alternative_path("/ws/rpc/v0_8", "v08/starknet_executables.json", &[], Api::Both)]
+    #[case::v0_8_trace_alternative_path("/ws/rpc/v0_8", "v08/starknet_trace_api_openrpc.json", &[], Api::Both)]
+    #[case::v0_8_write_alternative_path("/ws/rpc/v0_8", "v08/starknet_write_api.json", &[], Api::Both)]
+    #[case::v0_8_websocket_alternative_path(
+        "/ws/rpc/v0_8",
         "v08/starknet_ws_api.json",
         // "starknet_subscription*" methods are in fact notifications
         &[
@@ -951,9 +1057,17 @@ mod tests {
     #[case::v0_7_pathfinder("/rpc/v0_7", "pathfinder_rpc_api.json", &["pathfinder_version", "pathfinder_getTransactionStatus"], Api::HttpOnly)]
     #[case::v0_7_pathfinder_websocket("/ws/rpc/v0_7", "pathfinder_rpc_api.json", &["pathfinder_version", "pathfinder_getTransactionStatus"], Api::WebsocketOnly)]
 
-    #[case::v0_6_api("/rpc/v0_6", "v06/starknet_api_openrpc.json", &[], Api::HttpOnly)]
+    #[case::v0_6_api(
+        "/rpc/v0_6",
+        "v06/starknet_api_openrpc.json",
+        &[],
+        Api::HttpOnly)]
     #[case::v0_6_api_websocket("/ws/rpc/v0_6", "v06/starknet_api_openrpc.json", &[], Api::WebsocketOnly)]
-    #[case::v0_6_trace("/rpc/v0_6", "v06/starknet_trace_api_openrpc.json", &[], Api::HttpOnly)]
+    #[case::v0_6_trace(
+        "/rpc/v0_6",
+        "v06/starknet_trace_api_openrpc.json",
+        &[],
+        Api::HttpOnly)]
     #[case::v0_6_trace_websocket("/ws/rpc/v0_6", "v06/starknet_trace_api_openrpc.json", &[], Api::WebsocketOnly)]
     #[case::v0_6_write("/rpc/v0_6", "v06/starknet_write_api.json", &[], Api::HttpOnly)]
     #[case::v0_6_write_websocket("/ws/rpc/v0_6", "v06/starknet_write_api.json", &[], Api::WebsocketOnly)]
@@ -974,7 +1088,7 @@ mod tests {
         let specification = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
-            .join("doc")
+            .join("specs")
             .join("rpc")
             .join(specification);
         let specification = std::fs::File::open(specification).unwrap();
@@ -1013,6 +1127,7 @@ mod tests {
             .unwrap();
 
         let method_not_found = json!(-32601);
+        let invalid_params = json!(-32602);
 
         if api.has_http() {
             let url = format!("http://{addr}{route}");
@@ -1024,6 +1139,9 @@ mod tests {
                     "jsonrpc": "2.0",
                     "method": method,
                     "id": 0,
+                    "params": {
+                        "invalid_param": null,
+                    }
                 });
 
                 let res: serde_json::Value = client
@@ -1039,6 +1157,7 @@ mod tests {
                 if res["error"]["code"] == method_not_found {
                     failures.push(method);
                 }
+                assert_eq!(res["error"]["code"], invalid_params);
             }
 
             if !failures.is_empty() {
@@ -1052,6 +1171,9 @@ mod tests {
                     "jsonrpc": "2.0",
                     "method": excluded,
                     "id": 0,
+                    "params": {
+                        "invalid_param": null,
+                    }
                 });
 
                 let res: serde_json::Value = client
@@ -1088,15 +1210,19 @@ mod tests {
                     "jsonrpc": "2.0",
                     "method": method,
                     "id": 0,
+                    "params": {
+                        "invalid_param": null,
+                    }
                 });
 
                 stream.send(Message::Text(request.to_string())).await.unwrap();
-                let res = stream.next().await.unwrap().unwrap();
+                let res: Message = stream.next().await.unwrap().unwrap();
                 let res: serde_json::Value = serde_json::from_str(&res.to_string()).unwrap();
 
                 if res["error"]["code"] == method_not_found {
                     failures.push(method);
                 }
+                assert_eq!(res["error"]["code"], invalid_params);
             }
 
             if !failures.is_empty() {
@@ -1110,6 +1236,9 @@ mod tests {
                     "jsonrpc": "2.0",
                     "method": excluded,
                     "id": 0,
+                    "params": {
+                        "invalid_param": null,
+                    }
                 });
 
                 stream.send(Message::Text(request.to_string())).await.unwrap();

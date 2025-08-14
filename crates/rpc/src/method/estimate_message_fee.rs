@@ -1,44 +1,92 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use pathfinder_common::{BlockId, CallParam, ChainId, TransactionNonce};
+use pathfinder_common::prelude::*;
+use pathfinder_common::BlockId;
 use pathfinder_crypto::Felt;
 use pathfinder_executor::{ExecutionState, IntoStarkFelt, L1BlobDataAvailability};
 use starknet_api::core::PatriciaKey;
+use starknet_api::transaction::fields::{Calldata, Fee};
 
 use crate::context::RpcContext;
 use crate::error::ApplicationError;
-use crate::v06::method::estimate_message_fee as v06;
+use crate::executor::CALLDATA_LIMIT;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct EstimateMessageFeeInput {
+    pub message: MsgFromL1,
+    pub block_id: BlockId,
+}
+
+impl crate::dto::DeserializeForVersion for EstimateMessageFeeInput {
+    fn deserialize(value: crate::dto::Value) -> Result<Self, serde_json::Error> {
+        value.deserialize_map(|value| {
+            Ok(Self {
+                message: value.deserialize("message")?,
+                block_id: value.deserialize("block_id")?,
+            })
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MsgFromL1 {
+    pub from_address: EthereumAddress,
+    pub to_address: ContractAddress,
+    pub entry_point_selector: EntryPoint,
+    pub payload: Vec<CallParam>,
+}
+
+impl crate::dto::DeserializeForVersion for MsgFromL1 {
+    fn deserialize(value: crate::dto::Value) -> Result<Self, serde_json::Error> {
+        value.deserialize_map(|value| {
+            Ok(Self {
+                from_address: value.deserialize("from_address")?,
+                to_address: value.deserialize("to_address").map(ContractAddress)?,
+                entry_point_selector: value.deserialize("entry_point_selector").map(EntryPoint)?,
+                payload: value
+                    .deserialize_array("payload", |value| value.deserialize().map(CallParam))?,
+            })
+        })
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Output(pathfinder_executor::types::FeeEstimate);
 
 pub async fn estimate_message_fee(
     context: RpcContext,
-    input: v06::EstimateMessageFeeInput,
+    input: EstimateMessageFeeInput,
 ) -> Result<Output, EstimateMessageFeeError> {
     let span = tracing::Span::current();
-
-    let mut result = tokio::task::spawn_blocking(move || {
+    if input.message.payload.len() > CALLDATA_LIMIT {
+        return Err(EstimateMessageFeeError::Custom(anyhow::anyhow!(
+            "Calldata limit ({CALLDATA_LIMIT}) exceeded"
+        )));
+    }
+    let mut result = util::task::spawn_blocking(move |_| {
         let _g = span.enter();
-        let mut db = context
+        let mut db_conn = context
             .storage
             .connection()
             .context("Creating database connection")?;
-        let db = db.transaction().context("Creating database transaction")?;
+        let db_tx = db_conn
+            .transaction()
+            .context("Creating database transaction")?;
 
         let (header, pending) = match input.block_id {
             BlockId::Pending => {
                 let pending = context
                     .pending_data
-                    .get(&db)
+                    .get(&db_tx)
                     .context("Querying pending data")?;
 
                 (pending.header(), Some(pending.state_update.clone()))
             }
             other => {
                 let block_id = other.try_into().expect("Only pending cast should fail");
-                let header = db
+
+                let header = db_tx
                     .block_header(block_id)
                     .context("Querying block header")?
                     .ok_or(EstimateMessageFeeError::BlockNotFound)?;
@@ -47,22 +95,29 @@ pub async fn estimate_message_fee(
             }
         };
 
-        if !db.contract_exists(input.message.to_address, header.number.into())? {
+        if !db_tx.contract_exists(input.message.to_address, header.number.into())? {
             return Err(EstimateMessageFeeError::ContractNotFound);
         }
 
         let state = ExecutionState::simulation(
-            &db,
             context.chain_id,
             header,
             pending,
             L1BlobDataAvailability::Enabled,
-            context.config.custom_versioned_constants,
+            context.config.versioned_constants_map,
+            context.contract_addresses.eth_l2_token_address,
+            context.contract_addresses.strk_l2_token_address,
+            context.native_class_cache,
         );
 
         let transaction = create_executor_transaction(input, context.chain_id)?;
 
-        let result = pathfinder_executor::estimate(state, vec![transaction], false)?;
+        let result = pathfinder_executor::estimate(
+            db_tx,
+            state,
+            vec![transaction],
+            context.config.fee_estimation_epsilon,
+        )?;
 
         Ok::<_, EstimateMessageFeeError>(result)
     })
@@ -76,21 +131,11 @@ pub async fn estimate_message_fee(
     }
 
     let result = result.pop().unwrap();
-
-    Ok(Output(pathfinder_executor::types::FeeEstimate {
-        l1_gas_consumed: result.l1_gas_consumed,
-        l1_gas_price: result.l1_gas_price,
-        l1_data_gas_consumed: result.l1_data_gas_consumed,
-        l1_data_gas_price: result.l1_data_gas_price,
-        l2_gas_consumed: result.l2_gas_consumed,
-        l2_gas_price: result.l2_gas_price,
-        overall_fee: result.overall_fee,
-        unit: result.unit,
-    }))
+    Ok(Output(result))
 }
 
 fn create_executor_transaction(
-    input: v06::EstimateMessageFeeInput,
+    input: EstimateMessageFeeInput,
     chain_id: ChainId,
 ) -> anyhow::Result<pathfinder_executor::Transaction> {
     let from_address =
@@ -117,7 +162,7 @@ fn create_executor_transaction(
         entry_point_selector: starknet_api::core::EntryPointSelector(
             input.message.entry_point_selector.0.into_starkfelt(),
         ),
-        calldata: starknet_api::transaction::Calldata(Arc::new(
+        calldata: Calldata(Arc::new(
             transaction
                 .calldata
                 .into_iter()
@@ -130,19 +175,19 @@ fn create_executor_transaction(
         starknet_api::transaction::Transaction::L1Handler(tx),
         starknet_api::transaction::TransactionHash(transaction_hash.0.into_starkfelt()),
         None,
-        Some(starknet_api::transaction::Fee(1)),
+        Some(Fee(1)),
         None,
-        false,
+        pathfinder_executor::AccountTransactionExecutionFlags::default(),
     )?;
     Ok(transaction)
 }
 
-impl crate::dto::serialize::SerializeForVersion for Output {
+impl crate::dto::SerializeForVersion for Output {
     fn serialize(
         &self,
-        serializer: crate::dto::serialize::Serializer,
-    ) -> Result<crate::dto::serialize::Ok, crate::dto::serialize::Error> {
-        crate::dto::FeeEstimate(&self.0).serialize(serializer)
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
+        self.0.serialize(serializer)
     }
 }
 
@@ -210,15 +255,17 @@ impl From<EstimateMessageFeeError> for ApplicationError {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pathfinder_common::macro_prelude::*;
     use pathfinder_common::prelude::*;
     use pathfinder_common::{BlockId, L1DataAvailabilityMode};
     use pathfinder_storage::StorageBuilder;
-    use pretty_assertions_sorted::assert_eq;
     use primitive_types::H160;
 
+    use super::*;
     use crate::context::RpcContext;
-    use crate::v06::method::estimate_message_fee::*;
+    use crate::dto::{SerializeForVersion, Serializer};
+    use crate::RpcVersion;
 
     enum Setup {
         Full,
@@ -310,23 +357,40 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
     #[tokio::test]
-    async fn test_estimate_message_fee() {
-        let expected = super::Output(pathfinder_executor::types::FeeEstimate {
-            l1_gas_consumed: 14647.into(),
-            l1_gas_price: 2.into(),
-            l1_data_gas_consumed: 128.into(),
-            l1_data_gas_price: 1.into(),
-            l2_gas_consumed: 0.into(),
-            l2_gas_price: 0.into(),
-            overall_fee: 29422.into(),
-            unit: pathfinder_executor::types::PriceUnit::Wei,
-        });
-
+    async fn test_estimate_message_fee(#[case] version: RpcVersion) {
         let rpc = setup(Setup::Full).await.expect("RPC context");
         let result = super::estimate_message_fee(rpc, input())
             .await
             .expect("result");
-        assert_eq!(result, expected);
+
+        let output_json = result.serialize(Serializer { version }).unwrap();
+        crate::assert_json_matches_fixture!(output_json, version, "fee_estimates/full.json");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn calldata_limit_exceeded() {
+        let rpc = setup(Setup::Full).await.expect("RPC context");
+        let input = EstimateMessageFeeInput {
+            message: MsgFromL1 {
+                // Calldata length over the limit, the rest of the fields should not matter.
+                payload: vec![call_param!("0x123"); CALLDATA_LIMIT + 5],
+
+                to_address: contract_address!("0xdeadbeef"),
+                entry_point_selector: EntryPoint::ZERO,
+                from_address: EthereumAddress(H160::zero()),
+            },
+            block_id: BlockId::Number(BlockNumber::new_or_panic(1)),
+        };
+
+        let err = super::estimate_message_fee(rpc, input).await.unwrap_err();
+
+        let error_cause = "Calldata limit (10000) exceeded";
+        assert_matches!(err, EstimateMessageFeeError::Custom(e) if e.root_cause().to_string() == error_cause);
     }
 }

@@ -2,14 +2,7 @@ use std::io::Write;
 use std::num::NonZeroU32;
 
 use anyhow::{ensure, Context};
-use pathfinder_common::{
-    BlockHeader,
-    BlockNumber,
-    ReceiptCommitment,
-    StarknetVersion,
-    StateCommitment,
-    StorageCommitment,
-};
+use pathfinder_common::prelude::*;
 use pathfinder_lib::state::block_hash::{
     calculate_event_commitment,
     calculate_receipt_commitment,
@@ -118,10 +111,6 @@ fn main() -> anyhow::Result<()> {
         ensure!(
             header.state_commitment != StateCommitment::ZERO,
             "state_commitment missing"
-        );
-        ensure!(
-            header.storage_commitment != StorageCommitment::ZERO,
-            "storage_commitment missing"
         );
 
         // Compute the block hash in the 0.13.2 style

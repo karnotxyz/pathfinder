@@ -1,14 +1,8 @@
 use anyhow::Context;
 use pathfinder_common::hash::PoseidonHash;
-use pathfinder_common::{
-    BlockNumber,
-    ClassCommitment,
-    ClassCommitmentLeafHash,
-    ClassHash,
-    SierraHash,
-};
+use pathfinder_common::prelude::*;
 use pathfinder_crypto::Felt;
-use pathfinder_storage::{Transaction, TrieUpdate};
+use pathfinder_storage::{Transaction, TrieStorageIndex, TrieUpdate};
 
 use crate::tree::{GetProofError, MerkleTree, TrieNodeWithHash};
 
@@ -78,7 +72,7 @@ impl<'tx> ClassCommitmentTree<'tx> {
         tx: &'tx Transaction<'tx>,
         block: BlockNumber,
         class_hash: ClassHash,
-        root: u64,
+        root: TrieStorageIndex,
     ) -> Result<Vec<TrieNodeWithHash>, GetProofError> {
         let storage = ClassStorage {
             tx,
@@ -96,7 +90,7 @@ impl<'tx> ClassCommitmentTree<'tx> {
         tx: &'tx Transaction<'tx>,
         block: BlockNumber,
         class_hashes: &[ClassHash],
-        root: u64,
+        root: TrieStorageIndex,
     ) -> Result<Vec<Vec<TrieNodeWithHash>>, GetProofError> {
         let storage = ClassStorage {
             tx,
@@ -118,11 +112,14 @@ struct ClassStorage<'tx> {
 }
 
 impl crate::storage::Storage for ClassStorage<'_> {
-    fn get(&self, index: u64) -> anyhow::Result<Option<pathfinder_storage::StoredNode>> {
+    fn get(
+        &self,
+        index: TrieStorageIndex,
+    ) -> anyhow::Result<Option<pathfinder_storage::StoredNode>> {
         self.tx.class_trie_node(index)
     }
 
-    fn hash(&self, index: u64) -> anyhow::Result<Option<Felt>> {
+    fn hash(&self, index: TrieStorageIndex) -> anyhow::Result<Option<Felt>> {
         self.tx.class_trie_node_hash(index)
     }
 

@@ -76,6 +76,23 @@ pub mod v0_13_2 {
     }
 }
 
+pub mod v0_13_4 {
+    pub mod block {
+        pub const SEPOLIA_INTEGRATION_63881: &str =
+            str_fixture!("0.13.4/block/sepolia_integration_63881.json");
+    }
+
+    pub mod state_update {
+        pub const SEPOLIA_INTEGRATION_63881: &str =
+            str_fixture!("0.13.4/state_update/sepolia_integration_63881.json");
+    }
+
+    pub mod traces {
+        pub const SEPOLIA_TESTNET_30000: &str =
+            str_fixture!("0.13.4/traces/sepolia_testnet_30000.json");
+    }
+}
+
 pub mod add_transaction {
     pub const INVOKE_CONTRACT_WITH_SIGNATURE: &str =
         str_fixture!("add-transaction/invoke-contract-with-signature.json");
@@ -167,14 +184,7 @@ pub mod class_definitions {
 
 pub mod testnet {
     use pathfinder_common::macro_prelude::*;
-    use pathfinder_common::{
-        CallParam,
-        ClassHash,
-        ContractAddress,
-        EntryPoint,
-        StorageAddress,
-        TransactionHash,
-    };
+    use pathfinder_common::prelude::*;
     use pathfinder_crypto::Felt;
 
     pub const VALID_TX_HASH: TransactionHash =

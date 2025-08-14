@@ -7,25 +7,27 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ::p2p::sync::client::peer_agnostic::Client as P2PSyncClient;
 use anyhow::Context;
+use config::BlockchainHistory;
 use metrics_exporter_prometheus::PrometheusBuilder;
-use pathfinder_common::consts::VERGEN_GIT_DESCRIBE;
 use pathfinder_common::{BlockNumber, Chain, ChainId, EthereumChain};
 use pathfinder_ethereum::{EthereumApi, EthereumClient};
 use pathfinder_lib::monitoring::{self};
 use pathfinder_lib::state;
 use pathfinder_lib::state::SyncContext;
-use pathfinder_rpc::context::WebsocketContext;
+use pathfinder_rpc::context::{EthContractAddresses, WebsocketContext};
 use pathfinder_rpc::{Notifications, SyncState};
 use pathfinder_storage::Storage;
-use primitive_types::H160;
 use starknet_gateway_client::GatewayApi;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::task::JoinError;
 use tracing::{info, warn};
 
 use crate::config::{NetworkConfig, StateTries};
 
 mod config;
+mod p2p;
 mod update;
 
 // The Cairo VM allocates felts on the stack, so during execution it's making
@@ -40,16 +42,19 @@ fn main() -> anyhow::Result<()> {
         .thread_stack_size(8 * 1024 * 1024)
         .build()
         .unwrap()
-        .block_on(async { async_main().await })
+        .block_on(async {
+            async_main().await?;
+            Ok(())
+        })
 }
 
-async fn async_main() -> anyhow::Result<()> {
+async fn async_main() -> anyhow::Result<Storage> {
     if std::env::var_os("RUST_LOG").is_none() {
         // Disable all dependency logs by default.
-        std::env::set_var("RUST_LOG", "pathfinder=info");
+        std::env::set_var("RUST_LOG", "pathfinder=info,error");
     }
 
-    let mut config = config::Config::parse();
+    let config = config::Config::parse();
 
     setup_tracing(
         config.color,
@@ -59,7 +64,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     info!(
         // this is expected to be $(last_git_tag)-$(commits_since)-$(commit_hash)
-        version = VERGEN_GIT_DESCRIBE,
+        version = pathfinder_version::VERSION,
         "🏁 Starting node."
     );
 
@@ -68,6 +73,7 @@ async fn async_main() -> anyhow::Result<()> {
             .create(&config.data_directory)
             .context("Creating database directory")?;
     }
+    std::env::set_var("SQLITE_TMPDIR", &config.data_directory);
 
     permission_check(&config.data_directory)?;
 
@@ -95,24 +101,12 @@ async fn async_main() -> anyhow::Result<()> {
             .default_network()
             .context("Using default Starknet network based on Ethereum configuration")?,
     };
-
-    // Spawn monitoring if configured.
-    if let Some(address) = config.monitor_address {
-        let network_label = match &network {
-            NetworkConfig::Mainnet => "mainnet",
-            NetworkConfig::SepoliaTestnet => "testnet-sepolia",
-            NetworkConfig::SepoliaIntegration => "integration-sepolia",
-            NetworkConfig::Custom { .. } => "custom",
-        };
-        spawn_monitoring(
-            network_label,
-            address,
-            readiness.clone(),
-            sync_state.clone(),
-        )
-        .await
-        .context("Starting monitoring task")?;
-    }
+    let network_label = match &network {
+        NetworkConfig::Mainnet => "mainnet",
+        NetworkConfig::SepoliaTestnet => "testnet-sepolia",
+        NetworkConfig::SepoliaIntegration => "integration-sepolia",
+        NetworkConfig::Custom { .. } => "custom",
+    };
 
     let pathfinder_context = PathfinderContext::configure_and_proxy_check(
         network,
@@ -136,15 +130,11 @@ async fn async_main() -> anyhow::Result<()> {
     let storage_manager =
         pathfinder_storage::StorageBuilder::file(pathfinder_context.database.clone())
             .journal_mode(config.sqlite_wal)
-            .bloom_filter_cache_size(config.event_bloom_filter_cache_size.get())
-            .trie_prune_mode(match config.state_tries {
-                Some(StateTries::Pruned(num_blocks_kept)) => {
-                    Some(pathfinder_storage::TriePruneMode::Prune { num_blocks_kept })
-                }
-                Some(StateTries::Archive) => Some(pathfinder_storage::TriePruneMode::Archive),
-                None => None,
-            })
+            .event_filter_cache_size(config.event_filter_cache_size.get())
+            .trie_prune_mode(config.state_tries.map(StateTries::into))
+            .blockchain_history_mode(config.blockchain_history.map(BlockchainHistory::into))
             .migrate()?;
+
     let sync_storage = storage_manager
         // 5 is enough for normal sync operations, and then `available_parallelism` for
         // the rayon thread pool workers to use.
@@ -185,11 +175,21 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
 Hint: This is usually caused by exceeding the file descriptor limit of your system.
       Try increasing the file limit to using `ulimit` or similar tooling.",
         )?;
-
+    // 5 is enough for normal sync operations, and then `available_parallelism` for
+    // the rayon thread pool workers to use.
     let p2p_storage = storage_manager
-        .create_pool(NonZeroU32::new(1).unwrap())
+        .create_pool(NonZeroU32::new(5 + available_parallelism.get() as u32).unwrap())
         .context(
             r"Creating database connection pool for p2p
+
+Hint: This is usually caused by exceeding the file descriptor limit of your system.
+      Try increasing the file limit to using `ulimit` or similar tooling.",
+        )?;
+
+    let shutdown_storage = storage_manager
+        .create_pool(NonZeroU32::new(1).unwrap())
+        .context(
+            r"Creating database connection pool for graceful shutdown
 
 Hint: This is usually caused by exceeding the file descriptor limit of your system.
       Try increasing the file limit to using `ulimit` or similar tooling.",
@@ -212,26 +212,32 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         .prune_tries()
         .context("Pruning tries on startup")?;
 
+    // Register signal handlers here, because we want to be able to interrupt long
+    // running migrations or trie pruning. No tasks are spawned before this point so
+    // we don't worry about detachment.
+    let mut term_signal = signal(SignalKind::terminate())?;
+    let mut int_signal = signal(SignalKind::interrupt())?;
+
     let (tx_pending, rx_pending) = tokio::sync::watch::channel(Default::default());
 
     let rpc_config = pathfinder_rpc::context::RpcConfig {
         batch_concurrency_limit: config.rpc_batch_concurrency_limit,
-        get_events_max_blocks_to_scan: config.get_events_max_blocks_to_scan,
-        get_events_max_uncached_bloom_filters_to_load: config
-            .get_events_max_uncached_bloom_filters_to_load,
-        #[cfg(feature = "aggregate_bloom")]
-        get_events_max_bloom_filters_to_load: config.get_events_max_bloom_filters_to_load,
-        custom_versioned_constants: config.custom_versioned_constants.take(),
+        get_events_event_filter_block_range_limit: config.get_events_event_filter_block_range_limit,
+        fee_estimation_epsilon: config.fee_estimation_epsilon,
+        versioned_constants_map: config.versioned_constants_map.clone(),
+        native_execution: config.native_execution.is_enabled(),
+        native_class_cache_size: config.native_execution.class_cache_size(),
+        submission_tracker_time_limit: config.submission_tracker_time_limit,
+        submission_tracker_size_limit: config.submission_tracker_size_limit,
     };
 
     let notifications = Notifications::default();
-
     let context = pathfinder_rpc::context::RpcContext::new(
         rpc_storage,
         execution_storage,
         sync_state.clone(),
         pathfinder_context.network_id,
-        pathfinder_context.l1_core_address,
+        pathfinder_context.contract_addresses,
         pathfinder_context.gateway.clone(),
         rx_pending.clone(),
         notifications.clone(),
@@ -250,8 +256,10 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
     };
 
     let default_version = match config.rpc_root_version {
-        config::RpcVersion::V06 => pathfinder_rpc::RpcVersion::V06,
-        config::RpcVersion::V07 => pathfinder_rpc::RpcVersion::V07,
+        config::RootRpcVersion::V06 => pathfinder_rpc::RpcVersion::V06,
+        config::RootRpcVersion::V07 => pathfinder_rpc::RpcVersion::V07,
+        config::RootRpcVersion::V08 => pathfinder_rpc::RpcVersion::V08,
+        config::RootRpcVersion::V09 => pathfinder_rpc::RpcVersion::V09,
     };
 
     let rpc_server = pathfinder_rpc::RpcServer::new(config.rpc_address, context, default_version);
@@ -260,12 +268,34 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         None => rpc_server,
     };
 
-    let (p2p_handle, gossiper, p2p_client) = start_p2p(
+    // Spawn monitoring if configured.
+    if let Some(address) = config.monitor_address {
+        spawn_monitoring(
+            network_label,
+            address,
+            readiness.clone(),
+            sync_state.clone(),
+        )
+        .await
+        .context("Starting monitoring task")?;
+    }
+
+    // From this point onwards, until the final select, we don't exit the process
+    // even if some error is encountered or a signal is received as it would result
+    // in tasks being detached and cancelled abruptly without a chance to clean
+    // up. We need to wait for the final select where we can cancel all the tasks
+    // and wait for them to finish. Only then can we exit the process and return an
+    // error if some of the tasks failed or no error if we have received a signal.
+
+    let (sync_p2p_handle, sync_p2p_client) = p2p::sync::start(
         pathfinder_context.network_id,
         p2p_storage,
-        config.p2p.clone(),
+        config.sync_p2p.clone(),
     )
-    .await?;
+    .await;
+
+    let (consensus_p2p_handle, _consensus_p2p_client) =
+        p2p::consensus::start(pathfinder_context.network_id, config.consensus_p2p.clone()).await;
 
     let sync_handle = if config.is_sync_enabled {
         start_sync(
@@ -277,9 +307,8 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
             tx_pending,
             rpc_server.get_topic_broadcasters().cloned(),
             notifications,
-            gossiper,
             gateway_public_key,
-            p2p_client,
+            sync_p2p_client,
             config.verify_tree_hashes,
         )
     } else {
@@ -287,59 +316,80 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
     };
 
     let rpc_handle = if config.is_rpc_enabled {
-        let (rpc_handle, local_addr) = rpc_server
+        match rpc_server
             .with_max_connections(config.max_rpc_connections.get())
             .spawn()
             .await
-            .context("Starting the RPC server")?;
-        info!("📡 HTTP-RPC server started on: {}", local_addr);
-        rpc_handle
+        {
+            Ok((rpc_handle, on)) => {
+                info!(%on, "📡 RPC server started");
+                rpc_handle
+            }
+            Err(error) => tokio::task::spawn(std::future::ready(Err(
+                error.context("RPC server failed to start")
+            ))),
+        }
     } else {
         tokio::spawn(std::future::pending())
     };
 
     if !config.disable_version_update_check {
-        tokio::spawn(update::poll_github_for_releases());
+        util::task::spawn(update::poll_github_for_releases());
     }
-
-    let mut term_signal = signal(SignalKind::terminate())?;
-    let mut int_signal = signal(SignalKind::interrupt())?;
 
     // We are now ready.
     readiness.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Monitor our critical spawned process tasks.
-    tokio::select! {
-        result = sync_handle => {
-            match result {
-                Ok(task_result) => tracing::error!("Sync process ended unexpected with: {:?}", task_result),
-                Err(err) => tracing::error!("Sync process ended unexpected; failed to join task handle: {:?}", err),
-            }
-            anyhow::bail!("Unexpected shutdown");
-        }
-        result = rpc_handle => {
-            match result {
-                Ok(_) => tracing::error!("RPC server process ended unexpectedly"),
-                Err(err) => tracing::error!(error=%err, "RPC server process ended unexpectedly"),
-            }
-            anyhow::bail!("Unexpected shutdown");
-        }
-        result = p2p_handle => {
-            match result {
-                Ok(_) => tracing::error!("P2P process ended unexpectedly"),
-                Err(err) => tracing::error!(error=%err, "P2P process ended unexpectedly"),
-            }
-            anyhow::bail!("Unexpected shutdown");
-        }
+    let main_result = tokio::select! {
+        result = sync_handle => handle_critical_task_result("Sync", result),
+        result = rpc_handle => handle_critical_task_result("RPC", result),
+        result = sync_p2p_handle => handle_critical_task_result("Sync P2P", result),
+        result = consensus_p2p_handle => handle_critical_task_result("Consensus P2P", result),
         _ = term_signal.recv() => {
-            tracing::info!("TERM signal received, exiting gracefully");
+            tracing::info!("TERM signal received");
             Ok(())
         }
         _ = int_signal.recv() => {
-            tracing::info!("INT signal received, exiting gracefully");
+            tracing::info!("INT signal received");
             Ok(())
         }
+    };
+
+    // If we get here either a signal was received or a task ended unexpectedly,
+    // which means we need to cancel all the remaining tasks.
+    tracing::info!("Shutdown started, waiting for tasks to finish...");
+    util::task::tracker::close();
+    // Force exit after a grace period
+    match tokio::time::timeout(config.shutdown_grace_period, util::task::tracker::wait()).await {
+        Ok(_) => {
+            tracing::info!("Shutdown finished successfully")
+        }
+        Err(_) => {
+            tracing::error!("Some tasks failed to finish in time, forcing exit");
+        }
     }
+
+    let jh = tokio::task::spawn_blocking(|| -> anyhow::Result<Storage> {
+        shutdown_storage
+            .connection()
+            .context("Creating database connection for graceful shutdown")?
+            .transaction()
+            .context("Creating database transaction for graceful shutdown")?
+            .store_in_memory_state()
+            .context("Storing in-memory DB state on shutdown")?;
+
+        Ok(shutdown_storage)
+    });
+
+    // Wait for the shutdown storage task to finish.
+    let shutdown_storage = jh.await.context("Running shutdown storage task")??;
+
+    // If a RO db connection pool remains after all RW connection pools have been
+    // dropped, WAL & SHM files are never cleaned up. To avoid this, we make sure
+    // that all RO pools and all but one RW pools are dropped when task tracker
+    // finishes waiting, and then we drop the last RW pool.
+    main_result.map(|_| shutdown_storage)
 }
 
 #[cfg(feature = "tokio-console")]
@@ -410,105 +460,6 @@ fn permission_check(base: &std::path::Path) -> Result<(), anyhow::Error> {
 }
 
 #[cfg(feature = "p2p")]
-async fn start_p2p(
-    chain_id: ChainId,
-    storage: Storage,
-    config: config::P2PConfig,
-) -> anyhow::Result<(
-    tokio::task::JoinHandle<()>,
-    state::Gossiper,
-    Option<p2p::client::peer_agnostic::Client>,
-)> {
-    use std::path::Path;
-    use std::time::Duration;
-
-    use p2p::libp2p::identity::Keypair;
-    use pathfinder_lib::p2p_network::P2PContext;
-    use serde::Deserialize;
-    use zeroize::Zeroizing;
-
-    #[derive(Clone, Deserialize)]
-    struct IdentityConfig {
-        pub private_key: String,
-    }
-
-    impl IdentityConfig {
-        pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-            Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
-        }
-    }
-
-    impl zeroize::Zeroize for IdentityConfig {
-        fn zeroize(&mut self) {
-            self.private_key.zeroize()
-        }
-    }
-
-    let keypair = match config.identity_config_file {
-        Some(path) => {
-            let config = Zeroizing::new(IdentityConfig::from_file(path.as_path())?);
-            let private_key = Zeroizing::new(base64::decode(config.private_key.as_bytes())?);
-            Keypair::from_protobuf_encoding(&private_key)?
-        }
-        None => {
-            tracing::info!("No private key configured, generating a new one");
-            Keypair::generate_ed25519()
-        }
-    };
-
-    let context = P2PContext {
-        cfg: p2p::Config {
-            direct_connection_timeout: config.direct_connection_timeout,
-            relay_connection_timeout: Duration::from_secs(10),
-            max_inbound_direct_peers: config.max_inbound_direct_connections,
-            max_inbound_relayed_peers: config.max_inbound_relayed_connections,
-            max_outbound_peers: config.max_outbound_connections,
-            ip_whitelist: config.ip_whitelist,
-            bootstrap_period: Some(Duration::from_secs(2 * 60)),
-            eviction_timeout: config.eviction_timeout,
-            inbound_connections_rate_limit: p2p::RateLimit {
-                max: 10,
-                interval: Duration::from_secs(1),
-            },
-            kad_name: config.kad_name,
-            stream_timeout: config.stream_timeout,
-            max_concurrent_streams: config.max_concurrent_streams,
-        },
-        chain_id,
-        storage,
-        proxy: config.proxy,
-        keypair,
-        listen_on: config.listen_on,
-        bootstrap_addresses: config.bootstrap_addresses,
-        predefined_peers: config.predefined_peers,
-    };
-
-    let (p2p_client, _head_receiver, p2p_handle) =
-        pathfinder_lib::p2p_network::start(context).await?;
-
-    Ok((
-        p2p_handle,
-        state::Gossiper::new(p2p_client.clone()),
-        Some(p2p_client),
-    ))
-}
-
-#[cfg(not(feature = "p2p"))]
-async fn start_p2p(
-    _: ChainId,
-    _: Storage,
-    _: config::P2PConfig,
-) -> anyhow::Result<(
-    tokio::task::JoinHandle<()>,
-    state::Gossiper,
-    Option<p2p::client::peer_agnostic::Client>,
-)> {
-    let join_handle = tokio::task::spawn(futures::future::pending());
-
-    Ok((join_handle, Default::default(), None))
-}
-
-#[cfg(feature = "p2p")]
 #[allow(clippy::too_many_arguments)]
 fn start_sync(
     storage: Storage,
@@ -519,12 +470,11 @@ fn start_sync(
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
     websocket_txs: Option<pathfinder_rpc::TopicBroadcasters>,
     notifications: Notifications,
-    gossiper: state::Gossiper,
     gateway_public_key: pathfinder_common::PublicKey,
-    p2p_client: Option<p2p::client::peer_agnostic::Client>,
+    p2p_client: Option<P2PSyncClient>,
     verify_tree_hashes: bool,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    if config.p2p.proxy {
+    if config.sync_p2p.proxy {
         start_feeder_gateway_sync(
             storage,
             pathfinder_context,
@@ -534,7 +484,6 @@ fn start_sync(
             tx_pending,
             websocket_txs,
             notifications,
-            gossiper,
             gateway_public_key,
         )
     } else {
@@ -545,7 +494,7 @@ fn start_sync(
             ethereum_client,
             p2p_client,
             gateway_public_key,
-            config.p2p.l1_checkpoint_override,
+            config.sync_p2p.l1_checkpoint_override,
             verify_tree_hashes,
         )
     }
@@ -562,9 +511,8 @@ fn start_sync(
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
     websocket_txs: Option<pathfinder_rpc::TopicBroadcasters>,
     notifications: Notifications,
-    gossiper: state::Gossiper,
     gateway_public_key: pathfinder_common::PublicKey,
-    _p2p_client: Option<p2p::client::peer_agnostic::Client>,
+    _p2p_client: Option<P2PSyncClient>,
     _verify_tree_hashes: bool,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     start_feeder_gateway_sync(
@@ -576,7 +524,6 @@ fn start_sync(
         tx_pending,
         websocket_txs,
         notifications,
-        gossiper,
         gateway_public_key,
     )
 }
@@ -591,7 +538,6 @@ fn start_feeder_gateway_sync(
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
     websocket_txs: Option<pathfinder_rpc::TopicBroadcasters>,
     notifications: Notifications,
-    gossiper: state::Gossiper,
     gateway_public_key: pathfinder_common::PublicKey,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let sync_context = SyncContext {
@@ -599,7 +545,7 @@ fn start_feeder_gateway_sync(
         ethereum: ethereum_client,
         chain: pathfinder_context.network,
         chain_id: pathfinder_context.network_id,
-        core_address: pathfinder_context.l1_core_address,
+        core_address: pathfinder_context.contract_addresses.l1_contract_address,
         sequencer: pathfinder_context.gateway,
         state: sync_state.clone(),
         head_poll_interval: config.poll_interval,
@@ -611,13 +557,12 @@ fn start_feeder_gateway_sync(
         block_cache_size: 1_000,
         restart_delay: config.debug.restart_delay,
         verify_tree_hashes: config.verify_tree_hashes,
-        gossiper,
         sequencer_public_key: gateway_public_key,
         fetch_concurrency: config.feeder_gateway_fetch_concurrency,
         fetch_casm_from_fgw: config.fetch_casm_from_fgw,
     };
 
-    tokio::spawn(state::sync(sync_context, state::l1::sync, state::l2::sync))
+    util::task::spawn(state::sync(sync_context, state::l1::sync, state::l2::sync))
 }
 
 #[cfg(feature = "p2p")]
@@ -625,7 +570,7 @@ fn start_p2p_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
     ethereum_client: EthereumClient,
-    p2p_client: p2p::client::peer_agnostic::Client,
+    p2p_client: P2PSyncClient,
     gateway_public_key: pathfinder_common::PublicKey,
     l1_checkpoint_override: Option<pathfinder_ethereum::EthereumStateUpdate>,
     verify_tree_hashes: bool,
@@ -636,7 +581,7 @@ fn start_p2p_sync(
         storage,
         p2p: p2p_client,
         eth_client: ethereum_client,
-        eth_address: pathfinder_context.l1_core_address,
+        eth_address: pathfinder_context.contract_addresses.l1_contract_address,
         fgw_client: pathfinder_context.gateway,
         chain_id: pathfinder_context.network_id,
         public_key: gateway_public_key,
@@ -644,7 +589,7 @@ fn start_p2p_sync(
         verify_tree_hashes,
         block_hash_db: Some(BlockHashDb::new(pathfinder_context.network)),
     };
-    tokio::spawn(sync.run())
+    util::task::spawn(sync.run())
 }
 
 /// Spawns the monitoring task at the given address.
@@ -659,7 +604,7 @@ async fn spawn_monitoring(
         .install_recorder()
         .context("Creating Prometheus recorder")?;
 
-    metrics::gauge!("pathfinder_build_info", 1.0, "version" => VERGEN_GIT_DESCRIBE);
+    metrics::gauge!("pathfinder_build_info", 1.0, "version" => pathfinder_version::VERSION);
 
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => metrics::gauge!("process_start_time_seconds", duration.as_secs() as f64),
@@ -730,7 +675,7 @@ struct PathfinderContext {
     network_id: ChainId,
     gateway: starknet_gateway_client::Client,
     database: PathBuf,
-    l1_core_address: H160,
+    contract_addresses: EthContractAddresses,
 }
 
 /// Used to hide private fn's for [PathfinderContext].
@@ -741,7 +686,7 @@ mod pathfinder_context {
     use anyhow::Context;
     use pathfinder_common::{Chain, ChainId};
     use pathfinder_ethereum::core_addr;
-    use primitive_types::H160;
+    use pathfinder_rpc::context::EthContractAddresses;
     use reqwest::Url;
     use starknet_gateway_client::Client as GatewayClient;
 
@@ -761,14 +706,14 @@ mod pathfinder_context {
                     network_id: ChainId::MAINNET,
                     gateway: GatewayClient::mainnet(gateway_timeout).with_api_key(api_key),
                     database: data_directory.join("mainnet.sqlite"),
-                    l1_core_address: H160::from(core_addr::MAINNET),
+                    contract_addresses: EthContractAddresses::new_known(core_addr::MAINNET),
                 },
                 NetworkConfig::SepoliaTestnet => Self {
                     network: Chain::SepoliaTestnet,
                     network_id: ChainId::SEPOLIA_TESTNET,
                     gateway: GatewayClient::sepolia_testnet(gateway_timeout).with_api_key(api_key),
                     database: data_directory.join("testnet-sepolia.sqlite"),
-                    l1_core_address: H160::from(core_addr::SEPOLIA_TESTNET),
+                    contract_addresses: EthContractAddresses::new_known(core_addr::SEPOLIA_TESTNET),
                 },
                 NetworkConfig::SepoliaIntegration => Self {
                     network: Chain::SepoliaIntegration,
@@ -776,7 +721,9 @@ mod pathfinder_context {
                     gateway: GatewayClient::sepolia_integration(gateway_timeout)
                         .with_api_key(api_key),
                     database: data_directory.join("integration-sepolia.sqlite"),
-                    l1_core_address: H160::from(core_addr::SEPOLIA_INTEGRATION),
+                    contract_addresses: EthContractAddresses::new_known(
+                        core_addr::SEPOLIA_INTEGRATION,
+                    ),
                 },
                 NetworkConfig::Custom {
                     gateway,
@@ -819,12 +766,16 @@ mod pathfinder_context {
             let network_id =
                 ChainId(Felt::from_be_slice(chain_id.as_bytes()).context("Parsing chain ID")?);
 
-            let l1_core_address = gateway
+            let reply_contract_addresses = gateway
                 .eth_contract_addresses()
                 .await
-                .context("Downloading starknet L1 address from gateway for proxy check")?
-                .starknet
-                .0;
+                .context("Downloading starknet L1 address from gateway for proxy check")?;
+            let l1_core_address = reply_contract_addresses.starknet.0;
+            let contract_addresses = EthContractAddresses::new_custom(
+                l1_core_address,
+                reply_contract_addresses.eth_l2_token_address,
+                reply_contract_addresses.strk_l2_token_address,
+            );
 
             // Check for proxies by comparing the core address against those of the known
             // networks.
@@ -844,7 +795,7 @@ mod pathfinder_context {
                 network_id,
                 gateway,
                 database: data_directory.join("custom.sqlite"),
-                l1_core_address,
+                contract_addresses,
             };
 
             Ok(context)
@@ -878,16 +829,14 @@ async fn verify_database(
     gateway_client: &starknet_gateway_client::Client,
 ) -> anyhow::Result<()> {
     let storage = storage.clone();
-    let db_genesis = tokio::task::spawn_blocking(move || {
-        let mut conn = storage.connection().context("Create database connection")?;
-        let tx = conn.transaction().context("Create database transaction")?;
 
-        tx.block_id(BlockNumber::GENESIS.into())
-    })
-    .await
-    .context("Joining database task")?
-    .context("Fetching genesis hash from database")?
-    .map(|x| x.1);
+    let mut conn = storage.connection().context("Create database connection")?;
+    let tx = conn.transaction().context("Create database transaction")?;
+
+    let db_genesis = tx
+        .block_id(BlockNumber::GENESIS.into())
+        .context("Fetching genesis hash from database")?
+        .map(|x| x.1);
 
     if let Some(database_genesis) = db_genesis {
         use pathfinder_common::consts::{
@@ -928,4 +877,53 @@ async fn verify_database(
     }
 
     Ok(())
+}
+
+fn handle_critical_task_result(
+    task_name: &str,
+    task_result: Result<anyhow::Result<()>, JoinError>,
+) -> anyhow::Result<()> {
+    match task_result {
+        Ok(task_result) => {
+            tracing::error!(?task_result, "{} task ended unexpectedly", task_name);
+            task_result
+        }
+        Err(error) if error.is_panic() => {
+            tracing::error!(%error, "{} task panicked", task_name);
+            Err(anyhow::anyhow!("{} task panicked", task_name))
+        }
+        // Cancelling all tracked tasks via [`util::task::tracker::close()`] does not cause join
+        // errors on registered task handles, so this is unexpected and we should threat it as error
+        Err(_) => {
+            tracing::error!("{} task was cancelled unexpectedly", task_name);
+            Err(anyhow::anyhow!(
+                "{} task was cancelled unexpectedly",
+                task_name
+            ))
+        }
+    }
+}
+
+impl From<StateTries> for pathfinder_storage::TriePruneMode {
+    fn from(val: StateTries) -> Self {
+        match val {
+            StateTries::Pruned(num_blocks_kept) => {
+                pathfinder_storage::TriePruneMode::Prune { num_blocks_kept }
+            }
+            StateTries::Archive => pathfinder_storage::TriePruneMode::Archive,
+        }
+    }
+}
+
+impl From<BlockchainHistory> for pathfinder_storage::pruning::BlockchainHistoryMode {
+    fn from(val: BlockchainHistory) -> Self {
+        match val {
+            BlockchainHistory::Prune(num_blocks_kept) => {
+                pathfinder_storage::pruning::BlockchainHistoryMode::Prune { num_blocks_kept }
+            }
+            BlockchainHistory::Archive => {
+                pathfinder_storage::pruning::BlockchainHistoryMode::Archive
+            }
+        }
+    }
 }

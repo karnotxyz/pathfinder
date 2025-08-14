@@ -7,12 +7,149 @@ More expansive patch notes and explanations may be found in the specific [pathfi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.17.0-beta.2] - 2025-06-04
+
+### Fixed
+
+- `starknet_estimateFee` is failing for Braavos DEPLOY_ACCOUNT transactions involving a new Sierra 1.7.0 class.
+- `starknet_traceBlockTransactions` fails for blocks <= 2687.
+
+### Changed
+
+- `blockifier` has been upgraded to version 0.15.0-rc.1, adding initial support for Starknet 0.14.0 execution.
+
+## [0.17.0-beta.1] - 2025-05-13
+
+### Added
+
+- Pathfinder now supports _syncing_ from Starknet 0.14.0. Support is still incomplete, execution and compilation of new classes will likely fail for new classes until a further upgrade.
+- Pathfinder now supports storing only the latest state of the blockchain history. This can be configured with the '--storage.blockchain-history' CLI option.
+
+  - Accepted values are:
+
+    - "archive" (default) – Full history of the blockchain is stored.
+    - "N" – An integer specifying the number of historical blocks to store, in addition to the latest block (N + 1 blocks will be stored).
+
+  - Affected JSON-RPC methods are:
+
+    - `starknet_call`
+    - `starknet_estimateFee`
+    - `starknet_estimateMessageFee`
+    - `starknet_getBlockTransactionCount`
+    - `starknet_getBlockWithTxHashes`
+    - `starknet_getBlockWithTxs`
+    - `starknet_getBlockWithReceipts`
+    - `starknet_getClass`
+    - `starknet_getClassAt`
+    - `starknet_getClassHashAt`
+    - `starknet_getEvents`
+    - `starknet_getNonce`
+    - `starknet_getStateUpdate`
+    - `starknet_getStorageAt`
+    - `starknet_getStorageProof`
+    - `starknet_getTransactionByBlockIdAndIndex`
+    - `starknet_simulateTransactions`
+    - `starknet_traceBlockTransactions`
+
+  - With pruning enabled, affected JSON-RPC method requests will only succeed if the requested block is within the last N + 1 blocks.
+  - The choice between `archive` and `pruned` mode is made once, when creating the database. Once chosen, it cannot be changed without creating a new database.
+  - It is possible to change the number of blocks stored in pruned mode between runs, using the same CLI option with a different value for N.
+  - Note that the number of blocks stored is relative to:
+    a. The latest L1 checkpoint if it exists and the latest L2 block is ahead of it
+    b. The latest L2 block if it is behind the latest L1 checkpoint or no L1 checkpoints have been received by the node (practically unreachable)
+
+- `starknet_getTransactionStatus` now returns RECEIVED even when the gateway cannot find the transaction, provided the transaction was successfully sent by the responding node within the last 5 minutes.
+
+### Fixed
+
+- `starknet_unsubscribe` does not accept subscription IDs as strings.
+
+### Changed
+
+- `--rpc.get-events-max-uncached-event-filters-to-load` CLI option has been replaced with `rpc.get-events-event-filter-block-range-limit`. The new option serves the same purpose of preventing queries from taking too long, but it should be clearer in its intent.
+
+## [0.16.5] - 2025-05-22
+
+### Fixed
+
+- `starknet_estimateFee` is failing for Braavos DEPLOY_ACCOUNT transactions involving a new Sierra 1.7.0 class.
+- `starknet_unsubscribe` does not accept subscription IDs as strings.
+- `starknet_traceBlockTransactions` fails for blocks <= 2687.
+
+## [0.16.4] - 2025-04-15
+
+### Fixed
+
+- `starknet_simulateTransactions` returns an error instead of the trace of the reverted transaction if the L2 gas cap is insufficient.
+- `starknet_traceTransaction` and `starknet_traceBlockTransactions` returns an internal error with no details upon encountering a transaction execution error.
+- `starknet_getEvents` returns an incomplete set of events for some queries over a block range larger than 106k blocks.
+
+## [0.16.3] - 2025-04-03
+
+### Added
+
+- The JSON-RPC 0.8.0 API can now be accessed under `/ws/rpc/v0_8` as well if Websockets are enabled. This is equivalent to the `/rpc/v0_8` path and is provided only as a convenience feature.
+
+### Fixed
+
+- `starknet_subscribeEvents` subscriptions stop sending notifications.
+- Broken aggregate bloom filter migration has been updated to work properly. If you migrated from a database running in archived mode, please [re-download our latest snapshot](https://eqlabs.github.io/pathfinder/database-snapshots) and re-run the migrations.
+- `starknet_getStateUpdate` has `new_root` and `old_root` swapped.
+
+### Changed
+
+- JSON-RPC 0.8 `subscription_id` is now a string.
+- Pathfinder now supports the JSON-RPC 0.8.1 specification. In this new version, the Websocket `subscription_id` type has been changed to `string`.
+
+## [0.16.2] - 2025-03-12
+
+### Added
+
+- Support for custom versioned constants for multiple Starknet versions.
+- Support for Starknet 0.13.5.
+
+### Fixed
+
+- `starknet_estimateFee` returns an internal error for v3 transactions with L2 gas `max_price_per_unit` set to zero.
+- `starknet_getCompiledCasm` returns CASM wrapped in a `casm` property.
+- `starknet_traceBlockTransactions` fails on Starknet 0.13.4 when a fallback to fetching from the feeder gateway is required.
+- Websocket subscriptions to the `latest` block do not send notifications for the current latest block.
+- `starknet_subscribeEvents` subscriptions send matching events only from the `latest` block, not as soon as those show up in `pending`.
+- Pathfinder stops receiving L1 state updates.
+
+## [0.16.1] - 2025-02-24
+
+### Fixed
+
+- Pathfinder does not return `transaction_hash` in `starknet_getBlockWithTxns` response.
+- Custom networks cannot be configured for pre-0.13.4 Starknet versions,
+
+## [0.16.0] - 2025-02-19
+
+### Added
+
+- Support for Starknet 0.13.4.
+- Support for the JSON-RPC 0.8.0-rc3 API, including Websocket subscriptions.
+- Graceful shutdown upon SIGINT and SIGTERM with a default grace period of 10 seconds, configurable via `--shutdown.grace-period`.
+
+### Removed
+
+- `storage_commitment` and `class_commitment` fields from the `pathfinder_subscribe_newHeads` method response.
 
 ### Fixed
 
 - `pathfinder_getProof`, `pathfinder_getClassProof` return `ProofMissing` (10001) when Pathfinder is in `archive` mode and queried block's tries are empty.
-- `starknet_getStorageProof` returns `StorageProofNotSupported` (42) when Pathfinder is in `archive` mode and queried block's tries are empty.
+- `starknet_syncing` returns `u64::MAX` as the starting block number when starting from scratch.
+
+### Changed
+
+- Use aggregate Bloom filters for `starknet_getEvents` to improve performance.
+
+## [0.15.3] - 2025-01-10
+
+### Changed
+
+- Cairo 0 class definition size is now capped at 4 MiB.
 
 ## [0.15.2] - 2024-12-04
 
@@ -31,7 +168,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Pathfinder is now compiled with arithmetic overflow checks enabled in release mode to mitigate potential issues.
-
 
 ## [0.15.0] - 2024-11-21
 
@@ -147,7 +283,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Pruned merkle tries take significantly less disk space than full ones.
   - Pathfinder stores this setting in its database and defaults to using that.
   - Once set pruning cannot be enabled/disabled for non-empty databases.
-  - Pruning achieves a ~75% reduction in overall storage compared to archive. 
+  - Pruning achieves a ~75% reduction in overall storage compared to archive.
 
 ### Removed
 
@@ -196,7 +332,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `starknet_getTransactionStatus` reports gateway errors as `TxnNotFound`. These are now reported as internal errors.
 - Sync process leaves a zombie task behind each time it restarts, wasting resources.
 - `starknet_getEvents` does not return a continuation token if not all events from the last block fit into the result page.
-- `starknet_addXXX` requests to the gateway use the configured gateway timeout, often causing these to timeout while waiting for 
+- `starknet_addXXX` requests to the gateway use the configured gateway timeout, often causing these to timeout while waiting for
   a gateway response. These instead now use a much longer timeout.
 
 ### Changed
@@ -219,7 +355,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The memory allocator used by pathfinder has been changed to jemalloc, leading to improved JSON-RPC performance.
 - Improved poseidon hash performance.
 - Default RPC version changed to v0.6.
-
 
 ### Added
 
@@ -260,7 +395,7 @@ Users should not use this version.
 
 ### Added
 
-- RPC parsing failures now include the error reason when its an invalid JSON-RPC request (invalid request params already include the error reason). 
+- RPC parsing failures now include the error reason when its an invalid JSON-RPC request (invalid request params already include the error reason).
 
 ## [0.10.3-rc1] - 2023-12-22
 
@@ -272,7 +407,7 @@ Users should not use this version.
 
 ### Changed
 
-- Fee estimations are now compatible with starknet v0.13 and *incompatible* with starknet v0.12.3.
+- Fee estimations are now compatible with starknet v0.13 and _incompatible_ with starknet v0.12.3.
 
 ### Added
 
@@ -323,7 +458,7 @@ Users should not use this version.
 - Support for RPC v0.6.0-rc4 via the `/rpc/v0_6` endpoint. Note that this does not include the `/rpc/v0.6` endpoint as the underscore is now the standard across node implementations.
 - Configuration options to selectively enable/disable parts of the node. This can be useful to run tests or benchmarks with isolated components e.g. test RPC methods without the sync process updating the database.
   - `rpc.enable` configuration option to enable/disable the RPC server. Defaults to enabled.
-  - `sync.enable` configuration option to enable/disable the sync process. Defaults to enabled. 
+  - `sync.enable` configuration option to enable/disable the sync process. Defaults to enabled.
 - Support for Sepolia testnet via `--network testnet-sepolia`
 - Support for Sepolia integration via `--network integration-sepolia`
 - Support for Starknet 0.13.0.
@@ -436,7 +571,7 @@ Users should not use this version.
 
 ### Fixed
 
-- JSON-RPC requests containing a Cairo 0 class definition were requiring the `debug_info` property to be present in the input program. This was a regression caused by the execution engine change. 
+- JSON-RPC requests containing a Cairo 0 class definition were requiring the `debug_info` property to be present in the input program. This was a regression caused by the execution engine change.
 - Performance for the `starknet_getEvents` JSON-RPC method has been improved for queries involving the pending block.
 
 ### Added
@@ -632,6 +767,7 @@ Users should not use this version.
   - `cairo-lang` upgraded to 0.11.2a0
 - Subscription to `newHead` events via websocket using the method `pathfinder_subscribe_newHeads`, which can
   be managed by the following command line options
+
   - `rpc.websocket`, which enables websocket transport
   - `rpc.websocket.capacity`, which sets the maximum number of websocket subscriptions per subscription type
 

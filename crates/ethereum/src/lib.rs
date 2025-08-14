@@ -7,25 +7,15 @@ use alloy::primitives::{Address, TxHash};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::{FilteredParams, Log};
 use anyhow::Context;
-use futures::StreamExt;
+use pathfinder_common::prelude::*;
 use pathfinder_common::transaction::L1HandlerTransaction;
-use pathfinder_common::{
-    BlockHash,
-    BlockNumber,
-    CallParam,
-    ContractAddress,
-    EntryPoint,
-    EthereumChain,
-    L1BlockNumber,
-    L1TransactionHash,
-    StateCommitment,
-    TransactionNonce,
-};
+use pathfinder_common::{EthereumChain, L1BlockNumber, L1TransactionHash};
 use pathfinder_crypto::Felt;
 use primitive_types::{H160, U256};
 use reqwest::{IntoUrl, Url};
 use starknet::StarknetCoreContract;
 use tokio::select;
+use tokio::time::MissedTickBehavior;
 
 use crate::utils::*;
 
@@ -109,7 +99,7 @@ impl EthereumClient {
         let provider = ProviderBuilder::new().on_ws(ws).await?;
         // Fetch the finalized block number
         provider
-            .get_block_by_number(BlockNumberOrTag::Finalized, false)
+            .get_block_by_number(BlockNumberOrTag::Finalized)
             .await?
             .map(|block| L1BlockNumber::new_or_panic(block.header.number))
             .context("Failed to fetch finalized block hash")
@@ -144,25 +134,39 @@ impl EthereumApi for EthereumClient {
         let core_contract = StarknetCoreContract::new(core_address, provider.clone());
 
         // Listen for state update events
-        let mut state_updates = provider
-            .subscribe_logs(&core_contract.LogStateUpdate_filter().filter)
-            .await?
-            .into_stream();
+        let filter = core_contract.LogStateUpdate_filter().filter;
+        let mut state_updates = provider.subscribe_logs(&filter).await?;
 
         // Poll regularly for finalized block number
         let provider_clone = provider.clone();
         let (finalized_block_tx, mut finalized_block_rx) =
             tokio::sync::mpsc::channel::<L1BlockNumber>(1);
-        tokio::spawn(async move {
+
+        util::task::spawn(async move {
             let mut interval = tokio::time::interval(poll_interval);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                if let Ok(Some(finalized_block)) = provider_clone
-                    .get_block_by_number(BlockNumberOrTag::Finalized, false)
+
+                match provider_clone
+                    .get_block_by_number(BlockNumberOrTag::Finalized)
                     .await
                 {
-                    let block_number = L1BlockNumber::new_or_panic(finalized_block.header.number);
-                    let _ = finalized_block_tx.send(block_number).await.unwrap();
+                    Ok(Some(finalized_block)) => {
+                        let block_number =
+                            L1BlockNumber::new_or_panic(finalized_block.header.number);
+                        if finalized_block_tx.send(block_number).await.is_err() {
+                            tracing::debug!("L1 finalized block channel closed");
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::error!("No L1 finalized block found");
+                    }
+                    Err(e) => {
+                        tracing::error!(error=%e, "Error fetching L1 finalized block");
+                        return;
+                    }
                 }
             }
         });
@@ -170,36 +174,57 @@ impl EthereumApi for EthereumClient {
         // Process incoming events
         loop {
             select! {
-                Some(state_update) = state_updates.next() => {
-                    // Decode the state update
-                    let eth_block = L1BlockNumber::new_or_panic(
-                        state_update.block_number.expect("missing eth block number")
-                    );
-                    let state_update: Log<StarknetCoreContract::LogStateUpdate> = state_update.log_decode()?;
-                    let block_number = get_block_number(state_update.inner.blockNumber);
-                    // Add or remove to/from pending state updates accordingly
-                    if !state_update.removed {
-                        let state_update = EthereumStateUpdate {
-                            block_number,
-                            block_hash: get_block_hash(state_update.inner.blockHash),
-                            state_root: get_state_root(state_update.inner.globalRoot),
-                        };
-                        self.pending_state_updates.insert(eth_block, state_update);
-                    } else {
-                        self.pending_state_updates.remove(&eth_block);
+                maybe_state_update = state_updates.recv() => {
+                    match maybe_state_update {
+                        Ok(state_update) => {
+                            tracing::trace!(?state_update, "Processing LogStateUpdate event");
+                            // one would expect this to always be true, but in fact it isn't...
+                            if filter.address.matches(&state_update.inner.address) {
+                                // Decode the state update
+                                let eth_block = L1BlockNumber::new_or_panic(
+                                    state_update.block_number.expect("missing eth block number")
+                                );
+                                let state_update: Log<StarknetCoreContract::LogStateUpdate> = state_update.log_decode()?;
+                                let block_number = get_block_number(state_update.inner.blockNumber);
+                                // Add or remove to/from pending state updates accordingly
+                                if !state_update.removed {
+                                    let state_update = EthereumStateUpdate {
+                                        block_number,
+                                        block_hash: get_block_hash(state_update.inner.blockHash),
+                                        state_root: get_state_root(state_update.inner.globalRoot),
+                                    };
+                                    self.pending_state_updates.insert(eth_block, state_update);
+                                } else {
+                                    self.pending_state_updates.remove(&eth_block);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(error=%e, "LogStateUpdate stream ended, re-subscribing");
+                            state_updates = provider.subscribe_logs(&filter).await?;
+                        }
                     }
                 }
-                Some(block_number) = finalized_block_rx.recv() => {
-                    // Collect all state updates up to (and including) the finalized block
-                    let pending_state_updates: Vec<EthereumStateUpdate> = self.pending_state_updates
-                        .range(..=block_number)
-                        .map(|(_, &update)| update)
-                        .collect();
-                    // Remove emitted updates from the map
-                    self.pending_state_updates.retain(|&k, _| k > block_number);
-                    // Emit the state updates
-                    for state_update in pending_state_updates {
-                        let _ = callback(state_update).await;
+                maybe_block_number = finalized_block_rx.recv() => {
+                    match maybe_block_number {
+                        Some(block_number) => {
+                            tracing::trace!(%block_number, "Processing L1 finalized block");
+                            // Collect all state updates up to (and including) the finalized block
+                            let pending_state_updates: Vec<EthereumStateUpdate> = self.pending_state_updates
+                                .range(..=block_number)
+                                .map(|(_, &update)| update)
+                                .collect();
+                            // Remove emitted updates from the map
+                            self.pending_state_updates.retain(|&k, _| k > block_number);
+                            // Emit the state updates
+                            for state_update in pending_state_updates {
+                                let _ = callback(state_update).await;
+                            }
+                        }
+                        None => {
+                            tracing::debug!("L1 finalized block channel closed");
+                            return Err(anyhow::anyhow!("L1 finalized block channel closed"));
+                        }
                     }
                 }
             }

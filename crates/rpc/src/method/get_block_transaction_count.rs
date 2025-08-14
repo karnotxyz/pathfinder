@@ -29,8 +29,7 @@ pub async fn get_block_transaction_count(
     input: Input,
 ) -> Result<Output, Error> {
     let span = tracing::Span::current();
-
-    tokio::task::spawn_blocking(move || {
+    util::task::spawn_blocking(move |_| {
         let _g = span.enter();
         let mut db = context
             .storage
@@ -55,7 +54,6 @@ pub async fn get_block_transaction_count(
         let exists = db
             .block_exists(block_id)
             .context("Querying block existence")?;
-
         if !exists {
             return Err(Error::BlockNotFound);
         }
@@ -70,11 +68,11 @@ pub async fn get_block_transaction_count(
     .context("Joining blocking task")?
 }
 
-impl crate::dto::serialize::SerializeForVersion for Output {
+impl crate::dto::SerializeForVersion for Output {
     fn serialize(
         &self,
-        serializer: crate::dto::serialize::Serializer,
-    ) -> Result<crate::dto::serialize::Ok, crate::dto::serialize::Error> {
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
         serializer.serialize_u64(self.0)
     }
 }

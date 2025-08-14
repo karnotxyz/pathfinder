@@ -8,8 +8,6 @@ use crate::context::RpcContext;
 
 crate::error::generate_rpc_error_subset!(Error: BlockNotFound);
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Input {
     pub block_id: BlockId,
 }
@@ -40,8 +38,7 @@ pub enum Output {
 /// Get block information with full transactions given the block id
 pub async fn get_block_with_txs(context: RpcContext, input: Input) -> Result<Output, Error> {
     let span = tracing::Span::current();
-
-    tokio::task::spawn_blocking(move || {
+    util::task::spawn_blocking(move |_| {
         let _g = span.enter();
         let mut connection = context
             .storage
@@ -59,13 +56,7 @@ pub async fn get_block_with_txs(context: RpcContext, input: Input) -> Result<Out
                     .get(&transaction)
                     .context("Querying pending data")?;
 
-                let transactions = pending
-                    .block
-                    .transactions
-                    .iter()
-                    .cloned()
-                    .map(Into::into)
-                    .collect();
+                let transactions = pending.block.transactions.to_vec();
 
                 return Ok(Output::Pending {
                     header: pending.block,
@@ -87,7 +78,6 @@ pub async fn get_block_with_txs(context: RpcContext, input: Input) -> Result<Out
             .context("Reading transactions from database")?
             .context("Transaction data missing")?
             .into_iter()
-            .map(Into::into)
             .collect();
 
         Ok(Output::Full {
@@ -100,18 +90,18 @@ pub async fn get_block_with_txs(context: RpcContext, input: Input) -> Result<Out
     .context("Joining blocking task")?
 }
 
-impl crate::dto::serialize::SerializeForVersion for Output {
+impl crate::dto::SerializeForVersion for Output {
     fn serialize(
         &self,
-        serializer: crate::dto::serialize::Serializer,
-    ) -> Result<crate::dto::serialize::Ok, crate::dto::serialize::Error> {
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
         match self {
             Output::Pending {
                 header,
                 transactions,
             } => {
                 let mut serializer = serializer.serialize_struct()?;
-                serializer.flatten(&crate::dto::PendingBlockHeader(header))?;
+                serializer.flatten(header.as_ref())?;
                 serializer.serialize_iter(
                     "transactions",
                     transactions.len(),
@@ -125,7 +115,7 @@ impl crate::dto::serialize::SerializeForVersion for Output {
                 l1_accepted,
             } => {
                 let mut serializer = serializer.serialize_struct()?;
-                serializer.flatten(&crate::dto::BlockHeader(header))?;
+                serializer.flatten(header.as_ref())?;
                 serializer.serialize_iter(
                     "transactions",
                     transactions.len(),
@@ -142,5 +132,50 @@ impl crate::dto::serialize::SerializeForVersion for Output {
                 serializer.end()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dto::{SerializeForVersion, Serializer};
+    use crate::RpcVersion;
+
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
+    #[tokio::test]
+    async fn pending(#[case] version: RpcVersion) {
+        let context = RpcContext::for_tests_with_pending().await;
+
+        let input = Input {
+            block_id: BlockId::Pending,
+        };
+
+        let output = get_block_with_txs(context, input).await.unwrap();
+        let output_json = output.serialize(Serializer { version }).unwrap();
+
+        crate::assert_json_matches_fixture!(output_json, version, "blocks/pending_with_txs.json");
+    }
+
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
+    #[tokio::test]
+    async fn latest(#[case] version: RpcVersion) {
+        let context = RpcContext::for_tests_with_pending().await;
+
+        let input = Input {
+            block_id: BlockId::Latest,
+        };
+
+        let output = get_block_with_txs(context, input).await.unwrap();
+        let output_json = output.serialize(Serializer { version }).unwrap();
+
+        crate::assert_json_matches_fixture!(output_json, version, "blocks/latest_with_txs.json");
     }
 }

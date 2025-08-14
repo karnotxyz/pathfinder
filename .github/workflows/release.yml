@@ -29,7 +29,9 @@ jobs:
             matrix:
               include:
                 - target: x86_64-unknown-linux-gnu
-                  os: ubuntu-20.04
+                  os: ubuntu-22.04
+                - target: aarch64-unknown-linux-gnu
+                  os: ubuntu-22.04-arm
                 - target: x86_64-apple-darwin
                   os: macos-latest
                 - target: aarch64-apple-darwin
@@ -37,7 +39,6 @@ jobs:
         runs-on: ${{ matrix.os }}
         steps:
             - uses: actions/checkout@v4
-            - uses: dtolnay/rust-toolchain@stable
             - uses: arduino/setup-protoc@v3
               with:
                 repo-token: ${{ secrets.GITHUB_TOKEN }}

@@ -3,42 +3,24 @@ use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 
 use fake::{Fake, Faker};
+use pathfinder_class_hash::compute_class_hash;
 use pathfinder_common::event::Event;
+use pathfinder_common::prelude::*;
 use pathfinder_common::receipt::Receipt;
 use pathfinder_common::state_update::{
     ContractClassUpdate,
     ContractUpdate,
+    StateUpdateError,
     StateUpdateRef,
     SystemContractUpdate,
 };
 use pathfinder_common::test_utils::fake_non_empty_with_rng;
 use pathfinder_common::transaction::Transaction;
-use pathfinder_common::{
-    class_definition,
-    BlockHash,
-    BlockHeader,
-    BlockNumber,
-    ChainId,
-    ClassCommitment,
-    ClassHash,
-    ContractAddress,
-    EventCommitment,
-    ReceiptCommitment,
-    SierraHash,
-    SignedBlockHeader,
-    StarknetVersion,
-    StateCommitment,
-    StateUpdate,
-    StorageCommitment,
-    TransactionCommitment,
-    TransactionHash,
-    TransactionIndex,
-};
+use pathfinder_common::SignedBlockHeader;
 use pathfinder_crypto::signature::SignatureError;
 use pathfinder_crypto::Felt;
 use rand::seq::IteratorRandom;
 use rand::Rng;
-use starknet_gateway_types::class_hash::compute_class_hash;
 
 use crate::{Storage, StorageBuilder};
 
@@ -70,7 +52,7 @@ pub type UpdateTriesFn = Box<
         bool,
         BlockNumber,
         Storage,
-    ) -> anyhow::Result<(StorageCommitment, ClassCommitment)>,
+    ) -> Result<(StorageCommitment, ClassCommitment), StateUpdateError>,
 >;
 
 pub struct Config {
@@ -229,7 +211,11 @@ pub fn fill(storage: &Storage, blocks: &[Block], update_tries: Option<UpdateTrie
 /// - transactions
 ///     - transaction hashes are calculated from their respective variant
 pub mod generate {
-    use pathfinder_common::{BlockCommitmentSignature, BlockCommitmentSignatureElem};
+    use pathfinder_common::{
+        class_definition,
+        BlockCommitmentSignature,
+        BlockCommitmentSignatureElem,
+    };
 
     use super::*;
 
@@ -411,12 +397,20 @@ pub mod generate {
                     declared_cairo_classes,
                     declared_sierra_classes,
                     system_contract_updates: if occurrence.system_storage.contains(&1) {
-                        Some((
-                            ContractAddress::ONE,
-                            SystemContractUpdate {
-                                storage: fake_non_empty_with_rng(rng),
-                            },
-                        ))
+                        [
+                            (
+                                ContractAddress::ONE,
+                                SystemContractUpdate {
+                                    storage: fake_non_empty_with_rng(rng),
+                                },
+                            ),
+                            (
+                                ContractAddress::TWO,
+                                SystemContractUpdate {
+                                    storage: fake_non_empty_with_rng(rng),
+                                },
+                            ),
+                        ]
                         .into_iter()
                         .collect()
                     } else {
@@ -524,8 +518,6 @@ pub mod generate {
             )
             .unwrap();
             let state_commitment = StateCommitment::calculate(storage_commitment, class_commitment);
-            header.header.storage_commitment = storage_commitment;
-            header.header.class_commitment = class_commitment;
             header.header.state_commitment = state_commitment;
             state_update.state_commitment = state_commitment;
         }

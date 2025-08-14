@@ -65,7 +65,7 @@ impl TryFrom<u32> for Action {
             7 => Ok(Action::SanityResponse((value & 0xFFFFFF00) >> 8)),
             8 => Ok(Action::TimeoutOnWriteRequest),
             9 => Ok(Action::TimeoutOnReadRequest),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "invalid action")),
+            _ => Err(io::Error::other("invalid action")),
         }
     }
 }
@@ -89,9 +89,7 @@ impl Codec for TestCodec {
         io.read_exact(&mut buf).await?;
 
         match u32::from_be_bytes(buf).try_into()? {
-            Action::FailOnReadRequest => {
-                Err(io::Error::new(io::ErrorKind::Other, "FailOnReadRequest"))
-            }
+            Action::FailOnReadRequest => Err(io::Error::other("FailOnReadRequest")),
             Action::TimeoutOnReadRequest => loop {
                 tokio::time::sleep(Duration::MAX).await;
             },
@@ -112,9 +110,7 @@ impl Codec for TestCodec {
         io.read_exact(&mut buf).await?;
 
         match u32::from_be_bytes(buf).try_into()? {
-            Action::FailOnReadResponse => {
-                Err(io::Error::new(io::ErrorKind::Other, "FailOnReadResponse"))
-            }
+            Action::FailOnReadResponse => Err(io::Error::other("FailOnReadResponse")),
             Action::TimeoutOnReadResponse => loop {
                 tokio::time::sleep(Duration::MAX).await;
             },
@@ -132,9 +128,7 @@ impl Codec for TestCodec {
         T: AsyncWrite + Unpin + Send,
     {
         match req {
-            Action::FailOnWriteRequest => {
-                Err(io::Error::new(io::ErrorKind::Other, "FailOnWriteRequest"))
-            }
+            Action::FailOnWriteRequest => Err(io::Error::other("FailOnWriteRequest")),
             Action::TimeoutOnWriteRequest => loop {
                 tokio::time::sleep(Duration::MAX).await;
             },
@@ -156,9 +150,7 @@ impl Codec for TestCodec {
         T: AsyncWrite + Unpin + Send,
     {
         match res {
-            Action::FailOnWriteResponse => {
-                Err(io::Error::new(io::ErrorKind::Other, "FailOnWriteResponse"))
-            }
+            Action::FailOnWriteResponse => Err(io::Error::other("FailOnWriteResponse")),
             Action::TimeoutOnWriteResponse => loop {
                 tokio::time::sleep(Duration::MAX).await;
             },
@@ -199,11 +191,14 @@ where
     )
 }
 
-pub fn new_swarm_with_timeout(
-    timeout: Duration,
+pub fn new_swarm_with_timeouts(
+    stream_timeout: Duration,
+    response_timeout: Duration,
 ) -> (PeerId, Swarm<p2p_stream::Behaviour<TestCodec>>) {
     let protocols = iter::once(StreamProtocol::new("/test/1"));
-    let cfg = p2p_stream::Config::default().request_timeout(timeout);
+    let cfg = p2p_stream::Config::default()
+        .stream_timeout(stream_timeout)
+        .response_timeout(response_timeout);
 
     // SwarmExt::new_ephemeral uses async::std
     let swarm = new_ephemeral_with_tokio_executor(|_| {
@@ -216,7 +211,7 @@ pub fn new_swarm_with_timeout(
 }
 
 pub fn new_swarm() -> (PeerId, Swarm<p2p_stream::Behaviour<TestCodec>>) {
-    new_swarm_with_timeout(Duration::from_millis(100))
+    new_swarm_with_timeouts(Duration::from_millis(100), Duration::from_millis(100))
 }
 
 pub async fn wait_no_events(swarm: &mut Swarm<p2p_stream::Behaviour<TestCodec>>) {

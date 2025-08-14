@@ -1,23 +1,20 @@
-use std::sync::Arc;
-#[cfg(feature = "aggregate_bloom")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 mod block;
 mod class;
 mod ethereum;
 pub mod event;
+pub mod pruning;
 mod reference;
-mod reorg_counter;
 mod signature;
-mod state_update;
+pub(crate) mod state_update;
 pub(crate) mod transaction;
 mod trie;
 
-#[cfg(feature = "aggregate_bloom")]
 use event::RunningEventFilter;
 pub use event::{
     EmittedEvent,
-    EventFilter,
+    EventConstraints,
     EventFilterError,
     PageOfEvents,
     PAGE_SIZE_LIMIT as EVENT_PAGE_SIZE_LIMIT,
@@ -26,34 +23,37 @@ use pathfinder_common::event::Event;
 use pathfinder_common::receipt::Receipt;
 use pathfinder_common::transaction::Transaction as StarknetTransaction;
 use pathfinder_common::{BlockNumber, TransactionHash};
-pub(crate) use reorg_counter::ReorgCounter;
+use pruning::BlockchainHistoryMode;
 // Re-export this so users don't require rusqlite as a direct dep.
 pub use rusqlite::TransactionBehavior;
-pub use trie::{Node, NodeRef, RootIndexUpdate, StoredNode, TrieUpdate};
+pub use trie::{Node, NodeRef, RootIndexUpdate, StoredNode, TrieStorageIndex, TrieUpdate};
+
+use crate::bloom::AggregateBloomCache;
 
 type PooledConnection = r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>;
 
 pub struct Connection {
     connection: PooledConnection,
-    bloom_filter_cache: Arc<crate::bloom::Cache>,
-    #[cfg(feature = "aggregate_bloom")]
+    event_filter_cache: Arc<AggregateBloomCache>,
     running_event_filter: Arc<Mutex<RunningEventFilter>>,
     trie_prune_mode: TriePruneMode,
+    pub blockchain_history_mode: BlockchainHistoryMode,
 }
 
 impl Connection {
     pub(crate) fn new(
         connection: PooledConnection,
-        bloom_filter_cache: Arc<crate::bloom::Cache>,
-        #[cfg(feature = "aggregate_bloom")] running_event_filter: Arc<Mutex<RunningEventFilter>>,
+        event_filter_cache: Arc<AggregateBloomCache>,
+        running_event_filter: Arc<Mutex<RunningEventFilter>>,
         trie_prune_mode: TriePruneMode,
+        blockchain_history_mode: BlockchainHistoryMode,
     ) -> Self {
         Self {
             connection,
-            bloom_filter_cache,
-            #[cfg(feature = "aggregate_bloom")]
+            event_filter_cache,
             running_event_filter,
             trie_prune_mode,
+            blockchain_history_mode,
         }
     }
 
@@ -61,10 +61,10 @@ impl Connection {
         let tx = self.connection.transaction()?;
         Ok(Transaction {
             transaction: tx,
-            bloom_filter_cache: self.bloom_filter_cache.clone(),
-            #[cfg(feature = "aggregate_bloom")]
+            event_filter_cache: self.event_filter_cache.clone(),
             running_event_filter: self.running_event_filter.clone(),
             trie_prune_mode: self.trie_prune_mode,
+            blockchain_history_mode: self.blockchain_history_mode,
         })
     }
 
@@ -75,20 +75,28 @@ impl Connection {
         let tx = self.connection.transaction_with_behavior(behavior)?;
         Ok(Transaction {
             transaction: tx,
-            bloom_filter_cache: self.bloom_filter_cache.clone(),
-            #[cfg(feature = "aggregate_bloom")]
+            event_filter_cache: self.event_filter_cache.clone(),
             running_event_filter: self.running_event_filter.clone(),
             trie_prune_mode: self.trie_prune_mode,
+            blockchain_history_mode: self.blockchain_history_mode,
         })
+    }
+
+    pub fn with_retry(self) -> anyhow::Result<Self> {
+        self.connection.busy_handler(Some(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            true
+        }))?;
+        Ok(self)
     }
 }
 
 pub struct Transaction<'inner> {
     transaction: rusqlite::Transaction<'inner>,
-    bloom_filter_cache: Arc<crate::bloom::Cache>,
-    #[cfg(feature = "aggregate_bloom")]
+    event_filter_cache: Arc<AggregateBloomCache>,
     running_event_filter: Arc<Mutex<RunningEventFilter>>,
     trie_prune_mode: TriePruneMode,
+    pub blockchain_history_mode: BlockchainHistoryMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,5 +129,25 @@ impl Transaction<'_> {
 
     pub fn trie_pruning_enabled(&self) -> bool {
         matches!(self.trie_prune_mode, TriePruneMode::Prune { .. })
+    }
+
+    pub fn blockchain_pruning_enabled(&self) -> bool {
+        matches!(
+            self.blockchain_history_mode,
+            BlockchainHistoryMode::Prune { .. }
+        )
+    }
+
+    /// Store the in-memory [`Storage`](crate::Storage) state in the database.
+    /// To be performed on shutdown.
+    pub fn store_in_memory_state(self) -> anyhow::Result<()> {
+        self.store_running_event_filter()?.commit()
+    }
+
+    /// Resets the in-memory [`Storage`](crate::Storage) state. Required after
+    /// each reorg.
+    pub fn reset_in_memory_state(&self, head: BlockNumber) -> anyhow::Result<()> {
+        self.event_filter_cache.reset();
+        self.rebuild_running_event_filter(head)
     }
 }

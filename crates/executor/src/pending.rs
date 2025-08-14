@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use blockifier::execution::contract_class::RunnableCompiledClass;
 use blockifier::state::errors::StateError;
 use blockifier::state::state_api::StateReader;
 use pathfinder_common::{StateUpdate, StorageAddress};
@@ -9,12 +10,13 @@ use starknet_api::StarknetApiError;
 
 use super::felt::{IntoFelt, IntoStarkFelt};
 
-pub(super) struct PendingStateReader<S: StateReader> {
+#[derive(Clone)]
+pub(super) struct PendingStateReader<S: StateReader + Clone> {
     state: S,
     pending_update: Option<Arc<StateUpdate>>,
 }
 
-impl<S: StateReader> PendingStateReader<S> {
+impl<S: StateReader + Clone> PendingStateReader<S> {
     pub(super) fn new(state: S, pending_update: Option<Arc<StateUpdate>>) -> Self {
         Self {
             state,
@@ -23,7 +25,7 @@ impl<S: StateReader> PendingStateReader<S> {
     }
 }
 
-impl<S: StateReader> StateReader for PendingStateReader<S> {
+impl<S: StateReader + Clone> StateReader for PendingStateReader<S> {
     fn get_storage_at(
         &self,
         contract_address: ContractAddress,
@@ -84,13 +86,11 @@ impl<S: StateReader> StateReader for PendingStateReader<S> {
             .unwrap_or_else(|| self.state.get_class_hash_at(contract_address))
     }
 
-    fn get_compiled_contract_class(
+    fn get_compiled_class(
         &self,
         class_hash: starknet_api::core::ClassHash,
-    ) -> blockifier::state::state_api::StateResult<
-        blockifier::execution::contract_class::ContractClass,
-    > {
-        self.state.get_compiled_contract_class(class_hash)
+    ) -> blockifier::state::state_api::StateResult<RunnableCompiledClass> {
+        self.state.get_compiled_class(class_hash)
     }
 
     fn get_compiled_class_hash(
@@ -103,19 +103,15 @@ impl<S: StateReader> StateReader for PendingStateReader<S> {
 
 #[cfg(test)]
 mod tests {
+    use blockifier::execution::contract_class::RunnableCompiledClass;
     use blockifier::state::state_api::StateReader;
-    use pathfinder_common::{
-        class_hash,
-        contract_address,
-        contract_nonce,
-        storage_address,
-        storage_value,
-        StateUpdate,
-    };
+    use pathfinder_common::macro_prelude::*;
+    use pathfinder_common::StateUpdate;
     use starknet_types_core::felt::Felt as CoreFelt;
 
     use super::PendingStateReader;
 
+    #[derive(Clone)]
     struct DummyStateReader {}
 
     impl StateReader for DummyStateReader {
@@ -141,12 +137,10 @@ mod tests {
             Ok(starknet_api::core::ClassHash(CoreFelt::from(u32::MAX)))
         }
 
-        fn get_compiled_contract_class(
+        fn get_compiled_class(
             &self,
             _class_hash: starknet_api::core::ClassHash,
-        ) -> blockifier::state::state_api::StateResult<
-            blockifier::execution::contract_class::ContractClass,
-        > {
+        ) -> blockifier::state::state_api::StateResult<RunnableCompiledClass> {
             unimplemented!()
         }
 

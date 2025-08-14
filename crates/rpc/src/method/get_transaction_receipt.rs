@@ -5,7 +5,7 @@ use pathfinder_common::transaction::Transaction;
 use pathfinder_common::{BlockHash, BlockNumber, TransactionHash};
 
 use crate::context::RpcContext;
-use crate::dto::{self, serialize};
+use crate::dto;
 
 pub struct Input {
     pub transaction_hash: TransactionHash,
@@ -37,11 +37,11 @@ pub enum Output {
     },
 }
 
-impl serialize::SerializeForVersion for Output {
+impl crate::dto::SerializeForVersion for Output {
     fn serialize(
         &self,
-        serializer: serialize::Serializer,
-    ) -> Result<serialize::Ok, serialize::Error> {
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
         match self {
             Output::Full {
                 block_hash,
@@ -79,8 +79,7 @@ crate::error::generate_rpc_error_subset!(Error: TxnHashNotFound);
 
 pub async fn get_transaction_receipt(context: RpcContext, input: Input) -> Result<Output, Error> {
     let span = tracing::Span::current();
-
-    tokio::task::spawn_blocking(move || {
+    util::task::spawn_blocking(move |_| {
         let _g = span.enter();
         let mut db = context
             .storage
@@ -140,4 +139,97 @@ pub async fn get_transaction_receipt(context: RpcContext, input: Input) -> Resul
     })
     .await
     .context("Joining blocking task")?
+}
+
+#[cfg(test)]
+mod tests {
+    use pathfinder_common::transaction_hash_bytes;
+
+    use super::*;
+    use crate::dto::{SerializeForVersion, Serializer};
+    use crate::RpcVersion;
+
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
+    #[tokio::test]
+    async fn l2_accepted(#[case] version: RpcVersion) {
+        let context = RpcContext::for_tests();
+        // This transaction is in block 1 which is not L1 accepted.
+        let tx_hash = transaction_hash_bytes!(b"txn 1");
+        let input = Input {
+            transaction_hash: tx_hash,
+        };
+        let output = get_transaction_receipt(context, input).await.unwrap();
+
+        let output_json = output.serialize(Serializer { version }).unwrap();
+
+        crate::assert_json_matches_fixture!(
+            output_json,
+            version,
+            "transactions/receipt_l2_accepted.json"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
+    #[tokio::test]
+    async fn pending(#[case] version: RpcVersion) {
+        let context = RpcContext::for_tests_with_pending().await;
+        let tx_hash = transaction_hash_bytes!(b"pending tx hash 0");
+        let input = Input {
+            transaction_hash: tx_hash,
+        };
+        let output = get_transaction_receipt(context, input).await.unwrap();
+
+        let output_json = output.serialize(Serializer { version }).unwrap();
+
+        crate::assert_json_matches_fixture!(
+            output_json,
+            version,
+            "transactions/receipt_pending.json"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
+    #[tokio::test]
+    async fn reverted(#[case] version: RpcVersion) {
+        let context = RpcContext::for_tests_with_pending().await;
+        let input = Input {
+            transaction_hash: transaction_hash_bytes!(b"txn reverted"),
+        };
+        let output = get_transaction_receipt(context.clone(), input)
+            .await
+            .unwrap();
+
+        let output_json = output.serialize(Serializer { version }).unwrap();
+
+        crate::assert_json_matches_fixture!(
+            output_json,
+            version,
+            "transactions/receipt_reverted.json"
+        );
+
+        let input = Input {
+            transaction_hash: transaction_hash_bytes!(b"pending reverted"),
+        };
+        let output = get_transaction_receipt(context, input).await.unwrap();
+
+        let output_json = output.serialize(Serializer { version }).unwrap();
+
+        crate::assert_json_matches_fixture!(
+            output_json,
+            version,
+            "transactions/receipt_reverted_pending.json"
+        );
+    }
 }

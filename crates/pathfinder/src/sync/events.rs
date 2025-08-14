@@ -2,22 +2,15 @@ use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 
 use anyhow::Context;
-use p2p::client::types::EventsForBlockByTransaction;
 use p2p::libp2p::PeerId;
+use p2p::sync::client::types::EventsForBlockByTransaction;
 use p2p::PeerData;
 use pathfinder_common::event::Event;
+use pathfinder_common::prelude::*;
 use pathfinder_common::receipt::Receipt;
 use pathfinder_common::transaction::Transaction;
-use pathfinder_common::{
-    BlockHeader,
-    BlockNumber,
-    EventCommitment,
-    StarknetVersion,
-    TransactionHash,
-};
 use pathfinder_storage::Storage;
 use tokio::sync::mpsc;
-use tokio::task::spawn_blocking;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::error::SyncError;
@@ -27,31 +20,7 @@ use crate::sync::stream::ProcessStage;
 
 /// Returns the first block number whose events are missing in storage, counting
 /// from genesis
-pub(super) async fn next_missing(
-    storage: Storage,
-    head: BlockNumber,
-) -> anyhow::Result<Option<BlockNumber>> {
-    spawn_blocking(move || {
-        let mut db = storage
-            .connection()
-            .context("Creating database connection")?;
-        let db = db.transaction().context("Creating database transaction")?;
-
-        if let Some(highest) = db
-            .highest_block_with_all_events_downloaded()
-            .context("Querying highest block with events")?
-        {
-            Ok((highest < head).then_some(highest + 1))
-        } else {
-            Ok(Some(BlockNumber::GENESIS))
-        }
-    })
-    .await
-    .context("Joining blocking task")?
-}
-
-#[cfg(feature = "aggregate_bloom")]
-pub(super) fn next_missing_aggregate(
+pub(super) fn next_missing(
     storage: Storage,
     head: BlockNumber,
 ) -> anyhow::Result<Option<BlockNumber>> {
@@ -89,7 +58,8 @@ pub(super) async fn verify_commitment(
         peer,
         data: (block_number, events),
     } = events;
-    let events = tokio::task::spawn_blocking(move || {
+
+    let events = util::task::spawn_blocking(move |_| {
         let mut connection = storage
             .connection()
             .context("Creating database connection")?;
@@ -124,7 +94,7 @@ pub(super) async fn persist(
     storage: Storage,
     events: Vec<PeerData<EventsForBlockByTransaction>>,
 ) -> Result<BlockNumber, SyncError> {
-    tokio::task::spawn_blocking(move || {
+    util::task::spawn_blocking(move |_| {
         let mut connection = storage
             .connection()
             .context("Creating database connection")?;

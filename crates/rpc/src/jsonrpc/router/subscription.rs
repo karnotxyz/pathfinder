@@ -1,22 +1,22 @@
+use std::borrow::Cow;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use pathfinder_common::{BlockId, BlockNumber};
+use pathfinder_common::BlockNumber;
 use serde_json::value::RawValue;
 use tokio::sync::{mpsc, RwLock};
 use tracing::Instrument;
 
 use super::{run_concurrently, RpcRouter};
 use crate::context::RpcContext;
-use crate::dto::serialize::{self, SerializeForVersion};
-use crate::dto::DeserializeForVersion;
+use crate::dto::{DeserializeForVersion, SerializeForVersion};
 use crate::error::ApplicationError;
 use crate::jsonrpc::{RpcError, RpcRequest, RpcResponse};
+use crate::types::request::SubscriptionBlockId;
 use crate::{RpcVersion, SubscriptionId};
-
-pub const CATCH_UP_BATCH_SIZE: u64 = 64;
 
 /// See [`RpcSubscriptionFlow`].
 #[axum::async_trait]
@@ -29,9 +29,43 @@ pub(super) struct InvokeParams {
     router: RpcRouter,
     input: serde_json::Value,
     subscription_id: SubscriptionId,
-    subscriptions: Arc<DashMap<SubscriptionId, tokio::task::JoinHandle<()>>>,
+    subscriptions: Arc<Subscriptions>,
     ws_tx: mpsc::Sender<Result<Message, RpcResponse>>,
     lock: Arc<RwLock<()>>,
+}
+
+#[derive(Default, Debug)]
+pub struct Subscriptions {
+    subscriptions: DashMap<SubscriptionId, tokio::task::JoinHandle<()>>,
+    next_id: AtomicU32,
+}
+
+impl Subscriptions {
+    pub fn remove(
+        &self,
+        subscription_id: &SubscriptionId,
+    ) -> Option<(SubscriptionId, tokio::task::JoinHandle<()>)> {
+        self.subscriptions.remove(subscription_id)
+    }
+
+    pub fn contains_key(&self, subscription_id: &SubscriptionId) -> bool {
+        self.subscriptions.contains_key(subscription_id)
+    }
+
+    pub fn insert(
+        &self,
+        subscription_id: SubscriptionId,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.subscriptions.insert(subscription_id, handle)
+    }
+
+    pub fn next_id(&self) -> SubscriptionId {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SubscriptionId(id)
+    }
 }
 
 /// This trait is the main entry point for subscription endpoint
@@ -65,7 +99,9 @@ pub trait RpcSubscriptionFlow: Send + Sync {
     /// `params` field of the subscription request.
     type Params: crate::dto::DeserializeForVersion + Clone + Send + Sync + 'static;
     /// The notification type to be sent to the client.
-    type Notification: crate::dto::serialize::SerializeForVersion + Send + Sync + 'static;
+    type Notification: crate::dto::SerializeForVersion + std::fmt::Debug + Send + Sync + 'static;
+    /// The maximum number of blocks to catch up to in a single batch.
+    const CATCH_UP_BATCH_SIZE: u64 = 64;
 
     /// Validate the subscription parameters. If the parameters are invalid,
     /// return an error.
@@ -75,8 +111,8 @@ pub trait RpcSubscriptionFlow: Send + Sync {
 
     /// The block to start streaming from. If the subscription endpoint does not
     /// support catching up, leave this method unimplemented.
-    fn starting_block(_params: &Self::Params) -> BlockId {
-        BlockId::Latest
+    fn starting_block(_params: &Self::Params) -> SubscriptionBlockId {
+        SubscriptionBlockId::Latest
     }
 
     /// Fetch historical data from the `from` block to the `to` block. The
@@ -155,41 +191,41 @@ where
 
         let tx = SubscriptionSender {
             subscription_id,
-            subscriptions: subscriptions.clone(),
+            subscriptions: Arc::clone(&subscriptions),
             tx: ws_tx,
             version: router.version,
             _phantom: Default::default(),
         };
 
-        let first_block = T::starting_block(&params);
+        let starting_block = T::starting_block(&params);
+        let storage = router.context.storage.clone();
+        let mut current_block = util::task::spawn_blocking(move |_| -> Result<_, RpcError> {
+            let mut conn = storage.connection().map_err(RpcError::InternalError)?;
+            let db = conn.transaction().map_err(RpcError::InternalError)?;
 
-        let mut current_block = match first_block {
-            BlockId::Pending => {
-                return Err(RpcError::ApplicationError(ApplicationError::CallOnPending));
-            }
-            BlockId::Latest => {
-                // No need to catch up. The code below will subscribe to new blocks.
-                None
-            }
-            first_block @ (BlockId::Number(_) | BlockId::Hash(_)) => {
-                // Load the first block number, return an error if it's invalid.
-                let first_block = pathfinder_storage::BlockId::try_from(first_block)
-                    .map_err(|e| RpcError::InvalidParams(e.to_string()))?;
-                let storage = router.context.storage.clone();
-                let current_block = tokio::task::spawn_blocking(move || -> Result<_, RpcError> {
-                    let mut conn = storage.connection().map_err(RpcError::InternalError)?;
-                    let db = conn.transaction().map_err(RpcError::InternalError)?;
-                    db.block_number(first_block)
+            let starting_block = match starting_block {
+                SubscriptionBlockId::Number(starting_block_number)
+                    if db.blockchain_pruning_enabled() =>
+                {
+                    let earliest = db
+                        .earliest_block_number()
                         .map_err(RpcError::InternalError)?
-                        .ok_or_else(|| ApplicationError::BlockNotFound.into())
-                })
-                .await
-                .map_err(|e| RpcError::InternalError(e.into()))??;
-                Some(current_block)
-            }
-        };
+                        .unwrap_or(BlockNumber::GENESIS);
+                    let starting_block = std::cmp::max(earliest, starting_block_number);
+                    SubscriptionBlockId::Number(starting_block)
+                }
+                _ => starting_block,
+            };
+            let starting_block = pathfinder_storage::BlockId::from(starting_block);
 
-        Ok(tokio::spawn(async move {
+            db.block_number(starting_block)
+                .map_err(RpcError::InternalError)?
+                .ok_or_else(|| ApplicationError::BlockNotFound.into())
+        })
+        .await
+        .map_err(|e| RpcError::InternalError(e.into()))??;
+
+        Ok(util::task::spawn(async move {
             let _subscription_guard = SubscriptionsGuard {
                 subscription_id,
                 subscriptions,
@@ -199,52 +235,51 @@ where
             let _lock_guard = lock.read().await;
 
             // Catch up to the latest block in batches of BATCH_SIZE.
-            if let Some(current_block) = current_block.as_mut() {
-                loop {
-                    // -1 because the end is inclusive, otherwise we get batches of
-                    // `CATCH_UP_BATCH_SIZE + 1` which probably doesn't really
-                    // matter, but it's misleading.
-                    let end = *current_block + CATCH_UP_BATCH_SIZE - 1;
-                    let catch_up =
-                        match T::catch_up(&router.context, &params, *current_block, end).await {
-                            Ok(messages) => messages,
-                            Err(e) => {
-                                tx.send_err(e)
-                                    .await
-                                    // Could error if the subscription is closing.
-                                    .ok();
-                                return;
-                            }
-                        };
-                    let last_block = match catch_up.last_block {
-                        Some(last_block) => last_block,
-                        None => {
-                            // `None` means that there were no messages for the given block range.
-                            break;
-                        }
-                    };
-                    for msg in catch_up.messages {
-                        if tx
-                            .send(msg.notification, msg.subscription_name)
+            tracing::trace!(%current_block, "Catching up");
+            loop {
+                // -1 because the end is inclusive, otherwise we get batches of
+                // `CATCH_UP_BATCH_SIZE + 1` which probably doesn't really
+                // matter, but it's misleading.
+                let end = current_block + Self::CATCH_UP_BATCH_SIZE - 1;
+                let catch_up = match T::catch_up(&router.context, &params, current_block, end).await
+                {
+                    Ok(messages) => messages,
+                    Err(e) => {
+                        tx.send_err(e)
                             .await
-                            .is_err()
-                        {
-                            // Subscription closing.
-                            return;
-                        }
+                            // Could error if the subscription is closing.
+                            .ok();
+                        return;
                     }
-                    // Increment by 1 because the catch_up range is inclusive.
-                    *current_block = last_block + 1;
-                    if last_block < end {
-                        // This was the last batch.
+                };
+                let last_block = match catch_up.last_block {
+                    Some(last_block) => last_block,
+                    None => {
+                        // `None` means that there were no messages for the given block range.
                         break;
                     }
+                };
+                for msg in catch_up.messages {
+                    if tx
+                        .send(msg.notification, msg.subscription_name)
+                        .await
+                        .is_err()
+                    {
+                        // Subscription closing.
+                        return;
+                    }
+                }
+                // Increment by 1 because the catch_up range is inclusive.
+                current_block = last_block + 1;
+                if last_block < end {
+                    // This was the last batch.
+                    break;
                 }
             }
 
             // Subscribe to new blocks. Receive the first subscription message.
             let (tx1, mut rx1) = mpsc::channel::<SubscriptionMessage<T::Notification>>(1024);
-            tokio::spawn({
+            util::task::spawn({
                 let params = params.clone();
                 let context = router.context.clone();
                 let tx = tx.clone();
@@ -253,7 +288,7 @@ where
                         tx.send_err(e).await.ok();
                     }
                 }
-            });
+            }.in_current_span());
             let first_msg = match rx1.recv().await {
                 Some(msg) => msg,
                 None => {
@@ -267,8 +302,9 @@ where
             // blocks. Because the catch_up range is inclusive, we need to subtract 1 from
             // the block number (i.e. take its parent).
             let end = first_msg.block_number.parent();
-            match (current_block, end) {
-                (Some(current_block), Some(end)) if current_block <= end => {
+            match end {
+                Some(end) if current_block <= end => {
+                    tracing::trace!(%current_block, %end, "Catching up to the first subscription message");
                     let catch_up =
                         match T::catch_up(&router.context, &params, current_block, end).await {
                             Ok(messages) => messages,
@@ -292,38 +328,31 @@ where
                     }
                 }
                 _ => {
-                    // Either the range is empty or catch-up is not supported by
-                    // the endpoint (`current_block` is `None`).
+                    // The range is empty.
                 }
             }
 
             // Send the first subscription message and then forward the rest.
-            if tx
+            if let Err(e) = tx
                 .send(first_msg.notification, first_msg.subscription_name)
                 .await
-                .is_err()
             {
                 // Subscription closing.
+                tracing::trace!(error=?e, "Error sending first subscription message, closing subscription");
                 return;
             }
-            let mut last_block = first_msg.block_number;
             while let Some(msg) = rx1.recv().await {
-                if msg.block_number.get() > last_block.get() + 1 {
-                    // One or more blocks have been skipped. This is likely due to a race
-                    // condition resulting from a reorg. This message should be ignored.
-                    continue;
-                }
-                if tx
+                tracing::trace!(block_number=%msg.block_number, notification=?msg.notification, "Sending subscription notification");
+                if let Err(e) = tx
                     .send(msg.notification, msg.subscription_name)
                     .await
-                    .is_err()
                 {
                     // Subscription closing.
+                    tracing::trace!(error=?e, "Error sending subscription message, closing subscription");
                     break;
                 }
-                last_block = msg.block_number;
             }
-        }))
+        }.instrument(tracing::debug_span!("subscription", subscription_id=%subscription_id.0))))
     }
 }
 
@@ -331,7 +360,7 @@ where
 /// subscription task corresponding to that handle returns.
 struct SubscriptionsGuard {
     subscription_id: SubscriptionId,
-    subscriptions: Arc<DashMap<SubscriptionId, tokio::task::JoinHandle<()>>>,
+    subscriptions: Arc<Subscriptions>,
 }
 
 impl Drop for SubscriptionsGuard {
@@ -352,26 +381,44 @@ pub fn split_ws(ws: WebSocket, version: RpcVersion) -> (WsSender, WsReceiver) {
     let (mut ws_sender, mut ws_receiver) = ws.split();
     // Send messages to the websocket using an MPSC channel.
     let (sender_tx, mut sender_rx) = mpsc::channel::<Result<Message, RpcResponse>>(1024);
-    tokio::spawn(async move {
-        while let Some(msg) = sender_rx.recv().await {
-            match msg {
-                Ok(msg) => {
-                    if ws_sender.send(msg).await.is_err() {
+    util::task::spawn_with_cancel(move |cancellation_token| {
+        async move {
+            loop {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        // Ignore the error since we're shutting down anyway.
+                        let _ = ws_sender.send(Message::Close(Some(CloseFrame {
+                            code: close_code::NORMAL,
+                            reason:  Cow::Borrowed("Server shutdown"),
+                        }))).await.ok();
                         break;
                     }
-                }
-                Err(e) => {
-                    if ws_sender
-                        .send(Message::Text(
-                            serde_json::to_string(
-                                &e.serialize(serialize::Serializer::new(version)).unwrap(),
-                            )
-                            .unwrap(),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    msg = sender_rx.recv() => {
+                        let Some(msg) = msg else {
+                            break;
+                        };
+                        match msg {
+                            Ok(msg) => {
+                                if let Err(e) = ws_sender.send(msg).await {
+                                    tracing::debug!(error=?e, "Error sending websocket message");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if let Err(e) = ws_sender
+                                    .send(Message::Text(
+                                        serde_json::to_string(
+                                            &e.serialize(crate::dto::Serializer::new(version)).unwrap(),
+                                        )
+                                        .unwrap(),
+                                    ))
+                                    .await
+                                {
+                                    tracing::debug!(error=?e, "Error sending websocket error message");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -379,9 +426,10 @@ pub fn split_ws(ws: WebSocket, version: RpcVersion) -> (WsSender, WsReceiver) {
     });
     // Receive messages from the websocket using an MPSC channel.
     let (receiver_tx, receiver_rx) = mpsc::channel::<Result<Message, axum::Error>>(1024);
-    tokio::spawn(async move {
+    util::task::spawn(async move {
         while let Some(msg) = ws_receiver.next().await {
-            if receiver_tx.send(msg).await.is_err() {
+            if let Err(e) = receiver_tx.send(msg).await {
+                tracing::debug!(error=?e, "Error sending incoming websocket over channel");
                 break;
             }
         }
@@ -394,22 +442,21 @@ pub fn handle_json_rpc_socket(
     ws_tx: mpsc::Sender<Result<Message, RpcResponse>>,
     mut ws_rx: mpsc::Receiver<Result<Message, axum::Error>>,
 ) {
-    let subscriptions: Arc<DashMap<SubscriptionId, tokio::task::JoinHandle<()>>> =
-        Default::default();
+    let subscriptions = Arc::new(Subscriptions::default());
     // Read and handle messages from the websocket.
-    tokio::spawn(async move {
+    util::task::spawn(async move {
         loop {
             let request = match ws_rx.recv().await {
                 Some(Ok(Message::Text(msg))) => msg,
                 Some(Ok(Message::Binary(bytes))) => match String::from_utf8(bytes) {
                     Ok(msg) => msg,
                     Err(e) => {
-                        if ws_tx
+                        if let Err(e) = ws_tx
                             .send(Err(RpcResponse::parse_error(e.to_string(), state.version)))
                             .await
-                            .is_err()
                         {
                             // Connection is closing.
+                            tracing::debug!(error=?e, "Error sending websocket decoding error message");
                             break;
                         }
                         continue;
@@ -445,12 +492,12 @@ pub fn handle_json_rpc_socket(
                 let raw_value: &RawValue = match serde_json::from_str(request) {
                     Ok(raw_value) => raw_value,
                     Err(e) => {
-                        if ws_tx
+                        if let Err(e) = ws_tx
                             .send(Err(RpcResponse::parse_error(e.to_string(), state.version)))
                             .await
-                            .is_err()
                         {
                             // Connection is closing.
+                            tracing::debug!(error=?e, "Error sending websocket parse error message");
                             break;
                         }
                         continue;
@@ -459,26 +506,26 @@ pub fn handle_json_rpc_socket(
                 match handle_request(
                     &state,
                     raw_value,
-                    subscriptions.clone(),
+                    Arc::clone(&subscriptions),
                     ws_tx.clone(),
                     lock.clone(),
                 )
                 .await
                 {
                     Ok(Some(response)) | Err(response) => {
-                        if ws_tx
+                        if let Err(e) = ws_tx
                             .send(Ok(Message::Text(
                                 serde_json::to_string(
                                     &response
-                                        .serialize(serialize::Serializer::new(state.version))
+                                        .serialize(crate::dto::Serializer::new(state.version))
                                         .unwrap(),
                                 )
                                 .unwrap(),
                             )))
                             .await
-                            .is_err()
                         {
                             // Connection is closing.
+                            tracing::debug!(error=?e, "Error sending websocket response message");
                             break;
                         }
                     }
@@ -492,12 +539,12 @@ pub fn handle_json_rpc_socket(
                 let requests = match serde_json::from_str::<Vec<&RawValue>>(request) {
                     Ok(requests) => requests,
                     Err(e) => {
-                        if ws_tx
+                        if let Err(e) = ws_tx
                             .send(Err(RpcResponse::parse_error(e.to_string(), state.version)))
                             .await
-                            .is_err()
                         {
                             // Connection is closing.
+                            tracing::debug!(error=?e, "Error sending websocket parse error message");
                             break;
                         }
                         continue;
@@ -506,15 +553,15 @@ pub fn handle_json_rpc_socket(
 
                 if requests.is_empty() {
                     // According to the JSON-RPC spec, a batch request cannot be empty.
-                    if ws_tx
+                    if let Err(e) = ws_tx
                         .send(Err(RpcResponse::invalid_request(
                             "A batch request must contain at least one request".to_owned(),
                             state.version,
                         )))
                         .await
-                        .is_err()
                     {
                         // Connection is closing.
+                        tracing::debug!(error=?e, "Error sending websocket invalid request message");
                         break;
                     }
                 }
@@ -553,22 +600,22 @@ pub fn handle_json_rpc_socket(
                     .into_iter()
                     .map(|response| {
                         response
-                            .serialize(serialize::Serializer::new(state.version))
+                            .serialize(crate::dto::Serializer::new(state.version))
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
 
-                if ws_tx
+                if let Err(e) = ws_tx
                     .send(Ok(Message::Text(serde_json::to_string(&values).unwrap())))
                     .await
-                    .is_err()
                 {
                     // Connection is closing.
+                    tracing::debug!(error=?e, "Error sending websocket response message");
                     break;
                 }
             }
         }
-    });
+    }.in_current_span());
 }
 
 /// Handle a single request. Returns `Result` for convenience, so that the `?`
@@ -577,7 +624,7 @@ pub fn handle_json_rpc_socket(
 async fn handle_request(
     state: &RpcRouter,
     raw_request: &RawValue,
-    subscriptions: Arc<DashMap<SubscriptionId, tokio::task::JoinHandle<()>>>,
+    subscriptions: Arc<Subscriptions>,
     ws_tx: mpsc::Sender<Result<Message, RpcResponse>>,
     lock: Arc<RwLock<()>>,
 ) -> Result<Option<RpcResponse>, RpcResponse> {
@@ -608,10 +655,12 @@ async fn handle_request(
                 state.version,
             )
         })?;
-        let params =
-            serde_json::from_str::<StarknetUnsubscribeParams>(params.get()).map_err(|e| {
-                RpcResponse::invalid_params(req_id.clone(), e.to_string(), state.version)
-            })?;
+        let params = crate::dto::Value::from_str(params.get(), state.version).map_err(|e| {
+            RpcResponse::invalid_params(req_id.clone(), e.to_string(), state.version)
+        })?;
+        let params = StarknetUnsubscribeParams::deserialize(params).map_err(|e| {
+            RpcResponse::invalid_params(req_id.clone(), e.to_string(), state.version)
+        })?;
         let (_, handle) = subscriptions
             .remove(&params.subscription_id)
             .ok_or_else(|| RpcResponse {
@@ -641,14 +690,14 @@ async fn handle_request(
 
     // Start the subscription.
     let router = state.clone();
-    let subscription_id = SubscriptionId::next();
+    let subscription_id = subscriptions.next_id();
     let ws_tx = ws_tx.clone();
     match endpoint
         .invoke(InvokeParams {
             router,
             input: params,
             subscription_id,
-            subscriptions: subscriptions.clone(),
+            subscriptions: Arc::clone(&subscriptions),
             ws_tx: ws_tx.clone(),
             lock,
         })
@@ -659,7 +708,9 @@ async fn handle_request(
                 panic!("subscription id overflow");
             }
             Ok(Some(RpcResponse {
-                output: Ok(serde_json::to_value(subscription_id).unwrap()),
+                output: Ok(subscription_id
+                    .serialize(crate::dto::Serializer::new(state.version))
+                    .unwrap()),
                 id: req_id,
                 version: state.version,
             }))
@@ -672,16 +723,25 @@ async fn handle_request(
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct StarknetUnsubscribeParams {
     subscription_id: SubscriptionId,
+}
+
+impl DeserializeForVersion for StarknetUnsubscribeParams {
+    fn deserialize(value: crate::dto::Value) -> Result<Self, serde_json::Error> {
+        value.deserialize_map(|value| {
+            Ok(Self {
+                subscription_id: value.deserialize("subscription_id")?,
+            })
+        })
+    }
 }
 
 #[derive(Debug)]
 pub struct SubscriptionSender<T> {
     pub subscription_id: SubscriptionId,
-    pub subscriptions: Arc<DashMap<SubscriptionId, tokio::task::JoinHandle<()>>>,
+    pub subscriptions: Arc<Subscriptions>,
     pub tx: mpsc::Sender<Result<Message, RpcResponse>>,
     pub version: RpcVersion,
     pub _phantom: std::marker::PhantomData<T>,
@@ -699,7 +759,7 @@ impl<T> Clone for SubscriptionSender<T> {
     }
 }
 
-impl<T: crate::dto::serialize::SerializeForVersion> SubscriptionSender<T> {
+impl<T: crate::dto::SerializeForVersion> SubscriptionSender<T> {
     pub async fn send(
         &self,
         value: T,
@@ -717,7 +777,7 @@ impl<T: crate::dto::serialize::SerializeForVersion> SubscriptionSender<T> {
                 result: value,
             },
         }
-        .serialize(crate::dto::serialize::Serializer::new(self.version))
+        .serialize(crate::dto::Serializer::new(self.version))
         .unwrap();
         let data = serde_json::to_string(&notification).unwrap();
         self.tx
@@ -739,7 +799,7 @@ impl<T: crate::dto::serialize::SerializeForVersion> SubscriptionSender<T> {
                 result: err,
             },
         }
-        .serialize(crate::dto::serialize::Serializer::new(self.version))
+        .serialize(crate::dto::Serializer::new(self.version))
         .unwrap();
         let data = serde_json::to_string(&notification).unwrap();
         self.tx
@@ -762,14 +822,14 @@ pub struct SubscriptionResult<T> {
     result: T,
 }
 
-impl<T> crate::dto::serialize::SerializeForVersion for RpcNotification<T>
+impl<T> crate::dto::SerializeForVersion for RpcNotification<T>
 where
-    T: crate::dto::serialize::SerializeForVersion,
+    T: crate::dto::SerializeForVersion,
 {
     fn serialize(
         &self,
-        serializer: crate::dto::serialize::Serializer,
-    ) -> Result<crate::dto::serialize::Ok, crate::dto::serialize::Error> {
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
         let mut serializer = serializer.serialize_struct()?;
         serializer.serialize_field("jsonrpc", &self.jsonrpc)?;
         serializer.serialize_field("method", &self.method)?;
@@ -778,14 +838,14 @@ where
     }
 }
 
-impl<T> crate::dto::serialize::SerializeForVersion for SubscriptionResult<T>
+impl<T> crate::dto::SerializeForVersion for SubscriptionResult<T>
 where
-    T: crate::dto::serialize::SerializeForVersion,
+    T: crate::dto::SerializeForVersion,
 {
     fn serialize(
         &self,
-        serializer: crate::dto::serialize::Serializer,
-    ) -> Result<crate::dto::serialize::Ok, crate::dto::serialize::Error> {
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
         let mut serializer = serializer.serialize_struct()?;
         serializer.serialize_field("subscription_id", &self.subscription_id)?;
         serializer.serialize_field("result", &self.result)?;
@@ -795,20 +855,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use axum::async_trait;
     use axum::extract::ws::Message;
-    use pathfinder_common::{BlockHash, BlockHeader, BlockId, BlockNumber, ChainId};
+    use pathfinder_common::{BlockHash, BlockHeader, BlockNumber};
     use pathfinder_crypto::Felt;
-    use pathfinder_ethereum::EthereumClient;
     use pathfinder_storage::StorageBuilder;
-    use primitive_types::H160;
-    use starknet_gateway_client::Client;
     use tokio::sync::mpsc;
 
     use super::RpcSubscriptionEndpoint;
-    use crate::context::{RpcConfig, RpcContext};
+    use crate::context::RpcContext;
     use crate::dto::DeserializeForVersion;
     use crate::jsonrpc::{
         handle_json_rpc_socket,
@@ -817,9 +872,8 @@ mod tests {
         RpcSubscriptionFlow,
         SubscriptionMessage,
     };
-    use crate::pending::PendingWatcher;
-    use crate::types::syncing::Syncing;
-    use crate::{Notifications, SyncState};
+    use crate::types::request::SubscriptionBlockId;
+    use crate::Notifications;
 
     #[tokio::test]
     async fn test_error_returned_from_catch_up() {
@@ -830,8 +884,8 @@ mod tests {
             type Params = Params;
             type Notification = serde_json::Value;
 
-            fn starting_block(_params: &Self::Params) -> BlockId {
-                BlockId::Number(BlockNumber::GENESIS)
+            fn starting_block(_params: &Self::Params) -> SubscriptionBlockId {
+                SubscriptionBlockId::Number(BlockNumber::GENESIS)
             }
 
             async fn catch_up(
@@ -871,12 +925,12 @@ mod tests {
             .await
             .unwrap();
         let res = sender_rx.recv().await.unwrap().unwrap();
-        let subscription_id = match res {
+        let subscription_id: u64 = match res {
             Message::Text(json) => {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -892,7 +946,7 @@ mod tests {
                 "method": "pathfinder_subscriptionError",
                 "params": {
                     "result": { "code": -32603, "message": "Internal error" },
-                    "subscription_id": subscription_id
+                    "subscription_id": subscription_id.to_string()
                 }
             })
         )
@@ -907,8 +961,8 @@ mod tests {
             type Params = Params;
             type Notification = serde_json::Value;
 
-            fn starting_block(_params: &Self::Params) -> BlockId {
-                BlockId::Number(BlockNumber::GENESIS)
+            fn starting_block(_params: &Self::Params) -> SubscriptionBlockId {
+                SubscriptionBlockId::Number(BlockNumber::GENESIS)
             }
 
             async fn catch_up(
@@ -948,12 +1002,12 @@ mod tests {
             .await
             .unwrap();
         let res = sender_rx.recv().await.unwrap().unwrap();
-        let subscription_id = match res {
+        let subscription_id: u64 = match res {
             Message::Text(json) => {
                 let json: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(json["jsonrpc"], "2.0");
                 assert_eq!(json["id"], 1);
-                json["result"].as_u64().unwrap()
+                json["result"].as_str().unwrap().parse().unwrap()
             }
             _ => panic!("Expected text message"),
         };
@@ -969,7 +1023,7 @@ mod tests {
                 "method": "pathfinder_subscriptionError",
                 "params": {
                     "result": { "code": -32603, "message": "Internal error" },
-                    "subscription_id": subscription_id
+                    "subscription_id": subscription_id.to_string()
                 }
             })
         )
@@ -1007,31 +1061,10 @@ mod tests {
         .unwrap();
         let (_, pending_data) = tokio::sync::watch::channel(Default::default());
         let notifications = Notifications::default();
-        let ctx = RpcContext {
-            cache: Default::default(),
-            storage,
-            execution_storage: StorageBuilder::in_memory().unwrap(),
-            pending_data: PendingWatcher::new(pending_data),
-            sync_status: SyncState {
-                status: Syncing::False(false).into(),
-            }
-            .into(),
-            chain_id: ChainId::MAINNET,
-            core_contract_address: H160::from(pathfinder_ethereum::core_addr::MAINNET),
-            sequencer: Client::mainnet(Duration::from_secs(10)),
-            websocket: None,
-            notifications,
-            ethereum: EthereumClient::new("wss://eth-sepolia.g.alchemy.com/v2/just-for-tests")
-                .unwrap(),
-            config: RpcConfig {
-                batch_concurrency_limit: 1.try_into().unwrap(),
-                get_events_max_blocks_to_scan: 1.try_into().unwrap(),
-                get_events_max_uncached_bloom_filters_to_load: 1.try_into().unwrap(),
-                #[cfg(feature = "aggregate_bloom")]
-                get_events_max_bloom_filters_to_load: 1.try_into().unwrap(),
-                custom_versioned_constants: None,
-            },
-        };
+        let ctx = RpcContext::for_tests()
+            .with_notifications(notifications)
+            .with_pending_data(pending_data);
+
         RpcRouter::builder(crate::RpcVersion::V08)
             .register("test", endpoint)
             .build(ctx)

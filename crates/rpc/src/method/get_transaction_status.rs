@@ -42,8 +42,7 @@ crate::error::generate_rpc_error_subset!(Error: TxnHashNotFound);
 pub async fn get_transaction_status(context: RpcContext, input: Input) -> Result<Output, Error> {
     // Check database.
     let span = tracing::Span::current();
-
-    let db_status = tokio::task::spawn_blocking(move || {
+    let db_status = util::task::spawn_blocking(move |_| {
         let _g = span.enter();
 
         let mut db = context
@@ -92,7 +91,7 @@ pub async fn get_transaction_status(context: RpcContext, input: Input) -> Result
 
     // Check gateway for rejected transactions.
     use starknet_gateway_client::GatewayApi;
-    context
+    let result = context
         .sequencer
         .transaction_status(input.transaction_hash)
         .await
@@ -107,7 +106,16 @@ pub async fn get_transaction_status(context: RpcContext, input: Input) -> Result
             let execution_status = tx.execution_status.unwrap_or_default();
 
             match (tx.finality_status, execution_status) {
-                (GatewayFinalityStatus::NotReceived, _) => Err(Error::TxnHashNotFound),
+                (GatewayFinalityStatus::NotReceived, _) => {
+                    if context
+                        .submission_tracker
+                        .contains_key(&input.transaction_hash)
+                    {
+                        Ok(Output::Received)
+                    } else {
+                        Err(Error::TxnHashNotFound)
+                    }
+                }
                 (_, GatewayExecutionStatus::Rejected) => Ok(Output::Rejected {
                     error_message: tx.tx_failure_reason.map(|reason| reason.error_message),
                 }),
@@ -129,7 +137,9 @@ pub async fn get_transaction_status(context: RpcContext, input: Input) -> Result
                     Ok(Output::AcceptedOnL2(TxnExecutionStatus::Succeeded))
                 }
             }
-        })
+        });
+    context.submission_tracker.flush();
+    result
 }
 
 impl Output {
@@ -161,16 +171,15 @@ impl Output {
     }
 }
 
-impl crate::dto::serialize::SerializeForVersion for Output {
+impl crate::dto::SerializeForVersion for Output {
     fn serialize(
         &self,
-        serializer: crate::dto::serialize::Serializer,
-    ) -> Result<crate::dto::serialize::Ok, crate::dto::serialize::Error> {
+        serializer: crate::dto::Serializer,
+    ) -> Result<crate::dto::Ok, crate::dto::Error> {
         let mut serializer = serializer.serialize_struct()?;
         serializer.serialize_field("finality_status", &self.finality_status())?;
         serializer.serialize_optional("execution_status", self.execution_status())?;
-        // Delete check once rustc gives you a friendly reminder
-        if serializer.version != RpcVersion::V07 {
+        if serializer.version > RpcVersion::V07 {
             serializer.serialize_optional("failure_reason", self.failure_reason())?;
         }
         serializer.end()
@@ -185,6 +194,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::dto::{SerializeForVersion, Serializer};
+    use crate::RpcVersion;
 
     #[rstest::rstest]
     #[case::rejected(Output::Rejected { error_message: None }, json!({"finality_status":"REJECTED"}))]
@@ -198,7 +209,7 @@ mod tests {
         json!({"finality_status":"ACCEPTED_ON_L2","execution_status":"REVERTED"})
     )]
     fn output_serialization(#[case] output: Output, #[case] expected: serde_json::Value) {
-        use crate::dto::serialize::SerializeForVersion;
+        use crate::dto::SerializeForVersion;
         let encoded = output.serialize(Default::default()).unwrap();
         assert_eq!(encoded, expected);
     }
@@ -216,8 +227,13 @@ mod tests {
         assert_eq!(status, Output::AcceptedOnL1(TxnExecutionStatus::Succeeded));
     }
 
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
     #[tokio::test]
-    async fn l2_accepted() {
+    async fn l2_accepted(#[case] version: RpcVersion) {
         let context = RpcContext::for_tests();
         // This transaction is in block 1 which is not L1 accepted.
         let tx_hash = transaction_hash_bytes!(b"txn 1");
@@ -226,11 +242,22 @@ mod tests {
         };
         let status = get_transaction_status(context, input).await.unwrap();
 
-        assert_eq!(status, Output::AcceptedOnL2(TxnExecutionStatus::Succeeded));
+        let output_json = status.serialize(Serializer { version }).unwrap();
+
+        let expected_status = include_str!("../../fixtures/status/l2_accepted.json");
+        let expected_json: serde_json::Value =
+            serde_json::from_str(expected_status).expect("Failed to parse fixture as JSON");
+
+        pretty_assertions_sorted::assert_eq!(output_json, expected_json);
     }
 
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
     #[tokio::test]
-    async fn pending() {
+    async fn pending(#[case] version: RpcVersion) {
         let context = RpcContext::for_tests_with_pending().await;
         let tx_hash = transaction_hash_bytes!(b"pending tx hash 0");
         let input = Input {
@@ -238,7 +265,13 @@ mod tests {
         };
         let status = get_transaction_status(context, input).await.unwrap();
 
-        assert_eq!(status, Output::AcceptedOnL2(TxnExecutionStatus::Succeeded));
+        let output_json = status.serialize(Serializer { version }).unwrap();
+
+        let expected_status = include_str!("../../fixtures/status/pending.json");
+        let expected_json: serde_json::Value =
+            serde_json::from_str(expected_status).expect("Failed to parse fixture as JSON");
+
+        pretty_assertions_sorted::assert_eq!(output_json, expected_json);
     }
 
     #[tokio::test]
@@ -276,8 +309,13 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
     #[tokio::test]
-    async fn reverted() {
+    async fn reverted(#[case] version: RpcVersion) {
         let context = RpcContext::for_tests_with_pending().await;
         let input = Input {
             transaction_hash: transaction_hash_bytes!(b"txn reverted"),
@@ -285,22 +323,26 @@ mod tests {
         let status = get_transaction_status(context.clone(), input)
             .await
             .unwrap();
-        assert_eq!(
-            status,
-            Output::AcceptedOnL2(TxnExecutionStatus::Reverted {
-                reason: Some("Reverted because".to_string())
-            })
+
+        let output_json = status.serialize(Serializer { version }).unwrap();
+
+        crate::assert_json_matches_fixture!(
+            output_json,
+            version,
+            "transactions/status_reverted_with_reason.json"
         );
 
         let input = Input {
             transaction_hash: transaction_hash_bytes!(b"pending reverted"),
         };
         let status = get_transaction_status(context, input).await.unwrap();
-        assert_eq!(
-            status,
-            Output::AcceptedOnL2(TxnExecutionStatus::Reverted {
-                reason: Some("Reverted!".to_string())
-            })
+
+        let output_json = status.serialize(Serializer { version }).unwrap();
+
+        crate::assert_json_matches_fixture!(
+            output_json,
+            version,
+            "transactions/status_reverted.json"
         );
     }
 

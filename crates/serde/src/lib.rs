@@ -5,19 +5,7 @@ use std::borrow::Cow;
 use std::str::FromStr;
 
 use num_bigint::BigUint;
-use pathfinder_common::{
-    BlockNumber,
-    CallParam,
-    ConstructorParam,
-    EthereumAddress,
-    GasPrice,
-    L1ToL2MessagePayloadElem,
-    L2ToL1MessagePayloadElem,
-    ResourceAmount,
-    ResourcePricePerUnit,
-    Tip,
-    TransactionSignatureElem,
-};
+use pathfinder_common::prelude::*;
 use pathfinder_crypto::{Felt, HexParseError, OverflowError};
 use primitive_types::{H160, H256, U256};
 use serde::de::Visitor;
@@ -384,7 +372,7 @@ fn bytes_from_hex_str<const N: usize>(hex_str: &str) -> Result<[u8; N], HexParse
 
     for (i, c) in chunks.enumerate() {
         // Indexing c[0] and c[1] are safe since chunk-size is 2.
-        buf[N - 1 - i] = parse_hex_digit(c[0])? << 4 | parse_hex_digit(c[1])?;
+        buf[N - 1 - i] = (parse_hex_digit(c[0])? << 4) | parse_hex_digit(c[1])?;
     }
 
     Ok(buf)
@@ -423,6 +411,15 @@ fn it_to_hex_str<'a>(
     &buf[..len]
 }
 
+/// Converts a [BlockNumber] to a RPC-compatible hex string.
+pub fn block_number_as_hex_str(block_number: &BlockNumber) -> String {
+    let bytes = block_number.get().to_be_bytes();
+    // BlockNumber is "0x" + 16 digits at most
+    let mut buf = [0u8; 2 + 16];
+    let s = bytes_as_hex_str(&bytes, &mut buf);
+    s.to_string()
+}
+
 /// A convenience function which produces a "0x" prefixed hex str slice in a
 /// given buffer `buf` from an array of bytes.
 /// Panics if `bytes.len() * 2 + 2 > buf.len()`
@@ -456,6 +453,14 @@ pub fn bytes_to_hex_str(bytes: &[u8]) -> Cow<'static, str> {
     it_to_hex_str(it, start, len, &mut buf);
     // Unwrap is safe as the buffer contains valid utf8
     String::from_utf8(buf).unwrap().into()
+}
+
+/// A convenience function which produces a "0x" prefixed hex string from a
+/// [H256].
+pub fn h256_as_no_leading_zeros_hex_str(h: &H256) -> String {
+    let mut buf = [0u8; 2 + 64];
+    let s = bytes_as_hex_str(h.as_bytes(), &mut buf);
+    s.to_string()
 }
 
 /// Extract JSON representation of program and entry points from the contract

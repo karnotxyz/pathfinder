@@ -3,25 +3,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use futures::{StreamExt, TryStreamExt};
+use pathfinder_common::prelude::*;
 use pathfinder_common::state_update::{ContractClassUpdate, StateUpdateData};
-use pathfinder_common::{
-    BlockCommitmentSignature,
-    BlockHash,
-    BlockNumber,
-    CasmHash,
-    Chain,
-    ChainId,
-    ClassHash,
-    EventCommitment,
-    PublicKey,
-    ReceiptCommitment,
-    SierraHash,
-    StarknetVersion,
-    StateCommitment,
-    StateDiffCommitment,
-    StateUpdate,
-    TransactionCommitment,
-};
+use pathfinder_common::Chain;
 use pathfinder_storage::Storage;
 use starknet_gateway_client::GatewayApi;
 use starknet_gateway_types::error::SequencerError;
@@ -152,14 +136,14 @@ where
         };
 
         // We start downloading the signature for the block
-        let signature_handle = tokio::spawn({
+        let signature_handle = util::task::spawn({
             let sequencer = sequencer.clone();
             async move {
                 let t_signature = std::time::Instant::now();
                 let result = sequencer.signature(next.into()).await;
                 let t_signature = t_signature.elapsed();
 
-                (result, t_signature)
+                Ok((result, t_signature))
             }
         });
 
@@ -261,8 +245,10 @@ where
         let t_declare = t_declare.elapsed();
 
         // Download signature
-        let (signature_result, t_signature) =
-            signature_handle.await.context("Joining signature task")?;
+        let (signature_result, t_signature) = signature_handle
+            .await
+            .context("Joining signature task")?
+            .context("Task cancelled")?;
         let (signature, t_signature) = match signature_result {
             Ok(signature) => (signature, t_signature),
             Err(SequencerError::StarknetError(err))
@@ -299,14 +285,14 @@ where
         let (signature, state_update) = match block_validation_mode {
             BlockValidationMode::Strict => {
                 let block_hash = block.block_hash;
-                let (verify_result, signature, state_update) = tokio::task::spawn_blocking(move || -> (Result<(), pathfinder_crypto::signature::SignatureError>, BlockCommitmentSignature, Box<StateUpdate>) {
-                    let verify_result = signature
-                        .verify(
-                            sequencer_public_key,
-                            block_hash,
-                        );
-                    (verify_result, signature, state_update)
-                }).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rayon::spawn(move || {
+                    let verify_result = signature.verify(sequencer_public_key, block_hash);
+                    let _ = tx.send((verify_result, signature, state_update));
+                });
+                let (verify_result, signature, state_update) =
+                    rx.await.context("Panic on rayon thread")?;
+
                 if let Err(error) = verify_result {
                     tracing::warn!(%error, block_number=%block.block_number, "Block commitment signature mismatch");
                 }
@@ -413,7 +399,7 @@ pub async fn download_new_classes(
         return Ok(vec![]);
     }
 
-    let require_downloading = tokio::task::spawn_blocking(move || {
+    let require_downloading = util::task::spawn_blocking(move |_| {
         let mut db_conn = storage
             .connection()
             .context("Creating database connection")?;
@@ -510,7 +496,8 @@ async fn download_block(
             let block = recv.await.expect("Panic on rayon thread")?;
 
             // Check if commitments and block hash are correct
-            let verify_hash = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            rayon::spawn(move || {
                 let state_diff_commitment =
                     StateUpdateData::from(state_update.clone()).compute_state_diff_commitment();
                 let state_update = Box::new(state_update);
@@ -524,11 +511,13 @@ async fn download_block(
                     chain,
                     chain_id,
                 )
-                .with_context(move || format!("Verify block {block_number}"))?;
-                Ok((block, state_update, state_diff_commitment, verify_result))
+                .with_context(move || format!("Verify block {block_number}"));
+
+                let _ = tx.send((block, state_update, state_diff_commitment, verify_result));
             });
             let (block, state_update, state_diff_commitment, verify_result) =
-                verify_hash.await.context("Verify block hash")??;
+                rx.await.context("Panic on rayon thread")?;
+            let verify_result = verify_result.context("Verify block hash")?;
 
             match (block.status, verify_result, mode) {
                 (
@@ -1176,24 +1165,8 @@ mod tests {
 
         use assert_matches::assert_matches;
         use pathfinder_common::macro_prelude::*;
-        use pathfinder_common::{
-            BlockHash,
-            BlockId,
-            BlockNumber,
-            BlockTimestamp,
-            Chain,
-            ChainId,
-            ClassHash,
-            ContractAddress,
-            GasPrice,
-            PublicKey,
-            SequencerAddress,
-            StarknetVersion,
-            StateCommitment,
-            StateUpdate,
-            StorageAddress,
-            StorageValue,
-        };
+        use pathfinder_common::prelude::*;
+        use pathfinder_common::{BlockId, Chain};
         use pathfinder_crypto::Felt;
         use pathfinder_storage::StorageBuilder;
         use starknet_gateway_client::MockGatewayApi;
@@ -1408,6 +1381,7 @@ mod tests {
             block_number: BLOCK0_NUMBER,
             l1_gas_price: Default::default(),
             l1_data_gas_price: Default::default(),
+            l2_gas_price: None,
             parent_block_hash: BlockHash(Felt::ZERO),
             sequencer_address: Some(SequencerAddress(Felt::ZERO)),
             state_commitment: GLOBAL_ROOT0,
@@ -1434,6 +1408,10 @@ mod tests {
                 price_in_wei: GasPrice::from_be_slice(b"datgasprice 0 v2").unwrap(),
                 price_in_fri: GasPrice::from_be_slice(b"datstrkpric 0 v2").unwrap(),
             },
+            l2_gas_price: Some(GasPrices {
+                price_in_wei: GasPrice::from_be_slice(b"l2 gasprice 0 v2").unwrap(),
+                price_in_fri: GasPrice::from_be_slice(b"l2 strkpric 0 v2").unwrap(),
+            }),
             parent_block_hash: BlockHash(Felt::ZERO),
             sequencer_address: Some(SequencerAddress(
                 Felt::from_be_slice(b"sequencer addr. 0 v2").unwrap(),
@@ -1462,6 +1440,10 @@ mod tests {
                 price_in_wei: GasPrice::from(1),
                 price_in_fri: GasPrice::from(1),
             },
+            l2_gas_price: Some(GasPrices {
+                price_in_wei: GasPrice::from(1),
+                price_in_fri: GasPrice::from(1),
+            }),
             parent_block_hash: BLOCK0_HASH,
             sequencer_address: Some(SequencerAddress(
                 Felt::from_be_slice(b"sequencer address 1").unwrap(),
@@ -1490,6 +1472,10 @@ mod tests {
                 price_in_wei: GasPrice::from(2),
                 price_in_fri: GasPrice::from(2),
             },
+            l2_gas_price: Some(GasPrices {
+                price_in_wei: GasPrice::from(2),
+                price_in_fri: GasPrice::from(2),
+            }),
             parent_block_hash: BLOCK1_HASH,
             sequencer_address: Some(SequencerAddress(
                 Felt::from_be_slice(b"sequencer address 2").unwrap(),
@@ -2083,6 +2069,10 @@ mod tests {
                         price_in_wei: GasPrice::from_be_slice(b"datgasprice 1 v2").unwrap(),
                         price_in_fri: GasPrice::from_be_slice(b"datstrkpric 1 v2").unwrap(),
                     },
+                    l2_gas_price: Some(GasPrices {
+                        price_in_wei: GasPrice::from_be_slice(b"l2 gasprice 1 v2").unwrap(),
+                        price_in_fri: GasPrice::from_be_slice(b"l2 strkpric 1 v2").unwrap(),
+                    }),
                     parent_block_hash: BLOCK0_HASH_V2,
                     sequencer_address: Some(SequencerAddress(
                         Felt::from_be_slice(b"sequencer addr. 1 v2").unwrap(),
@@ -2317,6 +2307,10 @@ mod tests {
                         price_in_wei: GasPrice::from_be_slice(b"datgasprice 1 v2").unwrap(),
                         price_in_fri: GasPrice::from_be_slice(b"datstrkpric 1 v2").unwrap(),
                     },
+                    l2_gas_price: Some(GasPrices {
+                        price_in_wei: GasPrice::from_be_slice(b"l2 gasprice 1 v2").unwrap(),
+                        price_in_fri: GasPrice::from_be_slice(b"l2 strkpric 1 v2").unwrap(),
+                    }),
                     parent_block_hash: BLOCK0_HASH,
                     sequencer_address: Some(SequencerAddress(
                         Felt::from_be_slice(b"sequencer addr. 1 v2").unwrap(),
@@ -2345,6 +2339,10 @@ mod tests {
                         price_in_wei: GasPrice::from_be_slice(b"datgasprice 2 v2").unwrap(),
                         price_in_fri: GasPrice::from_be_slice(b"datstrkpric 2 v2").unwrap(),
                     },
+                    l2_gas_price: Some(GasPrices {
+                        price_in_wei: GasPrice::from_be_slice(b"l2 gasprice 2 v2").unwrap(),
+                        price_in_fri: GasPrice::from_be_slice(b"l2 strkpric 2 v2").unwrap(),
+                    }),
                     parent_block_hash: BLOCK1_HASH_V2,
                     sequencer_address: Some(SequencerAddress(
                         Felt::from_be_slice(b"sequencer addr. 2 v2").unwrap(),
@@ -2373,6 +2371,10 @@ mod tests {
                         price_in_wei: GasPrice::from(3),
                         price_in_fri: GasPrice::from(3),
                     },
+                    l2_gas_price: Some(GasPrices {
+                        price_in_wei: GasPrice::from(3),
+                        price_in_fri: GasPrice::from(3),
+                    }),
                     parent_block_hash: BLOCK2_HASH,
                     sequencer_address: Some(SequencerAddress(
                         Felt::from_be_slice(b"sequencer address 3").unwrap(),
@@ -2616,6 +2618,10 @@ mod tests {
                         price_in_wei: GasPrice::from_be_slice(b"datgasprice 2 v2").unwrap(),
                         price_in_fri: GasPrice::from_be_slice(b"datstrkpric 2 v2").unwrap(),
                     },
+                    l2_gas_price: Some(GasPrices {
+                        price_in_wei: GasPrice::from_be_slice(b"l2 gasprice 2 v2").unwrap(),
+                        price_in_fri: GasPrice::from_be_slice(b"l2 strkpric 2 v2").unwrap(),
+                    }),
                     parent_block_hash: BLOCK1_HASH,
                     sequencer_address: Some(SequencerAddress(
                         Felt::from_be_slice(b"sequencer addr. 2 v2").unwrap(),
@@ -2812,6 +2818,10 @@ mod tests {
                         price_in_wei: GasPrice::from_be_slice(b"datgasprice 1 v2").unwrap(),
                         price_in_fri: GasPrice::from_be_slice(b"datstrkpric 1 v2").unwrap(),
                     },
+                    l2_gas_price: Some(GasPrices {
+                        price_in_wei: GasPrice::from_be_slice(b"l2 gasprice 1 v2").unwrap(),
+                        price_in_fri: GasPrice::from_be_slice(b"l2 strkpric 1 v2").unwrap(),
+                    }),
                     parent_block_hash: BLOCK0_HASH,
                     sequencer_address: Some(SequencerAddress(
                         Felt::from_be_slice(b"sequencer addr. 1 v2").unwrap(),
@@ -2840,6 +2850,10 @@ mod tests {
                         price_in_wei: GasPrice::from_be_slice(b"datgasprice 2").unwrap(),
                         price_in_fri: GasPrice::from_be_slice(b"datstrkpric 2").unwrap(),
                     },
+                    l2_gas_price: Some(GasPrices {
+                        price_in_wei: GasPrice::from_be_slice(b"l2 gasprice 2").unwrap(),
+                        price_in_fri: GasPrice::from_be_slice(b"l2 strkpric 2").unwrap(),
+                    }),
                     parent_block_hash: BLOCK1_HASH_V2,
                     sequencer_address: Some(SequencerAddress(
                         Felt::from_be_slice(b"sequencer address 2").unwrap(),

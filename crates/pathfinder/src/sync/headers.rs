@@ -4,20 +4,8 @@ use futures::StreamExt;
 use p2p::libp2p::PeerId;
 use p2p::PeerData;
 use p2p_proto::header;
-use pathfinder_common::{
-    BlockHash,
-    BlockHeader,
-    BlockNumber,
-    Chain,
-    ChainId,
-    ClassCommitment,
-    PublicKey,
-    SignedBlockHeader,
-    StarknetVersion,
-    StorageCommitment,
-};
+use pathfinder_common::prelude::*;
 use pathfinder_storage::Storage;
-use tokio::task::spawn_blocking;
 
 use crate::state::block_hash::{BlockHeaderData, VerifyResult};
 use crate::sync::error::SyncError;
@@ -55,7 +43,7 @@ pub(super) async fn next_gap(
     head: BlockNumber,
     head_hash: BlockHash,
 ) -> anyhow::Result<Option<HeaderGap>> {
-    spawn_blocking(move || {
+    util::task::spawn_blocking(move |_| {
         let mut db = storage
             .connection()
             .context("Creating database connection")?;
@@ -115,24 +103,6 @@ pub(super) async fn next_gap(
             tail,
             tail_parent_hash,
         }))
-    })
-    .await
-    .context("Joining blocking task")?
-}
-
-pub(super) async fn query(
-    storage: Storage,
-    block_number: BlockNumber,
-) -> anyhow::Result<Option<BlockHeader>> {
-    spawn_blocking({
-        move || {
-            let mut db = storage
-                .connection()
-                .context("Creating database connection")?;
-            let db = db.transaction().context("Creating database transaction")?;
-            db.block_header(block_number.into())
-                .context("Querying first block without transactions")
-        }
     })
     .await
     .context("Joining blocking task")?

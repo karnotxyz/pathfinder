@@ -3,15 +3,8 @@ use std::fmt::Debug;
 use std::result::Result;
 use std::time::Duration;
 
-use pathfinder_common::{
-    BlockHash,
-    BlockId,
-    BlockNumber,
-    ClassHash,
-    PublicKey,
-    StateUpdate,
-    TransactionHash,
-};
+use pathfinder_common::prelude::*;
+use pathfinder_common::BlockId;
 use reqwest::Url;
 use starknet_gateway_types::error::SequencerError;
 use starknet_gateway_types::reply::PendingBlock;
@@ -235,8 +228,9 @@ pub struct Client {
 impl Client {
     /// Creates a [Client] for [pathfinder_common::Chain::Mainnet].
     pub fn mainnet(timeout: Duration) -> Self {
-        Self::with_base_url(
-            Url::parse("https://alpha-mainnet.starknet.io/").unwrap(),
+        Self::with_urls(
+            Url::parse("https://alpha-mainnet.starknet.io/gateway").unwrap(),
+            Url::parse("https://feeder.alpha-mainnet.starknet.io/feeder_gateway").unwrap(),
             timeout,
         )
         .unwrap()
@@ -244,8 +238,9 @@ impl Client {
 
     /// Creates a [Client] for [pathfinder_common::Chain::SepoliaTestnet].
     pub fn sepolia_testnet(timeout: Duration) -> Self {
-        Self::with_base_url(
-            Url::parse("https://alpha-sepolia.starknet.io/").unwrap(),
+        Self::with_urls(
+            Url::parse("https://alpha-sepolia.starknet.io/gateway").unwrap(),
+            Url::parse("https://feeder.alpha-sepolia.starknet.io/feeder_gateway").unwrap(),
             timeout,
         )
         .unwrap()
@@ -253,18 +248,19 @@ impl Client {
 
     /// Creates a [Client] for [pathfinder_common::Chain::SepoliaIntegration].
     pub fn sepolia_integration(timeout: Duration) -> Self {
-        Self::with_base_url(
-            Url::parse("https://integration-sepolia.starknet.io/").unwrap(),
+        Self::with_urls(
+            Url::parse("https://integration-sepolia.starknet.io/gateway").unwrap(),
+            Url::parse("https://feeder.integration-sepolia.starknet.io/feeder_gateway").unwrap(),
             timeout,
         )
         .unwrap()
     }
 
     /// Creates a [Client] with a shared feeder gateway and gateway base url.
-    pub fn with_base_url(base: Url, timeout: Duration) -> anyhow::Result<Self> {
+    pub fn for_test(base: Url) -> anyhow::Result<Self> {
         let gateway = base.join("gateway")?;
         let feeder_gateway = base.join("feeder_gateway")?;
-        Self::with_urls(gateway, feeder_gateway, timeout)
+        Self::with_urls(gateway, feeder_gateway, Duration::from_secs(5))
     }
 
     /// Create a Sequencer client for the given [Url]s.
@@ -274,7 +270,7 @@ impl Client {
         Ok(Self {
             inner: reqwest::Client::builder()
                 .timeout(timeout)
-                .user_agent(pathfinder_common::consts::USER_AGENT)
+                .user_agent(pathfinder_version::USER_AGENT)
                 .build()?,
             gateway,
             feeder_gateway,
@@ -562,7 +558,6 @@ mod tests {
     async fn client_user_agent() {
         use std::convert::Infallible;
 
-        use pathfinder_common::consts::VERGEN_GIT_DESCRIBE;
         use warp::Filter;
 
         let filter = warp::header::optional("user-agent").and_then(
@@ -571,7 +566,7 @@ mod tests {
                 let (name, version) = user_agent.split_once('/').unwrap();
 
                 assert_eq!(name, "starknet-pathfinder");
-                assert_eq!(version, VERGEN_GIT_DESCRIBE);
+                assert_eq!(version, pathfinder_version::VERSION);
 
                 Ok::<_, Infallible>(warp::reply::json(
                     &serde_json::json!({"block_hash": "0x0", "block_number": 0}),
@@ -588,7 +583,7 @@ mod tests {
 
         let url = format!("http://{addr}");
         let url = Url::parse(&url).unwrap();
-        let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+        let client = Client::for_test(url).unwrap();
 
         let _ = client.block_header(BlockId::Latest).await;
         shutdown_tx.send(()).unwrap();
@@ -613,7 +608,7 @@ mod tests {
                     200,
                 ),
             )]);
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+            let client = Client::for_test(url).unwrap();
             assert_eq!(
                 client
                     .transaction_status(INVALID_TX_HASH)
@@ -630,11 +625,19 @@ mod tests {
         let (_jh, url) = setup([(
             "/feeder_gateway/get_contract_addresses",
             (
-                r#"{"Starknet":"0xde29d060d45901fb19ed6c6e959eb22d8626708e","GpsStatementVerifier":"0xab43ba48c9edf4c2c4bb01237348d1d7b28ef168"}"#,
+                r#"{
+			"FriStatementContract": "0x55d049b4C82807808E76e61a08C6764bbf2ffB55",
+			"GpsStatementVerifier": "0x2046B966994Adcb88D83f467a41b75d64C2a619F",
+			"MemoryPageFactRegistry": "0x5628E75245Cc69eCA0994F0449F4dDA9FbB5Ec6a",
+			"MerkleStatementContract": "0xd414f8f535D4a96cB00fFC8E85160b353cb7809c",
+			"Starknet": "0x4737c0c1B4D5b1A687B42610DdabEE781152359c",
+			"strk_l2_token_address": "0x4718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+			"eth_l2_token_address": "0x49d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7"
+		}"#,
                 200,
             ),
         )]);
-        let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+        let client = Client::for_test(url).unwrap();
         client.eth_contract_addresses().await.unwrap();
     }
 
@@ -698,7 +701,7 @@ mod tests {
                     "/gateway/add_transaction",
                     response_from(KnownStarknetErrorCode::DeprecatedTransaction),
                 )]);
-                let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+                let client = Client::for_test(url).unwrap();
                 let (_, fee, sig, nonce, addr, call) = inputs();
                 let invoke = InvokeFunction::V0(InvokeFunctionV0V1 {
                     max_fee: fee,
@@ -727,7 +730,7 @@ mod tests {
                         200,
                     ),
                 )]);
-                let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+                let client = Client::for_test(url).unwrap();
                 // test with values dumped from `starknet invoke` for a test contract
                 let (_, fee, sig, nonce, addr, call) = inputs();
                 let invoke = InvokeFunction::V1(InvokeFunctionV0V1 {
@@ -756,7 +759,7 @@ mod tests {
                     "/gateway/add_transaction",
                     response_from(KnownStarknetErrorCode::DeprecatedTransaction),
                 )]);
-                let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+                let client = Client::for_test(url).unwrap();
 
                 let declare = Declare::V0(DeclareV0V1V2 {
                     version: TransactionVersion::ZERO,
@@ -790,7 +793,7 @@ mod tests {
                         200,
                     ),
                 )]);
-                let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+                let client = Client::for_test(url).unwrap();
 
                 let declare = Declare::V1(DeclareV0V1V2 {
                     version: TransactionVersion::ONE,
@@ -867,7 +870,7 @@ mod tests {
                         200,
                     ),
                 )]);
-                let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+                let client = Client::for_test(url).unwrap();
 
                 let declare = Declare::V2(DeclareV0V1V2 {
                     version: TransactionVersion::TWO,
@@ -966,8 +969,7 @@ mod tests {
                 let (_jh, addr) = test_server();
                 let mut url = reqwest::Url::parse("http://localhost/").unwrap();
                 url.set_port(Some(addr.port())).unwrap();
-                let client =
-                    Client::with_base_url(url, gateway_test_utils::GATEWAY_TIMEOUT).unwrap();
+                let client = Client::for_test(url).unwrap();
 
                 let declare = Declare::V0(DeclareV0V1V2 {
                     version: TransactionVersion::ZERO,
@@ -996,7 +998,7 @@ mod tests {
                 let (_jh, addr) = test_server();
                 let mut url = reqwest::Url::parse("http://localhost/").unwrap();
                 url.set_port(Some(addr.port())).unwrap();
-                let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+                let client = Client::for_test(url).unwrap();
 
                 let declare = Declare::V0(DeclareV0V1V2 {
                     version: TransactionVersion::ZERO,
@@ -1039,7 +1041,7 @@ mod tests {
                 "/feeder_gateway/get_block?blockNumber=9703&headerOnly=true",
                 (REPLY.to_owned(), 200),
             )]);
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+            let client = Client::for_test(url).unwrap();
 
             client
                 .block_header(BlockId::Number(BlockNumber::new_or_panic(9703)))
@@ -1055,7 +1057,7 @@ mod tests {
                  headerOnly=true",
                 (REPLY.to_owned(), 200),
             )]);
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+            let client = Client::for_test(url).unwrap();
 
             client
                 .block_header(
@@ -1075,7 +1077,7 @@ mod tests {
                 format!("/feeder_gateway/get_block?blockNumber={BLOCK_NUMBER}&headerOnly=true",),
                 response_from(KnownStarknetErrorCode::BlockNotFound),
             )]);
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+            let client = Client::for_test(url).unwrap();
             let error = client
                 .block_header(BlockNumber::new_or_panic(BLOCK_NUMBER).into())
                 .await
@@ -1099,7 +1101,7 @@ mod tests {
                     200,
                 ),
             )]);
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+            let client = Client::for_test(url).unwrap();
 
             client.pending_block().await.unwrap();
         }
@@ -1110,7 +1112,7 @@ mod tests {
                 "/feeder_gateway/get_state_update?blockNumber=pending&includeBlock=true",
                 response_from(KnownStarknetErrorCode::BlockNotFound),
             )]);
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+            let client = Client::for_test(url).unwrap();
             let error = client.pending_block().await.unwrap_err();
             assert_matches!(
                 error,
@@ -1131,7 +1133,7 @@ mod tests {
                     200,
                 ),
             )]);
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+            let client = Client::for_test(url).unwrap();
 
             client
                 .state_update_with_block(BlockNumber::new_or_panic(9703))
@@ -1148,7 +1150,7 @@ mod tests {
                 ),
                 response_from(KnownStarknetErrorCode::BlockNotFound),
             )]);
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+            let client = Client::for_test(url).unwrap();
             let error = client
                 .state_update_with_block(BlockNumber::new_or_panic(BLOCK_NUMBER))
                 .await
@@ -1172,7 +1174,7 @@ mod tests {
                     200,
                 ),
             )]);
-            let client = Client::with_base_url(url, GATEWAY_TIMEOUT).unwrap();
+            let client = Client::for_test(url).unwrap();
 
             client
                 .signature(BlockId::Number(BlockNumber::new_or_panic(350000)))

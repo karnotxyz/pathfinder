@@ -99,11 +99,11 @@ impl Transaction<'_> {
         transactions: &[(StarknetTransaction, Receipt)],
         events: Option<&[Vec<Event>]>,
     ) -> anyhow::Result<()> {
-        if transactions.is_empty() && events.map_or(true, |x| x.is_empty()) {
-            // Advance the running event bloom filter even if there's nothing to add since
-            // it requires that no blocks are skipped.
-            #[cfg(feature = "aggregate_bloom")]
-            self.upsert_block_events_aggregate(block_number, std::iter::empty())?;
+        if let Some(events) = events {
+            self.upsert_block_event_filters(block_number, events.iter().flatten())
+                .context("Inserting events into Bloom filter")?;
+        }
+        if transactions.is_empty() && events.is_none_or(|evts| evts.is_empty()) {
             return Ok(());
         }
 
@@ -147,20 +147,19 @@ impl Transaction<'_> {
             compression::compress_transactions(&transactions_with_receipts)
                 .context("Compressing transaction")?;
 
-        let encoded_events = match events {
-            Some(events) => {
+        let encoded_events = events
+            .map(|evts| {
                 let events = dto::EventsForBlock::V0 {
-                    events: events
+                    events: evts
                         .iter()
-                        .map(|events| events.iter().cloned().map(Into::into).collect())
+                        .map(|evts| evts.iter().cloned().map(Into::into).collect())
                         .collect(),
                 };
                 let events = bincode::serde::encode_to_vec(events, bincode::config::standard())
                     .context("Serializing events")?;
-                Some(compression::compress_events(&events).context("Compressing events")?)
-            }
-            None => None,
-        };
+                compression::compress_events(&events).context("Compressing events")
+            })
+            .transpose()?;
 
         insert_transaction_stmt
             .execute(named_params![
@@ -169,19 +168,6 @@ impl Transaction<'_> {
                 ":events": &encoded_events,
             ])
             .context("Inserting transaction data")?;
-
-        #[cfg(feature = "aggregate_bloom")]
-        {
-            let events = events.unwrap_or_default().iter().flatten();
-            self.upsert_block_events_aggregate(block_number, events)
-                .context("Inserting events into Bloom filter aggregate")?;
-        }
-
-        if let Some(events) = events {
-            let events = events.iter().flatten();
-            self.upsert_block_events(block_number, events)
-                .context("Inserting events into Bloom filter")?;
-        }
 
         Ok(())
     }
@@ -221,13 +207,8 @@ impl Transaction<'_> {
         ])
         .context("Updating events")?;
 
-        #[cfg(feature = "aggregate_bloom")]
-        {
-            let events = events.iter().flatten();
-            self.upsert_block_events_aggregate(block_number, events)
-                .context("Inserting events into Bloom filter aggregate")?;
-        }
-        self.upsert_block_events(block_number, events.iter().flatten())
+        let events = events.iter().flatten();
+        self.upsert_block_event_filters(block_number, events)
             .context("Inserting events into Bloom filter")?;
 
         Ok(())
@@ -383,6 +364,35 @@ impl Transaction<'_> {
             )
             .optional()
             .map_err(|e| e.into())
+    }
+
+    pub fn delete_transactions_before(&self, block_number: BlockNumber) -> anyhow::Result<()> {
+        let mut stmt = self.inner().prepare_cached(
+            r"
+            DELETE FROM transactions
+            WHERE block_number < ?
+            ",
+        )?;
+        stmt.execute(params![&block_number])
+            .context("Deleting old transactions")?;
+
+        Ok(())
+    }
+
+    pub fn delete_transaction_hashes_before(
+        &self,
+        block_number: BlockNumber,
+    ) -> anyhow::Result<()> {
+        let mut stmt = self.inner().prepare_cached(
+            r"
+            DELETE FROM transaction_hashes
+            WHERE block_number < ?
+            ",
+        )?;
+        stmt.execute(params![&block_number])
+            .context("Deleting old transaction hashes")?;
+
+        Ok(())
     }
 
     fn query_transactions_by_block(
@@ -1307,11 +1317,7 @@ pub(crate) mod dto {
             Self {
                 actual_fee: value.actual_fee,
                 execution_resources: value.execution_resources.map(Into::into),
-                l2_to_l1_messages: value
-                    .l2_to_l1_messages
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
+                l2_to_l1_messages: value.l2_to_l1_messages.into_iter().collect(),
                 transaction_hash: value.transaction_hash,
                 transaction_index: value.transaction_index,
                 execution_status: value.execution_status,
@@ -3326,6 +3332,39 @@ mod tests {
         let invalid = tx
             .transaction_block_hash(transaction_hash_bytes!(b"invalid hash"))
             .unwrap();
+        assert_eq!(invalid, None);
+    }
+
+    #[test]
+    fn delete_transactions_before() {
+        let (mut db, header, body) = setup();
+        let tx = db.transaction().unwrap();
+
+        let target = body.first().unwrap().0.hash;
+        let result = tx.transaction(target).unwrap().unwrap();
+        assert_eq!(result, body.first().unwrap().0);
+
+        // Add 1 because transactions belong to `header`.
+        tx.delete_transactions_before(header.number + 1).unwrap();
+
+        let invalid = tx.transaction(target).unwrap();
+        assert_eq!(invalid, None);
+    }
+
+    #[test]
+    fn delete_transaction_hashes_before() {
+        let (mut db, header, body) = setup();
+        let tx = db.transaction().unwrap();
+
+        let target = body.first().unwrap().0.hash;
+        let result = tx.transaction(target).unwrap().unwrap();
+        assert_eq!(result, body.first().unwrap().0);
+
+        // Add 1 because transactions belong to `header`.
+        tx.delete_transaction_hashes_before(header.number + 1)
+            .unwrap();
+
+        let invalid = tx.transaction(target).unwrap();
         assert_eq!(invalid, None);
     }
 }

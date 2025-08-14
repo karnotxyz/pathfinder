@@ -21,33 +21,7 @@
 //! }
 //! ```
 
-use pathfinder_common::{
-    AccountDeploymentDataElem,
-    BlockHash,
-    CallParam,
-    CallResultValue,
-    CasmHash,
-    ChainId,
-    ClassHash,
-    ConstructorParam,
-    ContractAddress,
-    ContractAddressSalt,
-    ContractNonce,
-    EntryPoint,
-    EventData,
-    EventKey,
-    L1ToL2MessagePayloadElem,
-    L2ToL1MessagePayloadElem,
-    PaymasterDataElem,
-    SequencerAddress,
-    SierraHash,
-    StateCommitment,
-    StorageAddress,
-    StorageValue,
-    TransactionHash,
-    TransactionNonce,
-    TransactionSignatureElem,
-};
+use pathfinder_common::prelude::*;
 use pathfinder_crypto::Felt;
 
 /// An RPC specific wrapper around [Felt] which implements
@@ -81,7 +55,7 @@ impl From<RpcFelt> for Felt {
 /// This can be easily accomplished by marking a field with `#[serde_as(as =
 /// "RpcFelt251")]`.
 #[derive(serde::Serialize)]
-pub struct RpcFelt251(RpcFelt);
+pub struct RpcFelt251(pub RpcFelt);
 
 mod serialization {
     //! Blanket [serde::Serialize] and [serde_with::SerializeAs] implementations

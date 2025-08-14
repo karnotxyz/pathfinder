@@ -1,50 +1,11 @@
 use anyhow::Result;
-use pathfinder_common::{
-    BlockCommitmentSignatureElem,
-    BlockHash,
-    BlockNumber,
-    BlockTimestamp,
-    ByteCodeOffset,
-    CallParam,
-    CallResultValue,
-    CasmHash,
-    ClassCommitment,
-    ClassCommitmentLeafHash,
-    ClassHash,
-    ConstructorParam,
-    ContractAddress,
-    ContractAddressSalt,
-    ContractNonce,
-    ContractRoot,
-    ContractStateHash,
-    EntryPoint,
-    EventCommitment,
-    EventData,
-    EventKey,
-    Fee,
-    GasPrice,
-    L1BlockNumber,
-    L1DataAvailabilityMode,
-    L1ToL2MessageNonce,
-    L1ToL2MessagePayloadElem,
-    L2ToL1MessagePayloadElem,
-    ReceiptCommitment,
-    SequencerAddress,
-    SierraHash,
-    StarknetVersion,
-    StateCommitment,
-    StateDiffCommitment,
-    StorageAddress,
-    StorageCommitment,
-    StorageValue,
-    TransactionCommitment,
-    TransactionHash,
-    TransactionNonce,
-    TransactionSignatureElem,
-};
+use pathfinder_common::prelude::*;
+use pathfinder_common::{BlockCommitmentSignatureElem, L1BlockNumber};
 use pathfinder_crypto::Felt;
 use rusqlite::types::{FromSqlError, ToSqlOutput};
 use rusqlite::RowIndex;
+
+use crate::TrieStorageIndex;
 
 pub trait ToSql {
     fn to_sql(&self) -> ToSqlOutput<'_>;
@@ -67,6 +28,13 @@ impl<Inner: ToSql> ToSql for Option<Inner> {
             Some(value) => value.to_sql(),
             None => ToSqlOutput::Owned(Value::Null),
         }
+    }
+}
+
+impl ToSql for TrieStorageIndex {
+    fn to_sql(&self) -> ToSqlOutput<'_> {
+        use rusqlite::types::Value;
+        ToSqlOutput::Owned(Value::Integer(self.0 as i64))
     }
 }
 
@@ -197,11 +165,11 @@ pub trait RowExt {
         Ok(self.get_optional_felt(index)?.map(CasmHash))
     }
 
-    fn get_optional_storage_commitment<Index: RowIndex>(
+    fn get_optional_state_commitment<Index: RowIndex>(
         &self,
         index: Index,
-    ) -> rusqlite::Result<Option<StorageCommitment>> {
-        Ok(self.get_optional_felt(index)?.map(StorageCommitment))
+    ) -> rusqlite::Result<Option<StateCommitment>> {
+        Ok(self.get_optional_felt(index)?.map(StateCommitment))
     }
 
     fn get_optional_class_commitment<Index: RowIndex>(
@@ -269,16 +237,6 @@ pub trait RowExt {
             .unwrap_or_default())
     }
 
-    fn get_class_commitment<Index: RowIndex>(
-        &self,
-        index: Index,
-    ) -> rusqlite::Result<ClassCommitment> {
-        Ok(self
-            .get_optional_felt(index)?
-            .map(ClassCommitment)
-            .unwrap_or_default())
-    }
-
     fn get_contract_address<Index: RowIndex>(
         &self,
         index: Index,
@@ -326,14 +284,6 @@ pub trait RowExt {
         Ok(self.get_optional_felt(index)?.map(ClassHash))
     }
 
-    fn get_reorg_counter<Index: RowIndex>(
-        &self,
-        index: Index,
-    ) -> rusqlite::Result<crate::ReorgCounter> {
-        let num = self.get_i64(index)?;
-        Ok(crate::ReorgCounter::new(num))
-    }
-
     fn get_l1_da_mode<Index: RowIndex>(
         &self,
         index: Index,
@@ -357,7 +307,6 @@ pub trait RowExt {
     row_felt_wrapper!(get_class_hash, ClassHash);
     row_felt_wrapper!(get_state_commitment, StateCommitment);
     row_felt_wrapper!(get_state_diff_commitment, StateDiffCommitment);
-    row_felt_wrapper!(get_storage_commitment, StorageCommitment);
     row_felt_wrapper!(get_sequencer_address, SequencerAddress);
     row_felt_wrapper!(get_contract_root, ContractRoot);
     row_felt_wrapper!(get_contract_nonce, ContractNonce);
