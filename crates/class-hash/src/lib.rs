@@ -150,9 +150,7 @@ pub mod from_parts {
 
     use anyhow::Result;
     use pathfinder_common::class_definition::{
-        EntryPointType,
-        SelectorAndOffset,
-        SierraEntryPoints,
+        EntryPointType, SelectorAndOffset, SierraEntryPoints,
     };
     use pathfinder_common::ClassHash;
     use pathfinder_crypto::Felt;
@@ -274,13 +272,14 @@ impl<'a> PreparedCairoContractDefinition<'a> {
 
 /// Computes the class hash for given Cairo class definition.
 ///
-/// The structure of the blob is not strictly defined, so it lives in privacy
-/// under `json` module of this module. The class hash has [official
-/// documentation][starknet-doc] and [cairo-lang
-/// has an implementation][cairo-compute] which is half-python and
-/// half-[cairo][cairo-contract].
+/// This function modifies the input `contract_definition` to ensure it is in a
+/// suitable state for calculating the class hash. It removes the `debug_info`
+/// field, checks and removes "accessible_scopes" and "flow_tracking_data"
+/// fields if they are empty or null, and applies a backwards compatibility hack
+/// for missing `compiler_version` by adding extra space to named tuple type
+/// definitions.
 ///
-/// Outline of the hashing is:
+/// # Errors
 ///
 /// 1. class definition is serialized with python's [`sort_keys=True`
 ///    option][py-sortkeys], then a truncated Keccak256 hash is calculated of
@@ -383,6 +382,28 @@ pub fn compute_cairo_class_hash(
     Ok(ClassHash(outer.finalize()))
 }
 
+fn sort_attributes_keys(attributes: &mut Vec<serde_json::Value>) -> Result<(), anyhow::Error> {
+    for attr in attributes.iter_mut() {
+        if let serde_json::Value::Object(obj) = attr {
+            // Create a new sorted map
+            let mut sorted_map = serde_json::Map::new();
+
+            // Collect all key-value pairs and sort them by key
+            let mut pairs: Vec<_> = obj.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+
+            // Insert sorted pairs into the new map
+            for (key, value) in pairs {
+                sorted_map.insert(key.clone(), value.clone());
+            }
+
+            // Replace the original object with the sorted one
+            *attr = serde_json::Value::Object(sorted_map);
+        }
+    }
+    Ok(())
+}
+
 /// Prepares a Cairo contract definition for class hash computation by applying
 /// necessary transformations.
 ///
@@ -453,6 +474,8 @@ pub fn prepare_json_contract_definition(
 
             Ok(())
         })?;
+
+    sort_attributes_keys(&mut contract_definition.program.attributes)?;
 
     fn add_extra_space_to_cairo_named_tuples(value: &mut serde_json::Value) {
         match value {
@@ -694,9 +717,7 @@ pub mod json {
     use std::collections::{BTreeMap, HashMap};
 
     use pathfinder_common::class_definition::{
-        EntryPointType,
-        SelectorAndFunctionIndex,
-        SelectorAndOffset,
+        EntryPointType, SelectorAndFunctionIndex, SelectorAndOffset,
     };
 
     #[allow(clippy::large_enum_variant)]

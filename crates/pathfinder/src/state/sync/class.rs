@@ -42,7 +42,10 @@ pub async fn download_class<SequencerClient: GatewayApi>(
                 tracing::warn!(expected=%class_hash, computed=%hash, "Cairo 0 class hash mismatch");
             }
 
-            Ok(DownloadedClass::Cairo { definition, hash })
+            Ok(DownloadedClass::Cairo {
+                definition,
+                hash: class_hash,
+            })
         }
         ComputedClassHash::Sierra(hash) => {
             anyhow::ensure!(
