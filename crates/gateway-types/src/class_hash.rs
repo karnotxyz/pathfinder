@@ -140,7 +140,6 @@ pub fn compute_cairo_hinted_class_hash(
 }
 
 fn sort_attributes_keys(attributes: &mut Vec<serde_json::Value>) -> Result<(), anyhow::Error> {
-    println!("sorting attributes keys {:?}", attributes);
     for attr in attributes.iter_mut() {
         if let serde_json::Value::Object(obj) = attr {
             // Create a new sorted map
