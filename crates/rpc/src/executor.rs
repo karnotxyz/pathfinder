@@ -366,7 +366,7 @@ pub fn compose_executor_transaction(
         class_info,
         paid_fee_on_l1,
         deployed_address,
-        pathfinder_executor::AccountTransactionExecutionFlags::default(),
+        pathfinder_executor::AccountTransactionExecutionFlags{ only_query: false, charge_fee: false, validate: true, strict_nonce_check: true },
     )?;
 
     Ok(tx)
