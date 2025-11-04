@@ -111,6 +111,7 @@ pub async fn estimate_message_fee(
 
         let state = ExecutionState::simulation(
             context.chain_id,
+            context.is_l3,
             header,
             pending,
             L1BlobDataAvailability::Enabled,

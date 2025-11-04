@@ -272,6 +272,7 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         execution_storage,
         sync_state.clone(),
         pathfinder_context.network_id,
+        pathfinder_context.is_l3,
         pathfinder_context.contract_addresses,
         pathfinder_context.gateway.clone(),
         rx_pending.clone(),
@@ -954,6 +955,7 @@ If you are trying to connect to a custom Starknet on another Ethereum network, p
 struct PathfinderContext {
     network: Chain,
     network_id: ChainId,
+    is_l3: bool,
     gateway: starknet_gateway_client::Client,
     gateway_dns_refresh_interval: std::time::Duration,
     database: PathBuf,
@@ -987,6 +989,7 @@ mod pathfinder_context {
                 NetworkConfig::Mainnet => Self {
                     network: Chain::Mainnet,
                     network_id: ChainId::MAINNET,
+                    is_l3: false,
                     gateway: GatewayClient::mainnet(gateway_timeout).with_api_key(api_key),
                     gateway_dns_refresh_interval,
                     database: data_directory.join("mainnet.sqlite"),
@@ -995,6 +998,7 @@ mod pathfinder_context {
                 NetworkConfig::SepoliaTestnet => Self {
                     network: Chain::SepoliaTestnet,
                     network_id: ChainId::SEPOLIA_TESTNET,
+                    is_l3: false,
                     gateway: GatewayClient::sepolia_testnet(gateway_timeout).with_api_key(api_key),
                     gateway_dns_refresh_interval,
                     database: data_directory.join("testnet-sepolia.sqlite"),
@@ -1003,6 +1007,7 @@ mod pathfinder_context {
                 NetworkConfig::SepoliaIntegration => Self {
                     network: Chain::SepoliaIntegration,
                     network_id: ChainId::SEPOLIA_INTEGRATION,
+                    is_l3: false,
                     gateway: GatewayClient::sepolia_integration(gateway_timeout)
                         .with_api_key(api_key),
                     gateway_dns_refresh_interval,
@@ -1016,10 +1021,12 @@ mod pathfinder_context {
                     feeder_gateway,
                     chain_id,
                     compress_gateway_requests,
+                    is_l3,
                 } => Self::configure_custom(
                     *gateway,
                     *feeder_gateway,
                     chain_id,
+                    is_l3,
                     data_directory,
                     api_key,
                     gateway_timeout,
@@ -1042,6 +1049,7 @@ mod pathfinder_context {
             gateway: Url,
             feeder: Url,
             chain_id: String,
+            is_l3: bool,
             data_directory: &Path,
             api_key: Option<String>,
             gateway_timeout: Duration,
@@ -1063,6 +1071,8 @@ mod pathfinder_context {
                 .eth_contract_addresses()
                 .await
                 .context("Downloading starknet L1 address from gateway for proxy check")?;
+
+
             let l1_core_address = reply_contract_addresses.starknet.0;
             let contract_addresses = EthContractAddresses::new_custom(
                 l1_core_address,
@@ -1086,6 +1096,7 @@ mod pathfinder_context {
             let context = Self {
                 network,
                 network_id,
+                is_l3,
                 gateway,
                 gateway_dns_refresh_interval,
                 database: data_directory.join("custom.sqlite"),
@@ -1133,9 +1144,7 @@ async fn verify_database(
 
     if let Some(database_genesis) = db_genesis {
         use pathfinder_common::consts::{
-            MAINNET_GENESIS_HASH,
-            SEPOLIA_INTEGRATION_GENESIS_HASH,
-            SEPOLIA_TESTNET_GENESIS_HASH,
+            MAINNET_GENESIS_HASH, SEPOLIA_INTEGRATION_GENESIS_HASH, SEPOLIA_TESTNET_GENESIS_HASH,
         };
 
         let db_network = match database_genesis {
