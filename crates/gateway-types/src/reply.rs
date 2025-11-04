@@ -1,7 +1,7 @@
 //! Structures used for deserializing replies from Starkware's sequencer REST
 //! API.
-use pathfinder_common::prelude::*;
-use pathfinder_serde::{EthereumAddressAsHexStr, GasPriceAsHexStr};
+use pathfinder_common::{SettlementLayerAddress, prelude::*};
+use pathfinder_serde::{GasPriceAsHexStr, SettlementLayerAddressAsHexStr};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 pub use transaction::DataAvailabilityMode;
@@ -2220,8 +2220,8 @@ pub mod state_update {
 #[derive(Clone, Debug, Deserialize)]
 pub struct EthContractAddresses {
     #[serde(rename = "Starknet")]
-    #[serde_as(as = "EthereumAddressAsHexStr")]
-    pub starknet: EthereumAddress,
+    #[serde_as(as = "SettlementLayerAddressAsHexStr")]
+    pub starknet: SettlementLayerAddress,
 
     pub strk_l2_token_address: Option<ContractAddress>,
 

@@ -749,7 +749,7 @@ mod pathfinder_context {
     use std::time::Duration;
 
     use anyhow::Context;
-    use pathfinder_common::{Chain, ChainId};
+    use pathfinder_common::{Chain, ChainId, SettlementLayerAddress};
     use pathfinder_ethereum::core_addr;
     use pathfinder_rpc::context::EthContractAddresses;
     use reqwest::Url;
@@ -842,8 +842,26 @@ mod pathfinder_context {
                 .await
                 .context("Downloading starknet L1 address from gateway for proxy check")?;
 
+            let l1_core_address = if is_l3 {
+                // For L3 networks, assert we got Starknet variant (ContractAddress)
+                match reply_contract_addresses.starknet {
+                    SettlementLayerAddress::Starknet(_contract_address) => {
+                        primitive_types::H160::zero()
+                    }
+                    SettlementLayerAddress::Ethereum(_) => {
+                        anyhow::bail!("L3 networks should have ContractAddress (Starknet variant) in starknet field, but got EthereumAddress (Ethereum variant)");
+                    }
+                }
+            } else {
+                // For L2 networks, assert we got Ethereum variant (EthereumAddress)
+                match reply_contract_addresses.starknet {
+                    SettlementLayerAddress::Starknet(_) => {
+                        anyhow::bail!("L2 networks should have EthereumAddress (Ethereum variant) in starknet field, but got ContractAddress (Starknet variant)");
+                    }
+                    SettlementLayerAddress::Ethereum(address) => address.0,
+                }
+            };
 
-            let l1_core_address = reply_contract_addresses.starknet.0;
             let contract_addresses = EthContractAddresses::new_custom(
                 l1_core_address,
                 reply_contract_addresses.eth_l2_token_address,

@@ -1,7 +1,7 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use pathfinder_common::{contract_address, ChainId, ConsensusInfo, ContractAddress};
+use pathfinder_common::{ChainId, ConsensusInfo, ContractAddress, EthereumAddress, SettlementLayerAddress, contract_address};
 use pathfinder_ethereum::EthereumClient;
 use pathfinder_executor::{NativeClassCache, TraceCache, VersionedConstantsMap};
 use pathfinder_storage::Storage;
