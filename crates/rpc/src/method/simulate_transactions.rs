@@ -109,6 +109,7 @@ pub async fn simulate_transactions(
 
         let state = pathfinder_executor::ExecutionState::simulation(
             context.chain_id,
+            context.is_l3,
             header,
             pending,
             pathfinder_executor::L1BlobDataAvailability::Enabled,

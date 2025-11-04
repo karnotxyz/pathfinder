@@ -32,6 +32,7 @@ type ReceiptAndEvents = (Receipt, Vec<pathfinder_common::event::Event>);
 impl BlockExecutor {
     pub fn new(
         chain_id: ChainId,
+        is_l3: bool,
         block_info: BlockInfo,
         eth_fee_address: ContractAddress,
         strk_fee_address: ContractAddress,
@@ -39,6 +40,7 @@ impl BlockExecutor {
     ) -> anyhow::Result<Self> {
         let execution_state = ExecutionState::validation(
             chain_id,
+            is_l3,
             block_info,
             None,
             Default::default(),
@@ -67,6 +69,7 @@ impl BlockExecutor {
     /// the final state of a previous executor
     pub fn new_with_initial_state(
         chain_id: ChainId,
+        is_l3: bool,
         block_info: BlockInfo,
         eth_fee_address: ContractAddress,
         strk_fee_address: ContractAddress,
@@ -75,6 +78,7 @@ impl BlockExecutor {
     ) -> anyhow::Result<Self> {
         let execution_state = ExecutionState::validation(
             chain_id,
+            is_l3,
             block_info,
             None,
             Default::default(),
@@ -505,6 +509,7 @@ mod tests {
         // Execute them all in a single executor
         let mut single_executor = BlockExecutor::new(
             chain_id,
+            false,
             block_info,
             ETH_FEE_TOKEN_ADDRESS,
             STRK_FEE_TOKEN_ADDRESS,
@@ -527,6 +532,7 @@ mod tests {
         // Execute batch 1
         let mut executor1 = BlockExecutor::new(
             chain_id,
+            false,
             block_info,
             ETH_FEE_TOKEN_ADDRESS,
             STRK_FEE_TOKEN_ADDRESS,
@@ -542,6 +548,7 @@ mod tests {
         // Execute batch 2 with state from batch 1
         let mut executor2 = BlockExecutor::new_with_initial_state(
             chain_id,
+            false,
             block_info,
             ETH_FEE_TOKEN_ADDRESS,
             STRK_FEE_TOKEN_ADDRESS,
@@ -558,6 +565,7 @@ mod tests {
         // Execute batch 3 with state from batch 2
         let mut executor3 = BlockExecutor::new_with_initial_state(
             chain_id,
+            false,
             block_info,
             ETH_FEE_TOKEN_ADDRESS,
             STRK_FEE_TOKEN_ADDRESS,
@@ -616,6 +624,7 @@ mod tests {
         // Single executor execution
         let mut single_executor = BlockExecutor::new(
             chain_id,
+            false,
             block_info,
             ETH_FEE_TOKEN_ADDRESS,
             STRK_FEE_TOKEN_ADDRESS,
@@ -643,6 +652,7 @@ mod tests {
 
         let mut current_executor = BlockExecutor::new(
             chain_id,
+            false,
             block_info,
             ETH_FEE_TOKEN_ADDRESS,
             STRK_FEE_TOKEN_ADDRESS,
@@ -655,6 +665,7 @@ mod tests {
         for batch in batches.into_iter() {
             current_executor = BlockExecutor::new(
                 chain_id,
+                false,
                 block_info,
                 ETH_FEE_TOKEN_ADDRESS,
                 STRK_FEE_TOKEN_ADDRESS,

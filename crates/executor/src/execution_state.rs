@@ -166,6 +166,7 @@ pub struct ExecutionState {
     eth_fee_address: ContractAddress,
     strk_fee_address: ContractAddress,
     native_class_cache: Option<NativeClassCache>,
+    is_l3: bool,
 }
 
 pub fn create_executor<S: StorageAdapter + Clone>(
@@ -320,7 +321,7 @@ impl ExecutionState {
                 strk_fee_token_address,
                 eth_fee_token_address,
             },
-            is_l3: false,
+            is_l3: self.is_l3,
         })
     }
 
@@ -401,6 +402,7 @@ impl ExecutionState {
     #[allow(clippy::too_many_arguments)]
     pub fn trace(
         chain_id: ChainId,
+        is_l3: bool,
         header: BlockHeader,
         pending_state: Option<Arc<StateUpdate>>,
         versioned_constants_map: VersionedConstantsMap,
@@ -418,12 +420,14 @@ impl ExecutionState {
             eth_fee_address,
             strk_fee_address,
             native_class_cache,
+            is_l3,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn simulation(
         chain_id: ChainId,
+        is_l3: bool,
         header: BlockHeader,
         pending_state: Option<Arc<StateUpdate>>,
         l1_blob_data_availability: L1BlobDataAvailability,
@@ -442,12 +446,14 @@ impl ExecutionState {
             eth_fee_address,
             strk_fee_address,
             native_class_cache,
+            is_l3,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn validation(
         chain_id: ChainId,
+        is_l3: bool,
         block_info: BlockInfo,
         pending_state: Option<Arc<StateUpdate>>,
         versioned_constants_map: VersionedConstantsMap,
@@ -465,6 +471,7 @@ impl ExecutionState {
             eth_fee_address,
             strk_fee_address,
             native_class_cache,
+            is_l3,
         }
     }
 }

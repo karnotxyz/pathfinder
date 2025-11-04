@@ -46,11 +46,22 @@ use crate::state::block_hash::{
     calculate_transaction_commitment,
 };
 
+/// Determines is_l3 from ChainId.
+/// For known networks (Mainnet, Sepolia, SepoliaIntegration), is_l3 is always false.
+/// For custom networks, this should be passed explicitly from network config.
+fn is_l3_from_chain_id(chain_id: ChainId) -> bool {
+    match chain_id {
+        ChainId::MAINNET | ChainId::SEPOLIA_TESTNET | ChainId::SEPOLIA_INTEGRATION => false,
+        _ => false, // Default to false for unknown/custom networks, should be passed explicitly
+    }
+}
+
 pub fn new(
     chain_id: ChainId,
     proposal_init: ProposalInit,
 ) -> anyhow::Result<ValidatorBlockInfoStage> {
-    ValidatorBlockInfoStage::new(chain_id, proposal_init)
+    let is_l3 = is_l3_from_chain_id(chain_id);
+    ValidatorBlockInfoStage::new(chain_id, is_l3, proposal_init)
 }
 
 /// Validates the basic block metadata and proposal information before any
@@ -58,17 +69,20 @@ pub fn new(
 #[derive(Debug)]
 pub struct ValidatorBlockInfoStage {
     chain_id: ChainId,
+    is_l3: bool,
     proposal_height: BlockNumber,
 }
 
 impl ValidatorBlockInfoStage {
     pub fn new(
         chain_id: ChainId,
+        is_l3: bool,
         proposal_init: ProposalInit,
     ) -> anyhow::Result<ValidatorBlockInfoStage> {
         // TODO(validator) how can we validate the proposal init?
         Ok(ValidatorBlockInfoStage {
             chain_id,
+            is_l3,
             proposal_height: BlockNumber::new(proposal_init.block_number)
                 .context("ProposalInit height exceeds i64::MAX")?,
         })
@@ -89,6 +103,7 @@ impl ValidatorBlockInfoStage {
 
         let Self {
             chain_id,
+            is_l3,
             proposal_height,
         } = self;
 
@@ -135,9 +150,10 @@ impl ValidatorBlockInfoStage {
 
         Ok(ValidatorTransactionBatchStage {
             chain_id,
+            is_l3,
             block_info,
             expected_block_header: None,
-            block_executor: LazyBlockExecutor::new(chain_id, block_info, storage.clone()),
+            block_executor: LazyBlockExecutor::new(chain_id, is_l3, block_info, storage.clone()),
             transactions: Vec::new(),
             receipts: Vec::new(),
             events: Vec::new(),
@@ -152,6 +168,7 @@ impl ValidatorBlockInfoStage {
 /// Executes transactions and manages the block execution state.
 pub struct ValidatorTransactionBatchStage {
     chain_id: ChainId,
+    is_l3: bool,
     block_info: pathfinder_executor::types::BlockInfo,
     expected_block_header: Option<BlockHeader>,
     block_executor: LazyBlockExecutor,
@@ -173,6 +190,7 @@ enum LazyBlockExecutor {
     /// on first use.
     Uninitialized {
         chain_id: ChainId,
+        is_l3: bool,
         block_info: Box<pathfinder_executor::types::BlockInfo>,
         storage: Storage,
     },
@@ -189,11 +207,13 @@ enum LazyBlockExecutor {
 impl LazyBlockExecutor {
     fn new(
         chain_id: ChainId,
+        is_l3: bool,
         block_info: pathfinder_executor::types::BlockInfo,
         storage: Storage,
     ) -> Self {
         LazyBlockExecutor::Uninitialized {
             chain_id,
+            is_l3,
             block_info: Box::new(block_info),
             storage,
         }
@@ -206,6 +226,7 @@ impl LazyBlockExecutor {
             let this = std::mem::replace(self, Self::Initializing);
             let LazyBlockExecutor::Uninitialized {
                 chain_id,
+                is_l3,
                 block_info,
                 storage,
             } = this
@@ -216,6 +237,7 @@ impl LazyBlockExecutor {
             let db_conn = storage.connection().context("Create database connection")?;
             let be = BlockExecutor::new(
                 chain_id,
+                is_l3,
                 *block_info,
                 ETH_FEE_TOKEN_ADDRESS,
                 STRK_FEE_TOKEN_ADDRESS,
@@ -245,16 +267,24 @@ impl LazyBlockExecutor {
 
 impl ValidatorTransactionBatchStage {
     /// Create a new ValidatorTransactionBatchStage
+    ///
+    /// Note: This method is primarily used in tests. For production code, use
+    /// `ValidatorBlockInfoStage::validate_consensus_block_info` which properly
+    /// passes `is_l3` from the network config.
     pub fn new(
         chain_id: ChainId,
         block_info: pathfinder_executor::types::BlockInfo,
         storage: Storage,
     ) -> anyhow::Result<Self> {
+        // For tests and when called directly, determine is_l3 from chain_id
+        // (returns false for known networks, false for custom by default)
+        let is_l3 = is_l3_from_chain_id(chain_id);
         Ok(ValidatorTransactionBatchStage {
             chain_id,
+            is_l3,
             block_info,
             expected_block_header: None,
-            block_executor: LazyBlockExecutor::new(chain_id, block_info, storage.clone()),
+            block_executor: LazyBlockExecutor::new(chain_id, is_l3, block_info, storage.clone()),
             transactions: Vec::new(),
             receipts: Vec::new(),
             events: Vec::new(),
@@ -321,6 +351,7 @@ impl ValidatorTransactionBatchStage {
             // First batch - start from initial state
             BlockExecutor::new(
                 self.chain_id,
+                self.is_l3,
                 self.block_info,
                 ETH_FEE_TOKEN_ADDRESS,
                 STRK_FEE_TOKEN_ADDRESS,
@@ -337,6 +368,7 @@ impl ValidatorTransactionBatchStage {
             let previous_state = last_executor.get_final_state()?;
             BlockExecutor::new_with_initial_state(
                 self.chain_id,
+                self.is_l3,
                 self.block_info,
                 ETH_FEE_TOKEN_ADDRESS,
                 STRK_FEE_TOKEN_ADDRESS,

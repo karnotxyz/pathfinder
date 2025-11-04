@@ -148,6 +148,7 @@ fn execute(
 
     let execution_state = ExecutionState::trace(
         chain_id,
+        false,
         work.header.clone(),
         None,
         Default::default(),

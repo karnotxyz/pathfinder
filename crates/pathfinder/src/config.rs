@@ -562,6 +562,15 @@ Note that 'custom' requires also setting the --gateway-url and --feeder-gateway-
         required_if_eq("network", Network::Custom)
     )]
     chain_id: Option<String>,
+
+    #[arg(
+        long = "is-l3",
+        long_help = "Set if the network is an L3 network",
+        env = "PATHFINDER_IS_L3",
+        required_if_eq("network", Network::Custom)
+    )]
+    is_l3: Option<bool>,
+
     #[arg(
         long = "feeder-gateway-url",
         value_name = "URL",
@@ -881,6 +890,7 @@ pub enum NetworkConfig {
         gateway: Url,
         feeder_gateway: Url,
         chain_id: String,
+        is_l3: bool,
     },
 }
 
@@ -923,22 +933,24 @@ impl NetworkConfig {
             args.gateway,
             args.feeder_gateway,
             args.chain_id,
+            args.is_l3,
         ) {
-            (None, None, None, None) => return None,
-            (Some(Custom), Some(gateway), Some(feeder_gateway), Some(chain_id)) => {
+            (None, None, None, None, None) => return None,
+            (Some(Custom), Some(gateway), Some(feeder_gateway), Some(chain_id), Some(is_l3)) => {
                 NetworkConfig::Custom {
                     gateway,
                     feeder_gateway,
                     chain_id,
+                    is_l3,
                 }
             }
-            (Some(Custom), _, _, _) => {
+            (Some(Custom), _, _, _, _) => {
                 unreachable!("`--network custom` requirements are handled by clap derive")
             }
             // Handle non-custom variants in an inner match so that the compiler will force
             // us to handle a new network variants explicitly. Otherwise we end up with a
             // catch-all arm that would swallow new variants silently.
-            (Some(non_custom), None, None, None) => match non_custom {
+            (Some(non_custom), None, None, None, None) => match non_custom {
                 Mainnet => NetworkConfig::Mainnet,
                 SepoliaTestnet => NetworkConfig::SepoliaTestnet,
                 SepoliaIntegration => NetworkConfig::SepoliaIntegration,

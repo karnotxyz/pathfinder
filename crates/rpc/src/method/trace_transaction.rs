@@ -170,6 +170,7 @@ pub async fn trace_transaction(
             let hash = header.hash;
             let state = pathfinder_executor::ExecutionState::trace(
                 context.chain_id,
+                context.is_l3,
                 header,
                 None,
                 context.config.versioned_constants_map,
