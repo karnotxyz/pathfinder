@@ -342,6 +342,12 @@ impl<T> Dummy<T> for EthereumAddress {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SettlementLayerAddress {
+    Ethereum(EthereumAddress),
+    Starknet(ContractAddress),
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("expected slice length of 16 or less, got {0}")]
 pub struct FromSliceError(usize);
