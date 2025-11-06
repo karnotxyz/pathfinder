@@ -4,7 +4,8 @@ use pathfinder_common::class_definition::{
     SerializedSierraDefinition,
 };
 use pathfinder_common::transaction::TransactionVariant;
-use pathfinder_common::{BlockNumber, ChainId, StarknetVersion};
+use pathfinder_common::{BlockNumber, ChainId, StarknetVersion, TransactionVersion};
+use pathfinder_crypto::Felt;
 use pathfinder_executor::types::to_starknet_api_transaction;
 use pathfinder_executor::{ClassInfo, IntoStarkFelt};
 use starknet_api::contract_class::SierraVersion;
@@ -375,7 +376,10 @@ pub fn compose_executor_transaction(
 
     let transaction = to_starknet_api_transaction(transaction.variant.clone())?;
     let mut charge_fee = true;
-    if let Some(resource_bounds) = transaction.resource_bounds() {
+    if transaction.version().0 == starknet_types_core::felt::Felt::ZERO {
+        // Only used during bootstrapper v1 bootstrapping
+        charge_fee = false;
+    } else if let Some(resource_bounds) = transaction.resource_bounds() {
         match resource_bounds {
             ValidResourceBounds::AllResources(all_resources) => {
                 if all_resources.l2_gas.max_amount.0 == 0 {
