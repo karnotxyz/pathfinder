@@ -9,13 +9,11 @@ use pathfinder_executor::types::to_starknet_api_transaction;
 use pathfinder_executor::{ClassInfo, IntoStarkFelt};
 use starknet_api::contract_class::SierraVersion;
 use starknet_api::core::PatriciaKey;
-use starknet_api::transaction::fields::Fee;
+use starknet_api::transaction::fields::{Fee, ValidResourceBounds};
 
 use crate::types::class::sierra::SierraContractClass;
 use crate::types::request::{
-    BroadcastedDeployAccountTransaction,
-    BroadcastedInvokeTransaction,
-    BroadcastedTransaction,
+    BroadcastedDeployAccountTransaction, BroadcastedInvokeTransaction, BroadcastedTransaction,
 };
 
 pub enum ExecutionStateError {
@@ -376,6 +374,21 @@ pub fn compose_executor_transaction(
     tracing::trace!(%tx_hash, "Converting transaction");
 
     let transaction = to_starknet_api_transaction(transaction.variant.clone())?;
+    let mut charge_fee = true;
+    if let Some(resource_bounds) = transaction.resource_bounds() {
+        match resource_bounds {
+            ValidResourceBounds::AllResources(all_resources) => {
+                if all_resources.l2_gas.max_amount.0 == 0 {
+                    charge_fee = false;
+                }
+            }
+            ValidResourceBounds::L1Gas(l1_gas) => {
+                if l1_gas.max_amount.0 == 0 {
+                    charge_fee = false;
+                }
+            }
+        }
+    }
 
     let tx = pathfinder_executor::Transaction::from_api(
         transaction,
@@ -383,7 +396,12 @@ pub fn compose_executor_transaction(
         class_info,
         paid_fee_on_l1,
         deployed_address,
-        pathfinder_executor::AccountTransactionExecutionFlags::default(),
+        pathfinder_executor::AccountTransactionExecutionFlags {
+            only_query: false,
+            charge_fee,
+            validate: true,
+            strict_nonce_check: true,
+        },
     )?;
 
     Ok(tx)
