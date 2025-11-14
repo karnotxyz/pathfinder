@@ -567,7 +567,8 @@ Note that 'custom' requires also setting the --gateway-url and --feeder-gateway-
         long = "is-l3",
         long_help = "Set if the network is an L3 network",
         env = "PATHFINDER_IS_L3",
-        required_if_eq("network", Network::Custom)
+        required_if_eq("network", Network::Custom),
+        default_value = "false"
     )]
     is_l3: Option<bool>,
 

@@ -46,21 +46,11 @@ use crate::state::block_hash::{
     calculate_transaction_commitment,
 };
 
-/// Determines is_l3 from ChainId.
-/// For known networks (Mainnet, Sepolia, SepoliaIntegration), is_l3 is always false.
-/// For custom networks, this should be passed explicitly from network config.
-fn is_l3_from_chain_id(chain_id: ChainId) -> bool {
-    match chain_id {
-        ChainId::MAINNET | ChainId::SEPOLIA_TESTNET | ChainId::SEPOLIA_INTEGRATION => false,
-        _ => false, // Default to false for unknown/custom networks, should be passed explicitly
-    }
-}
-
 pub fn new(
     chain_id: ChainId,
     proposal_init: ProposalInit,
 ) -> anyhow::Result<ValidatorBlockInfoStage> {
-    let is_l3 = is_l3_from_chain_id(chain_id);
+    let is_l3 = false;
     ValidatorBlockInfoStage::new(chain_id, is_l3, proposal_init)
 }
 
@@ -278,7 +268,7 @@ impl ValidatorTransactionBatchStage {
     ) -> anyhow::Result<Self> {
         // For tests and when called directly, determine is_l3 from chain_id
         // (returns false for known networks, false for custom by default)
-        let is_l3 = is_l3_from_chain_id(chain_id);
+        let is_l3 = false;
         Ok(ValidatorTransactionBatchStage {
             chain_id,
             is_l3,
