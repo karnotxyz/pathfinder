@@ -1076,6 +1076,9 @@ mod pathfinder_context {
                 // For L3 networks, assert we got Starknet variant (ContractAddress)
                 match reply_contract_addresses.starknet {
                     SettlementLayerAddress::Starknet(_contract_address) => {
+                        // TODO(mehul): This is a placeholder return. L1 syncing for L3 networks would
+                        // require significant changes that are not prioritized for pathfinder.
+                        // Returning 0 address as a dummy return
                         primitive_types::H160::zero()
                     }
                     SettlementLayerAddress::Ethereum(_) => {
