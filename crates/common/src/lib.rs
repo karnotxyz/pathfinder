@@ -8,7 +8,7 @@ use std::ops::Rem;
 use std::str::FromStr;
 
 use anyhow::Context;
-use fake::Dummy;
+use fake::{Dummy, Fake, Faker};
 use pathfinder_crypto::hash::HashChain;
 use pathfinder_crypto::Felt;
 use primitive_types::H160;
@@ -362,6 +362,22 @@ pub struct EthereumAddress(pub H160);
 impl<T> Dummy<T> for EthereumAddress {
     fn dummy_with_rng<R: rand::Rng + ?Sized>(_: &T, rng: &mut R) -> Self {
         Self(H160::random_using(rng))
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SettlementLayerAddress {
+    Ethereum(EthereumAddress),
+    Starknet(ContractAddress),
+}
+
+impl<T> Dummy<T> for SettlementLayerAddress {
+    fn dummy_with_rng<R: rand::Rng + ?Sized>(_: &T, rng: &mut R) -> Self {
+        if rng.gen_bool(0.5) {
+            Self::Ethereum(EthereumAddress(H160::random_using(rng)))
+        } else {
+            Self::Starknet(Faker.fake_with_rng(rng))
+        }
     }
 }
 
