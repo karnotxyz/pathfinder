@@ -269,12 +269,12 @@ pub mod transaction_status {
 /// Types used when deserializing L2 transaction related data.
 pub mod transaction {
     use fake::{Dummy, Fake, Faker};
-    use pathfinder_common::prelude::*;
+    use pathfinder_common::{SettlementLayerAddress, prelude::*};
     use pathfinder_crypto::Felt;
     use pathfinder_serde::{
         CallParamAsDecimalStr,
         ConstructorParamAsDecimalStr,
-        EthereumAddressAsHexStr,
+        SettlementLayerAddressAsHexStr,
         L1ToL2MessagePayloadElemAsDecimalStr,
         L2ToL1MessagePayloadElemAsDecimalStr,
         ResourceAmountAsHexStr,
@@ -535,8 +535,8 @@ pub mod transaction {
     #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct L1ToL2Message {
-        #[serde_as(as = "EthereumAddressAsHexStr")]
-        pub from_address: EthereumAddress,
+        #[serde_as(as = "SettlementLayerAddressAsHexStr")]
+        pub from_address: SettlementLayerAddress,
         #[serde_as(as = "Vec<L1ToL2MessagePayloadElemAsDecimalStr>")]
         pub payload: Vec<L1ToL2MessagePayloadElem>,
         pub selector: EntryPoint,
