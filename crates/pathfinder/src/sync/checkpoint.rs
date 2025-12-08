@@ -1370,6 +1370,7 @@ mod tests {
         use starknet_gateway_test_fixtures::class_definitions::{
             CAIRO_0_10_TUPLES_INTEGRATION as CAIRO,
             CAIRO_0_11_SIERRA as SIERRA0,
+            CAIRO_1_1_0_BALANCE_CASM_JSON as CASM2,
             CAIRO_2_0_0_STACK_OVERFLOW as SIERRA2,
         };
         use starknet_gateway_types::error::SequencerError;
@@ -1391,7 +1392,7 @@ mod tests {
                 &self,
                 _: ClassHash,
             ) -> Result<bytes::Bytes, SequencerError> {
-                Ok(bytes::Bytes::from_static(b"I'm from the fgw!"))
+                Ok(bytes::Bytes::from_static(CASM2))
             }
         }
 
@@ -1436,14 +1437,13 @@ mod tests {
         /// The genesis block contains no declared classes
         async fn setup(expect_correct_class_hashes: bool) -> Setup {
             tokio::task::spawn_blocking(move || {
-                let fake_block = |n| {
+                let fake_block = |n, state_update| {
                     let mut block = Block::default();
                     block.header.header.number = BlockNumber::GENESIS + n;
                     block.header.header.hash = Faker.fake();
-                    block.state_update = Some(Default::default());
+                    block.state_update = Some(state_update);
                     block
                 };
-                let mut blocks = vec![fake_block(0), fake_block(1)];
 
                 let (cairo_hash, sierra0_hash, sierra2_hash) = if expect_correct_class_hashes {
                     (
@@ -1457,26 +1457,31 @@ mod tests {
                     Default::default()
                 };
 
-                blocks[1]
-                    .state_update
-                    .as_mut()
-                    .unwrap()
-                    .declared_cairo_classes = [cairo_hash].into();
-                blocks[1]
-                    .state_update
-                    .as_mut()
-                    .unwrap()
-                    .declared_sierra_classes = [
-                    (sierra0_hash, Default::default()),
-                    (sierra2_hash, Default::default()),
-                ]
-                .into();
+                let state_update1 = StateUpdate::default()
+                    .with_declared_cairo_class(cairo_hash)
+                    .with_declared_sierra_class(sierra0_hash, Default::default())
+                    .with_declared_sierra_class(sierra2_hash, Default::default());
+                let mut blocks = vec![
+                    fake_block(0, Default::default()),
+                    fake_block(1, state_update1),
+                ];
+
                 blocks[1].cairo_defs = vec![(cairo_hash, CAIRO.to_vec())];
                 blocks[1].sierra_defs = vec![
                     // Does not compile
-                    (sierra0_hash, SIERRA0.to_vec(), Default::default()),
+                    (
+                        sierra0_hash,
+                        SIERRA0.to_vec(),
+                        Default::default(),
+                        Default::default(),
+                    ),
                     // Compiles just fine
-                    (sierra2_hash, SIERRA2.to_vec(), Default::default()),
+                    (
+                        sierra2_hash,
+                        SIERRA2.to_vec(),
+                        Default::default(),
+                        Default::default(),
+                    ),
                 ];
 
                 let streamed_classes = vec![
@@ -1558,7 +1563,7 @@ mod tests {
                     db.casm_definition(ClassHash(SIERRA0_HASH.0))
                         .unwrap()
                         .unwrap(),
-                    b"I'm from the fgw!"
+                    CASM2
                 );
                 assert!(serde_json::from_slice::<serde_json::Value>(
                     &db.casm_definition(ClassHash(SIERRA2_HASH.0))
