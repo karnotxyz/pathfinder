@@ -52,7 +52,8 @@ use tokio::sync::{mpsc, watch};
 
 use super::fetch_proposers::L2ProposerSelector;
 use super::fetch_validators::L2ValidatorSetProvider;
-use super::{ConsensusTaskEvent, ConsensusValue, HeightExt, P2PTaskEvent};
+use super::{integration_testing, ConsensusTaskEvent, ConsensusValue, HeightExt, P2PTaskEvent};
+use crate::config::integration_testing::InjectFailureConfig;
 use crate::config::ConsensusConfig;
 use crate::state::block_hash::{
     calculate_event_commitment,
@@ -60,8 +61,6 @@ use crate::state::block_hash::{
     calculate_transaction_commitment,
 };
 use crate::validator::{FinalizedBlock, ValidatorBlockInfoStage};
-
-mod integration_testing;
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
@@ -75,7 +74,7 @@ pub fn spawn(
     fake_proposals_storage: Storage,
     data_directory: &Path,
     // Does nothing in production builds. Used for integration testing only.
-    inject_failure: crate::config::integration_testing::InjectFailureConfig,
+    inject_failure: Option<InjectFailureConfig>,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let data_directory = data_directory.to_path_buf();
 
@@ -92,15 +91,7 @@ pub fn spawn(
         let mut consensus =
             Consensus::<ConsensusValue, ContractAddress, L2ProposerSelector>::recover_with_proposal_selector(
                 Config::new(validator_address)
-                    .with_wal_dir(wal_directory)
-                    .with_history_depth(
-                        // TODO: We don't support round certificates yet, and we want to limit
-                        // rebroadcasting to a minimum. Rebroadcast timeouts will happen for
-                        // historical engines which are finalized because
-                        // the effect `CancelAllTimeouts` is only triggered
-                        // upon a new round or a new height.
-                        0,
-                    ),
+                    .with_wal_dir(wal_directory),
                 // TODO use a dynamic validator set provider, once fetching the validator set from
                 // the staking contract is implemented. Related issue: https://github.com/eqlabs/pathfinder/issues/2936
                 Arc::new(validator_set_provider.clone()),
@@ -249,10 +240,10 @@ pub fn spawn(
                                  round {round}",
                             );
 
-                            // Does nothing in production builds. Used for integration testing only.
-                            integration_testing::debug_fail_on(
+                            // Does nothing in production builds.
+                            integration_testing::debug_fail_on_decided(
                                 height,
-                                inject_failure.on_proposal_decided,
+                                inject_failure,
                                 &data_directory,
                             );
 
@@ -327,16 +318,6 @@ pub fn spawn(
                         // consensus engine is already started for this new height carried in those
                         // messages.
                         ConsensusCommand::Proposal(_) | ConsensusCommand::Vote(_) => {
-                            if let ConsensusCommand::Proposal(_) = &cmd {
-                                // Does nothing in production builds. Used for
-                                // integration testing only.
-                                integration_testing::debug_fail_on(
-                                    cmd_height,
-                                    inject_failure.on_proposal_rx,
-                                    &data_directory,
-                                )
-                            }
-
                             // TODO catch up with the current height of the consensus network using
                             // sync, for the time being just observe the height in the rebroadcasted
                             // votes or in the proposals.
@@ -491,9 +472,7 @@ fn create_empty_proposal(
         vec![
             ProposalPart::Init(proposal_init),
             ProposalPart::BlockInfo(block_info),
-            // TODO empty proposal in the spec actually skips this part,
-            // make sure our code handles the case where this part is missing
-            ProposalPart::TransactionBatch(vec![]),
+            // Note: Per spec, empty proposals skip TransactionBatch entirely.
             ProposalPart::ProposalCommitment(proposal_commitment),
             ProposalPart::Fin(ProposalFin {
                 proposal_commitment: proposal_commitment_hash,
@@ -501,4 +480,78 @@ fn create_empty_proposal(
         ],
         finalized_block,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use pathfinder_crypto::Felt;
+    use pathfinder_storage::StorageBuilder;
+
+    use super::*;
+
+    /// Tests that create_empty_proposal successfully creates an empty proposal
+    /// and finalizes it without requiring an executor.
+    #[test]
+    fn test_create_empty_proposal() {
+        let storage = StorageBuilder::in_tempdir().expect("Failed to create temp database");
+        let chain_id = ChainId::SEPOLIA_TESTNET;
+        let height = 0u64;
+        let round = Round::new(0);
+        let proposer = ContractAddress::new_or_panic(Felt::from_hex_str("0x1").unwrap());
+
+        // Create an empty proposal - this should succeed without an executor
+        let (proposal_parts, finalized_block) =
+            create_empty_proposal(chain_id, height, round, proposer, storage)
+                .expect("create_empty_proposal should succeed for empty proposals");
+
+        // Verify proposal structure
+        assert!(
+            proposal_parts.len() >= 4,
+            "Empty proposal should have at least Init, BlockInfo, ProposalCommitment, and Fin"
+        );
+
+        // Verify it starts with Init
+        assert!(
+            matches!(proposal_parts[0], ProposalPart::Init(_)),
+            "First part should be ProposalInit"
+        );
+
+        // Verify it has BlockInfo
+        assert!(
+            matches!(proposal_parts[1], ProposalPart::BlockInfo(_)),
+            "Second part should be BlockInfo"
+        );
+
+        // Verify it ends with Fin
+        let last_part = proposal_parts.last().expect("Proposal should have parts");
+        assert!(
+            matches!(last_part, ProposalPart::Fin(_)),
+            "Last part should be ProposalFin"
+        );
+
+        // Verify finalized block has empty state
+        assert_eq!(
+            finalized_block.header.transaction_count, 0,
+            "Empty proposal should have 0 transaction count"
+        );
+        assert_eq!(
+            finalized_block.header.event_count, 0,
+            "Empty proposal should have 0 event count"
+        );
+        assert_eq!(
+            finalized_block.state_update.contract_updates.len(),
+            0,
+            "Empty proposal should have no contract updates"
+        );
+        assert_eq!(
+            finalized_block.state_update.system_contract_updates.len(),
+            0,
+            "Empty proposal should have no system contract updates"
+        );
+        assert_eq!(
+            finalized_block.transactions_and_receipts.len(),
+            0,
+            "Empty proposal should have no transactions"
+        );
+    }
 }

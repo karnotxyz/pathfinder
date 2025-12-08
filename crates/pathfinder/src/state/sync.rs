@@ -69,6 +69,7 @@ pub enum SyncEvent {
         sierra_hash: SierraHash,
         casm_definition: Vec<u8>,
         casm_hash: CasmHash,
+        casm_hash_v2: CasmHash,
     },
     /// A new L2 pending update was polled.
     Pending((Box<PendingBlock>, Box<StateUpdate>)),
@@ -623,7 +624,7 @@ async fn consumer(
                 }
                 CairoClass { definition, hash } => {
                     tracing::trace!("Inserting new Cairo class with hash: {hash}");
-                    tx.insert_cairo_class(hash, &definition)
+                    tx.insert_cairo_class_definition(hash, &definition)
                         .context("Inserting new cairo class")?;
 
                     tracing::debug!(%hash, "Inserted new Cairo class");
@@ -635,13 +636,14 @@ async fn consumer(
                     sierra_hash,
                     casm_definition,
                     casm_hash,
+                    casm_hash_v2,
                 } => {
                     tracing::trace!("Inserting new Sierra class with hash: {sierra_hash}");
-                    tx.insert_sierra_class(
+                    tx.insert_sierra_class_definition(
                         &sierra_hash,
                         &sierra_definition,
-                        &casm_hash,
                         &casm_definition,
+                        &casm_hash_v2,
                     )
                     .context("Inserting sierra class")?;
 
@@ -1933,6 +1935,7 @@ mod tests {
                 sierra_hash: SierraHash(class_hash),
                 casm_definition: b"casm definition".to_vec(),
                 casm_hash: casm_hash_bytes!(b"casm hash"),
+                casm_hash_v2: casm_hash_bytes!(b"casm hash blake"),
             })
             .await
             .unwrap();
@@ -1956,6 +1959,9 @@ mod tests {
         let definition = tx.class_definition(ClassHash(class_hash)).unwrap().unwrap();
 
         assert_eq!(definition, expected_definition);
+
+        let casm_hash_v2 = tx.casm_hash_v2(ClassHash(class_hash)).unwrap().unwrap();
+        assert_eq!(casm_hash_v2, casm_hash_bytes!(b"casm hash blake"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2837,6 +2843,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
             let sierra_definition = b"sierra definition".to_vec();
             let casm_definition = b"casm definition".to_vec();
             let casm_hash = casm_hash_bytes!(b"casm hash");
+            let casm_hash_v2 = casm_hash_bytes!(b"casm hash blake");
 
             // Add the class definition.
             event_tx
@@ -2845,6 +2852,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                     sierra_hash: removed_class_hash,
                     casm_definition,
                     casm_hash,
+                    casm_hash_v2,
                 })
                 .await
                 .unwrap();

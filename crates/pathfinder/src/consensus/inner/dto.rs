@@ -19,6 +19,7 @@ pub enum ProposalPart {
     Fin(ProposalFin),
     BlockInfo(BlockInfo),
     TransactionBatch(Vec<TransactionWithClass>),
+    TransactionsFin(TransactionsFin),
     ProposalCommitment(Box<ProposalCommitment>),
 }
 
@@ -51,6 +52,11 @@ pub struct ProposalFin {
 pub struct TransactionWithClass {
     pub variant: TransactionVariantWithClass,
     pub hash: MinimalFelt,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TransactionsFin {
+    pub executed_transaction_count: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -155,6 +161,8 @@ pub struct StateUpdateData {
         LinearMap<pathfinder_common::ContractAddress, SystemContractUpdate>,
     pub declared_cairo_classes: Vec<pathfinder_common::ClassHash>,
     pub declared_sierra_classes:
+        LinearMap<pathfinder_common::SierraHash, pathfinder_common::CasmHash>,
+    pub migrated_compiled_classes:
         LinearMap<pathfinder_common::SierraHash, pathfinder_common::CasmHash>,
 }
 
