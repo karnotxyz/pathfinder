@@ -22,6 +22,7 @@ use tokio::time::Instant;
 use wal::*;
 
 use crate::config::TimeoutValues;
+use crate::error::ConsensusError;
 use crate::wal::{WalEntry, WalSink};
 use crate::{
     ConsensusCommand,
@@ -105,16 +106,35 @@ impl<
             "Recovering consensus from WAL entries"
         );
 
+        // Check if any entry is a Decision, which indicates this height is finalized.
+        let has_decision = entries
+            .iter()
+            .any(|e| matches!(e, WalEntry::Decision { .. }));
+
+        // Mark the WAL as finalized if we're recovering from a Decision entry.
+        if has_decision {
+            self.wal.mark_as_finalized();
+        }
+
+        // Now process the entries.
         for (i, entry) in entries.into_iter().enumerate() {
+            // We skip Decision entries as they're just markers.
+            if matches!(entry, WalEntry::Decision { .. }) {
+                continue;
+            }
+
             let input = convert_wal_entry_to_input(entry);
             if let Err(e) = self.process_input(input) {
-                tracing::error!(
+                tracing::warn!(
                     validator = %self.state.address(),
                     entry_index = i,
                     error = %e,
-                    "Failed to process WAL entry during recovery"
+                    "Failed to process WAL entry during recovery - skipping corrupted entry"
                 );
-                self.output_queue.push_back(ConsensusEvent::Error(e.into()));
+                self.output_queue
+                    .push_back(ConsensusEvent::Error(ConsensusError::wal_recovery(
+                        e.into(),
+                    )));
             }
         }
 
@@ -155,7 +175,8 @@ impl<
                 "Timeout elapsed"
             );
             if let Err(e) = self.process_input(input) {
-                self.output_queue.push_back(ConsensusEvent::Error(e.into()));
+                self.output_queue
+                    .push_back(ConsensusEvent::Error(ConsensusError::malachite(e)));
             }
         }
 
@@ -214,7 +235,8 @@ impl<
             };
 
             if let Err(e) = self.process_input(input) {
-                self.output_queue.push_back(ConsensusEvent::Error(e.into()));
+                self.output_queue
+                    .push_back(ConsensusEvent::Error(ConsensusError::malachite(e)));
             }
         }
 

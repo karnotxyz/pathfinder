@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- The new `--rpc.native-execution-force-use-for-incompatible-classes` CLI option can be used to force use of native execution even for pre-1.7.0 Sierra classes (where fee calculation is known to be inaccurate). Use this flag at your own risk.
+
+## [0.21.3] - 2025-12-03
+
+### Added
+
+- The new histogram metric `rpc_method_calls_duration_milliseconds` has been added to expose JSON-RPC method call latency data.
+
+### Changed
+
+- `blockifier` has been upgraded to 0.16.0-rc.2.
+- Pathfinder no longer returns `event_commitment` and `transaction_commitment` values for Starknet blocks older than Starknet version 0.13.2.
+
+### Fixed
+
+- `starknet_traceTransaction` times out for some transactions because fetching transaction traces from the feeder gateway fails due to some unknown fields in the response.
+
+## [0.21.2] - 2025-11-27
+
+### Changed
+
+- Pathfinder now serves the JSON-RPC 0.10.0 API on the `v0_10` routes.
+- The size of the block trace cache is now configurable by the new `--rpc.block-trace-cache-size` CLI argument.
+
+## [0.21.1] - 2025-11-20
+
+### Fixed
+
+- Pathfinder exits after receiving an internal server error from the feeder gateway.
+- `starknet_estimateFee` and `starknet_simulateTransactions` fails if one of the transactions is using a class that has been declared by a simulated DECLARE transaction in the batch.
+- Cairo Native is not working correctly with Docker images published on Docker Hub due to a linker error.
+
+## [0.21.0] - 2025-11-11
+
+### Added
+
+- Support for Starknet 0.14.1 networks.
+
 ### Fixed
 
 - Inconsistent state updates when using "pre_confirmed" block identifier with `starknet_call`, `starknet_estimateFee` and `starknet_simulateTransactions` JSON-RPC methods.

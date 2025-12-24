@@ -209,8 +209,8 @@ where
         let starting_block = T::starting_block(&params);
 
         let mut current_block = util::task::spawn_blocking(move |_| -> Result<_, RpcError> {
-            let mut conn = storage.connection().map_err(RpcError::InternalError)?;
-            let db = conn.transaction().map_err(RpcError::InternalError)?;
+            let mut conn = storage.connection()?;
+            let db = conn.transaction()?;
 
             let starting_block = match starting_block {
                 SubscriptionBlockId::Number(starting_block_number)
@@ -713,7 +713,7 @@ async fn handle_request(
                 version: state.version,
             })?;
         handle.abort();
-        metrics::increment_counter!("rpc_method_calls_total", "method" => "starknet_unsubscribe", "version" => state.version.to_str());
+        metrics::counter!("rpc_method_calls_total", "method" => "starknet_unsubscribe", "version" => state.version.to_str()).increment(1);
         return Ok(Some(RpcResponse {
             output: Ok(true.into()),
             id: req_id,
@@ -725,7 +725,7 @@ async fn handle_request(
         .subscription_endpoints
         .get_key_value(rpc_request.method.as_ref())
         .ok_or_else(|| RpcResponse::method_not_found(req_id.clone(), state.version))?;
-    metrics::increment_counter!("rpc_method_calls_total", "method" => method_name, "version" => state.version.to_str());
+    metrics::counter!("rpc_method_calls_total", "method" => method_name, "version" => state.version.to_str()).increment(1);
 
     let params = serde_json::to_value(rpc_request.params)
         .map_err(|e| RpcResponse::invalid_params(req_id.clone(), e.to_string(), state.version))?;

@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use pathfinder_common::prelude::*;
-use pathfinder_common::{BlockId, Chain};
+use pathfinder_common::state_update::StateUpdateData;
+use pathfinder_common::{BlockId, Chain, ConsensusFinalizedL2Block, L2Block, L2BlockToCommit};
 use pathfinder_crypto::Felt;
 use pathfinder_ethereum::{EthereumApi, EthereumStateUpdate};
 use pathfinder_merkle_tree::starknet_state::update_starknet_state;
@@ -30,8 +31,10 @@ use starknet_gateway_types::reply::{
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::watch::Sender as WatchSender;
 
+use crate::state::block_hash;
 use crate::state::l1::L1SyncContext;
 use crate::state::l2::{BlockChain, L2SyncContext};
+use crate::SyncMessageToConsensus;
 
 /// Delay before restarting L1 or L2 tasks if they fail. This delay helps
 /// prevent DoS if these tasks are crashing.
@@ -43,8 +46,8 @@ pub const RESET_DELAY_ON_FAILURE: std::time::Duration = std::time::Duration::ZER
 #[derive(Debug)]
 pub enum SyncEvent {
     L1Update(EthereumStateUpdate),
-    /// New L2 [block update](StateUpdate) found.
-    Block(
+    /// New L2 [block update](StateUpdate) found on gateway.
+    DownloadedBlock(
         (
             Box<Block>,
             (TransactionCommitment, EventCommitment, ReceiptCommitment),
@@ -54,6 +57,17 @@ pub enum SyncEvent {
         Box<StateDiffCommitment>,
         l2::Timings,
     ),
+    /// A new L2 finalized block received from consensus. The consumer task is
+    /// responsible for updating the state tries, computing the state
+    /// commitment, and finally, the block hash.
+    FinalizedConsensusBlock {
+        /// L2 block finalized and decided upon by consensus.
+        l2_block: Box<ConsensusFinalizedL2Block>,
+        /// A oneshot channel to notify when the state tries update is done,
+        /// returning the computed block hash and state commitment, which is
+        /// necessary for the download block logic to continue its work.
+        state_tries_updated_tx: tokio::sync::oneshot::Sender<(BlockHash, StateCommitment)>,
+    },
     /// An L2 reorg was detected, contains the reorg-tail which
     /// indicates the oldest block which is now invalid
     /// i.e. reorg-tail - 1 should be the new head.
@@ -69,6 +83,7 @@ pub enum SyncEvent {
         sierra_hash: SierraHash,
         casm_definition: Vec<u8>,
         casm_hash: CasmHash,
+        casm_hash_v2: CasmHash,
     },
     /// A new L2 pending update was polled.
     Pending((Box<PendingBlock>, Box<StateUpdate>)),
@@ -93,6 +108,7 @@ pub struct SyncContext<G, E> {
     pub l1_poll_interval: Duration,
     pub pending_data: WatchSender<PendingData>,
     pub submitted_tx_tracker: pathfinder_rpc::tracker::SubmittedTransactionTracker,
+    pub sync_to_consensus_tx: Option<mpsc::Sender<SyncMessageToConsensus>>,
     pub block_validation_mode: l2::BlockValidationMode,
     pub notifications: Notifications,
     pub block_cache_size: usize,
@@ -171,6 +187,7 @@ where
         l1_poll_interval: _,
         pending_data,
         submitted_tx_tracker,
+        sync_to_consensus_tx,
         block_validation_mode: _,
         notifications,
         block_cache_size,
@@ -256,6 +273,7 @@ where
         pending_data,
         verify_tree_hashes: context.verify_tree_hashes,
         notifications,
+        sync_to_consensus_tx,
     };
     let mut consumer_handle =
         util::task::spawn(consumer(event_receiver, consumer_context, tx_current));
@@ -418,6 +436,264 @@ where
     }
 }
 
+/// Implements the main sync loop (like [sync]), where L1 and
+/// **consensus-aware** L2 sync results are combined.
+///
+/// This function is also stripped of the sync status updater and pending block
+/// poller, since this is a PoC for consensus integration and those features
+/// are not needed here.
+pub async fn consensus_sync<Ethereum, SequencerClient, F1, F2, L1Sync, L2Sync>(
+    context: SyncContext<SequencerClient, Ethereum>,
+    mut l1_sync: L1Sync,
+    l2_sync: L2Sync,
+) -> anyhow::Result<()>
+where
+    Ethereum: EthereumApi + Clone + Send + 'static,
+    SequencerClient: GatewayApi + Clone + Send + Sync + 'static,
+    F1: Future<Output = anyhow::Result<()>> + Send + 'static,
+    F2: Future<Output = anyhow::Result<()>> + Send + 'static,
+    L1Sync: FnMut(mpsc::Sender<SyncEvent>, L1SyncContext<Ethereum>) -> F1,
+    L2Sync: FnOnce(
+            mpsc::Sender<SyncEvent>,
+            Option<mpsc::Sender<SyncMessageToConsensus>>,
+            L2SyncContext<SequencerClient>,
+            Option<(BlockNumber, BlockHash, StateCommitment)>,
+            BlockChain,
+            tokio::sync::watch::Receiver<(BlockNumber, BlockHash)>,
+        ) -> F2
+        + Copy,
+{
+    let l1_context = L1SyncContext::from(&context);
+    let l2_context = L2SyncContext::from(&context);
+
+    let SyncContext {
+        storage,
+        ethereum: _,
+        chain: _,
+        chain_id: _,
+        core_address: _,
+        sequencer,
+        state,
+        head_poll_interval,
+        l1_poll_interval: _,
+        pending_data,
+        submitted_tx_tracker,
+        sync_to_consensus_tx,
+        block_validation_mode: _,
+        notifications,
+        block_cache_size,
+        restart_delay,
+        verify_tree_hashes: _,
+        sequencer_public_key: _,
+        fetch_concurrency: _,
+        fetch_casm_from_fgw: _,
+    } = context;
+
+    let mut db_conn = storage
+        .connection()
+        .context("Creating database connection")?;
+
+    let (event_sender, event_receiver) = mpsc::channel(8);
+
+    // Get the latest block from the database
+    let l2_head = tokio::task::block_in_place(|| -> anyhow::Result<_> {
+        let tx = db_conn.transaction()?;
+        let l2_head = tx
+            .block_header(BlockId::Latest)
+            .context("Fetching latest block header from database")?
+            .map(|header| (header.number, header.hash, header.state_commitment));
+
+        Ok(l2_head)
+    })?;
+
+    // Get the latest block from the sequencer
+    let gateway_latest = sequencer
+        .head()
+        .await
+        .context("Fetching latest block from gateway")?;
+
+    // Keep polling the sequencer for the latest block
+    let (tx_latest, rx_latest) = tokio::sync::watch::channel(gateway_latest);
+    let mut latest_handle = util::task::spawn(l2::poll_latest(
+        sequencer.clone(),
+        head_poll_interval,
+        tx_latest,
+    ));
+
+    // Start L1 producer task. Clone the event sender so that the channel remains
+    // open even if the producer task fails.
+    let mut l1_handle = util::task::spawn(l1_sync(event_sender.clone(), l1_context.clone()));
+
+    // Fetch latest blocks from storage
+    let latest_blocks = latest_n_blocks(&mut db_conn, block_cache_size)
+        .await
+        .context("Fetching latest blocks from storage")?;
+    let block_chain = BlockChain::with_capacity(block_cache_size, latest_blocks);
+
+    // Start L2 producer task. Clone the event sender so that the channel remains
+    // open even if the producer task fails.
+    let mut l2_handle = util::task::spawn(l2_sync(
+        event_sender.clone(),
+        sync_to_consensus_tx.clone(),
+        l2_context.clone(),
+        l2_head,
+        block_chain,
+        rx_latest.clone(),
+    ));
+
+    let (current_num, current_hash, _) = l2_head.unwrap_or_default();
+    let (tx_current, _rx_current) = tokio::sync::watch::channel((current_num, current_hash));
+    let consumer_context = ConsumerContext {
+        storage: storage.clone(),
+        state,
+        submitted_tx_tracker,
+        pending_data,
+        verify_tree_hashes: context.verify_tree_hashes,
+        notifications,
+        sync_to_consensus_tx: sync_to_consensus_tx.clone(),
+    };
+    let mut consumer_handle =
+        util::task::spawn(consumer(event_receiver, consumer_context, tx_current));
+
+    loop {
+        tokio::select! {
+            _ = &mut latest_handle => {
+                tracing::error!("Tracking chain tip task ended unexpectedly");
+                tracing::debug!("Shutting down other tasks");
+
+                l1_handle.abort();
+                l2_handle.abort();
+                consumer_handle.abort();
+
+                _ = l1_handle.await;
+                _ = l2_handle.await;
+                _ = consumer_handle.await;
+
+                anyhow::bail!("Sync process terminated");
+            },
+            l1_producer_result = &mut l1_handle => {
+                match l1_producer_result.context("Join L1 sync process handle")? {
+                    Ok(()) => {
+                        tracing::error!("L1 sync process terminated without an error.");
+                    }
+                    Err(e) => {
+                        tracing::warn!("L1 sync process terminated with: {e:?}");
+                    }
+                }
+
+                let fut = l1_sync(event_sender.clone(), l1_context.clone());
+                l1_handle = util::task::spawn(async move {
+                    tokio::time::sleep(RESET_DELAY_ON_FAILURE).await;
+                    fut.await
+                });
+            },
+            l2_producer_result = &mut l2_handle => {
+                // L2 sync process failed; restart it.
+                match l2_producer_result.context("Join L2 sync process handle")? {
+                    Ok(()) => {
+                        tracing::error!("L2 sync process terminated without an error.");
+                    }
+                    Err(e) => {
+                        tracing::warn!("L2 sync process terminated with: {e:?}");
+                    }
+                }
+
+                let l2_head = tokio::task::block_in_place(|| {
+                    let tx = db_conn.transaction()?;
+                    tx.block_header(BlockId::Latest)
+                })
+                .context("Query L2 head from database")?
+                .map(|block| (block.number, block.hash, block.state_commitment));
+
+                let latest_blocks = latest_n_blocks(&mut db_conn, block_cache_size)
+                    .await
+                    .context("Fetching latest blocks from storage")?;
+                let block_chain = BlockChain::with_capacity(1_000, latest_blocks);
+                let fut = l2_sync(
+                    event_sender.clone(),
+                    sync_to_consensus_tx.clone(),
+                    l2_context.clone(),
+                    l2_head,
+                    block_chain,
+                    rx_latest.clone()
+                );
+
+                l2_handle = util::task::spawn(async move {
+                    tokio::time::sleep(restart_delay).await;
+                    fut.await
+                });
+                tracing::info!("L2 sync process restarted.");
+            },
+            consumer_result = &mut consumer_handle => {
+                match consumer_result {
+                    Ok(Ok(())) => {
+                        tracing::debug!("Sync consumer task exited gracefully");
+                    },
+                    Ok(Err(e)) => {
+                        tracing::error!(reason=?e, "Sync consumer task terminated with an error");
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        tracing::debug!("Sync consumer task cancelled successfully");
+                    },
+                    Err(panic) => {
+                        tracing::error!(%panic, "Sync consumer task panic'd");
+                    }
+                }
+
+                // Shutdown the other processes.
+                tracing::debug!("Shutting down L1 and L2 sync producer tasks");
+                l1_handle.abort();
+                l2_handle.abort();
+                latest_handle.abort();
+
+                match l1_handle.await {
+                    Ok(Ok(())) => {
+                        tracing::debug!("L1 sync task exited gracefully");
+                    },
+                    Ok(Err(e)) => {
+                        tracing::error!(reason=?e, "L1 sync task terminated with an error");
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        tracing::debug!("L1 sync task cancelled successfully");
+                    },
+                    Err(panic) => {
+                        tracing::error!(%panic, "L1 sync task panic'd");
+                    }
+                }
+
+                match l2_handle.await {
+                    Ok(Ok(())) => {
+                        tracing::debug!("L2 sync task exited gracefully");
+                    },
+                    Ok(Err(e)) => {
+                        tracing::error!(reason=?e, "L2 sync task terminated with an error");
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        tracing::debug!("L2 sync task cancelled successfully");
+                    },
+                    Err(panic) => {
+                        tracing::error!(%panic, "L2 sync task panic'd");
+                    }
+                }
+
+                match latest_handle.await {
+                    Ok(()) => {
+                        tracing::debug!("Latest polling task exited gracefully");
+                    },
+                    Err(e) if e.is_cancelled() => {
+                        tracing::debug!("Latest polling task cancelled successfully");
+                    },
+                    Err(panic) => {
+                        tracing::error!(%panic, "Latest polling task panic'd");
+                    }
+                }
+
+                anyhow::bail!("Sync process terminated");
+            }
+        }
+    }
+}
+
 struct ConsumerContext {
     pub storage: Storage,
     pub state: Arc<SyncState>,
@@ -425,6 +701,7 @@ struct ConsumerContext {
     pub pending_data: WatchSender<PendingData>,
     pub verify_tree_hashes: bool,
     pub notifications: Notifications,
+    pub sync_to_consensus_tx: Option<mpsc::Sender<SyncMessageToConsensus>>,
 }
 
 async fn consumer(
@@ -439,6 +716,7 @@ async fn consumer(
         pending_data,
         verify_tree_hashes,
         mut notifications,
+        sync_to_consensus_tx,
     } = context;
 
     let mut last_block_start = std::time::Instant::now();
@@ -468,10 +746,10 @@ async fn consumer(
     while let Some(event) = events.recv().await {
         use SyncEvent::*;
 
-        if let Block((block, _), _, _, _, _) = &event {
+        if let DownloadedBlock((block, _), _, _, _, _) = &event {
             if block.block_number < next_number {
-                tracing::debug!("Ignoring duplicate block {}", block.block_number);
-                return anyhow::Ok(());
+                tracing::debug!(block_number=%block.block_number, "Ignoring duplicate block");
+                continue;
             }
 
             let block_number = block.block_number;
@@ -483,17 +761,17 @@ async fn consumer(
                 Syncing::Status(status) => {
                     status.current = NumberedBlock::from((block_hash, block_number));
 
-                    metrics::gauge!("current_block", block_number.get() as f64);
+                    metrics::gauge!("current_block").set(block_number.get() as f64);
 
                     if status.highest.number <= block_number {
                         status.highest = status.current;
-                        metrics::gauge!("highest_block", block_number.get() as f64);
+                        metrics::gauge!("highest_block").set(block_number.get() as f64);
                     }
                 }
             }
         }
 
-        tokio::task::block_in_place(|| {
+        let maybe_committed_l2_block_number = tokio::task::block_in_place(|| {
             let tx = db_conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .context("Create database transaction")?;
@@ -508,7 +786,7 @@ async fn consumer(
 
                     None
                 }
-                Block(
+                DownloadedBlock(
                     (block, (tx_comm, ev_comm, rc_comm)),
                     state_update,
                     signature,
@@ -517,8 +795,8 @@ async fn consumer(
                 ) => {
                     tracing::trace!("Updating L2 state to block {}", block.block_number);
                     if block.block_number < next_number {
-                        tracing::debug!("Ignoring duplicate block {}", block.block_number);
-                        return anyhow::Ok(());
+                        tracing::debug!(block_number=%block.block_number, "Ignoring duplicate block");
+                        return anyhow::Ok(None);
                     }
 
                     let block_number = block.block_number;
@@ -530,15 +808,18 @@ async fn consumer(
                         .map(|x| x.1.storage.len())
                         .sum();
                     let update_t = std::time::Instant::now();
-                    let block_header = l2_update(
-                        &tx,
-                        block.as_ref(),
+                    let l2_block = l2_block_from_fgw_reply(
+                        block,
                         tx_comm,
                         rc_comm,
                         ev_comm,
-                        *state_update,
-                        *signature,
                         *state_diff_commitment,
+                        *state_update,
+                    )?;
+                    let l2_block = l2_update(
+                        &tx,
+                        l2_block.into(),
+                        *signature,
                         verify_tree_hashes,
                         storage.clone(),
                     )
@@ -560,14 +841,16 @@ async fn consumer(
                         + timings.signature_download)
                         .as_secs_f64();
 
-                    metrics::gauge!("block_download", download_time);
-                    metrics::gauge!("block_processing", update_t.as_secs_f64());
-                    metrics::histogram!("block_processing_duration_seconds", update_t);
-                    metrics::gauge!("block_latency", latency as f64);
-                    metrics::gauge!(
-                        "block_time",
-                        (block_timestamp.get() - latest_timestamp.get()) as f64
-                    );
+                    metrics::gauge!("block_download").set(download_time);
+                    metrics::gauge!("block_processing").set(update_t.as_secs_f64());
+                    metrics::histogram!("block_processing_duration_seconds")
+                        .record(update_t.as_secs_f64());
+                    metrics::gauge!("block_latency").set(latency as f64);
+                    if let Some(block_time_secs) =
+                        block_timestamp.get().checked_sub(latest_timestamp.get())
+                    {
+                        metrics::gauge!("block_time").set(block_time_secs as f64);
+                    }
                     latest_timestamp = block_timestamp;
                     next_number += 1;
 
@@ -598,7 +881,36 @@ async fn consumer(
                         }
                     }
 
-                    Some(Notification::L2Block(block, block_header.into()))
+                    Some(Notification::L2Block(Arc::new(l2_block)))
+                }
+                FinalizedConsensusBlock {
+                    l2_block,
+                    state_tries_updated_tx,
+                } => {
+                    if l2_block.header.number < next_number {
+                        tracing::debug!(
+                            "Ignoring duplicate finalized block {}",
+                            l2_block.header.number
+                        );
+                        return anyhow::Ok(None);
+                    }
+
+                    let l2_block = l2_update(
+                        &tx,
+                        (*l2_block).into(),
+                        BlockCommitmentSignature::default(),
+                        verify_tree_hashes,
+                        storage.clone(),
+                    )?;
+
+                    state_tries_updated_tx
+                        .send((l2_block.header.hash, l2_block.header.state_commitment))
+                        .expect(
+                            "Receiver was dropped, which means that the consumer task exited and \
+                             all sync related tasks, including this one, will be restarted.",
+                        );
+
+                    Some(Notification::L2Block(Arc::new(l2_block)))
                 }
                 Reorg(reorg_tail) => {
                     tracing::trace!("Reorg L2 state to block {}", reorg_tail);
@@ -623,7 +935,7 @@ async fn consumer(
                 }
                 CairoClass { definition, hash } => {
                     tracing::trace!("Inserting new Cairo class with hash: {hash}");
-                    tx.insert_cairo_class(hash, &definition)
+                    tx.insert_cairo_class_definition(hash, &definition)
                         .context("Inserting new cairo class")?;
 
                     tracing::debug!(%hash, "Inserted new Cairo class");
@@ -635,13 +947,14 @@ async fn consumer(
                     sierra_hash,
                     casm_definition,
                     casm_hash,
+                    casm_hash_v2,
                 } => {
                     tracing::trace!("Inserting new Sierra class with hash: {sierra_hash}");
-                    tx.insert_sierra_class(
+                    tx.insert_sierra_class_definition(
                         &sierra_hash,
                         &sierra_definition,
-                        &casm_hash,
                         &casm_definition,
+                        &casm_hash_v2,
                     )
                     .context("Inserting sierra class")?;
 
@@ -712,6 +1025,16 @@ async fn consumer(
             }
             let commit_result = tx.commit().context("Committing database transaction");
 
+            // Consensus may have deferred execution for the next block until this one is
+            // committed, so we must now send notification to consensus to unblock any
+            // deferred execution.
+            let maybe_committed_l2_block_number =
+                if let Some(Notification::L2Block(l2_block)) = notification.as_ref() {
+                    Some(l2_block.header.number)
+                } else {
+                    None
+                };
+
             // Now that the changes have been committed to storage we can send out the
             // notification. It is important that this is only ever done _after_
             // the commit otherwise clients could potentially see inconsistent
@@ -720,8 +1043,21 @@ async fn consumer(
                 send_notification(notification, &mut notifications);
             }
 
-            commit_result
+            // TODO return the value of the committed l2 block
+            commit_result.map(|_| maybe_committed_l2_block_number)
         })?;
+
+        if let Some(committed_l2_block_number) = maybe_committed_l2_block_number {
+            // Notify consensus that a new L2 block has been committed.
+            if let Some(sync_to_consensus_tx) = sync_to_consensus_tx.clone() {
+                sync_to_consensus_tx
+                    .send(SyncMessageToConsensus::ConfirmFinalizedBlockCommitted {
+                        number: committed_l2_block_number,
+                    })
+                    .await
+                    .context("Sending L2 block committed message to consensus")?;
+            }
+        }
     }
 
     Ok(())
@@ -738,7 +1074,9 @@ impl PruningEvent {
             SyncEvent::L1Update(ethereum_state_update) => {
                 Some(Self::L1Checkpoint(ethereum_state_update.block_number))
             }
-            SyncEvent::Block((block, _), _, _, _, _) => Some(Self::L2Head(block.block_number)),
+            SyncEvent::DownloadedBlock((block, _), _, _, _, _) => {
+                Some(Self::L2Head(block.block_number))
+            }
             _ => None,
         }
     }
@@ -900,8 +1238,8 @@ async fn update_sync_status_latest(
                     highest: latest,
                 });
 
-                metrics::gauge!("current_block", starting.number.get() as f64);
-                metrics::gauge!("highest_block", latest.number.get() as f64);
+                metrics::gauge!("current_block").set(starting.number.get() as f64);
+                metrics::gauge!("highest_block").set(latest.number.get() as f64);
 
                 tracing::debug!(
                     status=%sync_status,
@@ -912,7 +1250,7 @@ async fn update_sync_status_latest(
                 if status.highest.hash != latest.hash {
                     status.highest = latest;
 
-                    metrics::gauge!("highest_block", latest.number.get() as f64);
+                    metrics::gauge!("highest_block").set(latest.number.get() as f64);
 
                     tracing::debug!(
                         %status,
@@ -952,37 +1290,129 @@ fn l1_update(transaction: &Transaction<'_>, update: &EthereumStateUpdate) -> any
     Ok(())
 }
 
-/// Returns the new [StateCommitment] after the update.
 #[allow(clippy::too_many_arguments)]
 fn l2_update(
     transaction: &Transaction<'_>,
-    block: &Block,
-    transaction_commitment: TransactionCommitment,
-    receipt_commitment: ReceiptCommitment,
-    event_commitment: EventCommitment,
-    state_update: StateUpdate,
+    block: L2BlockToCommit,
     signature: BlockCommitmentSignature,
-    state_diff_commitment: StateDiffCommitment,
     verify_tree_hashes: bool,
     // we need this so that we can create extra read-only transactions for
     // parallel contract state updates
     storage: Storage,
-) -> anyhow::Result<BlockHeader> {
+) -> anyhow::Result<L2Block> {
     let (storage_commitment, class_commitment) = update_starknet_state(
         transaction,
-        (&state_update).into(),
+        block.state_update().as_ref(),
         verify_tree_hashes,
-        block.block_number,
+        block.number(),
         storage,
     )
     .context("Updating Starknet state")?;
     let state_commitment = StateCommitment::calculate(storage_commitment, class_commitment);
 
-    // Ensure that roots match.. what should we do if it doesn't? For now the whole
-    // sync process ends..
+    if let Some(expected_state_commitment) = block.state_commitment() {
+        // Ensure that roots match.. what should we do if it doesn't? For now the whole
+        // sync process ends..
+        anyhow::ensure!(
+            state_commitment == expected_state_commitment,
+            "State commitment mismatch"
+        );
+    }
+
+    let block = match block {
+        L2BlockToCommit::FromConsensus(block) => {
+            let parent_hash = if let Some(parent_number) = block.header.number.parent() {
+                transaction
+                    .block_hash(BlockId::Number(parent_number))
+                    .context("Fetching parent block hash")?
+                    .context("Parent block missing - logic error in storage")?
+            } else {
+                BlockHash::ZERO
+            };
+            let ConsensusFinalizedL2Block {
+                header,
+                state_update,
+                transactions_and_receipts,
+                events,
+            } = block;
+            L2Block {
+                header: header.compute_hash(
+                    parent_hash,
+                    state_commitment,
+                    block_hash::compute_final_hash,
+                ),
+                state_update,
+                transactions_and_receipts,
+                events,
+            }
+        }
+        L2BlockToCommit::FromFgw(block) => block,
+    };
+
+    // Update L2 database. These types shouldn't be options at this level,
+    // but for now the unwraps are "safe" in that these should only ever be
+    // None for pending queries to the sequencer, but we aren't using those here.
+    // Nonetheless, the 0 defaults for l2_gas_price do show in the
+    // database (for old blocks that don't really have that price),
+    // and since the feeder gateway normally returns 1 in that case,
+    // that should also be the default.
+    transaction
+        .insert_block_header(&block.header)
+        .context("Inserting block header into database")?;
+
+    transaction
+        .insert_transaction_data(
+            block.header.number,
+            &block.transactions_and_receipts,
+            Some(&block.events),
+        )
+        .context("Insert transaction data into database")?;
+
+    // Insert state updates
+    transaction
+        .insert_state_update_data(block.header.number, &block.state_update)
+        .context("Insert state update into database")?;
+
+    // Insert signature
+    transaction
+        .insert_signature(block.header.number, &signature)
+        .context("Insert signature into database")?;
+
+    // Track combined L1 and L2 state.
+    let l1_l2_head = transaction.l1_l2_pointer().context("Query L1-L2 head")?;
+    let expected_next = l1_l2_head
+        .map(|head| head + 1)
+        .unwrap_or(BlockNumber::GENESIS);
+
+    if expected_next == block.header.number {
+        if let Some(l1_state) = transaction
+            .l1_state_at_number(block.header.number)
+            .context("Query L1 state")?
+        {
+            if l1_state.block_hash == block.header.hash {
+                transaction
+                    .update_l1_l2_pointer(Some(block.header.number))
+                    .context("Update L1-L2 head")?;
+            }
+        }
+    }
+
+    Ok(block)
+}
+
+fn l2_block_from_fgw_reply(
+    block: Box<Block>,
+    transaction_commitment: TransactionCommitment,
+    receipt_commitment: ReceiptCommitment,
+    event_commitment: EventCommitment,
+    state_diff_commitment: StateDiffCommitment,
+    state_update: StateUpdate,
+) -> anyhow::Result<L2Block> {
     anyhow::ensure!(
-        state_commitment == block.state_commitment,
-        "State root mismatch"
+        block.transactions.len() == block.transaction_receipts.len(),
+        "Transactions and receipts mismatch. There were {} transactions and {} receipts.",
+        block.transactions.len(),
+        block.transaction_receipts.len()
     );
 
     let transaction_count = block.transactions.len();
@@ -992,17 +1422,13 @@ fn l2_update(
         .map(|(_, events)| events.len())
         .sum();
 
-    // Update L2 database. These types shouldn't be options at this level,
-    // but for now the unwraps are "safe" in that these should only ever be
-    // None for pending queries to the sequencer, but we aren't using those here.
-    // Nonetheless, the 0 defaults for l2_gas_price do show in the
-    // database (for old blocks that don't really have that price),
-    // and since the feeder gateway normally returns 1 in that case,
-    // that should also be the default.
     let l2_gas_price = block.l2_gas_price.unwrap_or(GasPrices {
         price_in_wei: GasPrice(1),
         price_in_fri: GasPrice(1),
     });
+
+    let state_update: StateUpdateData = state_update.into();
+
     let header = BlockHeader {
         hash: block.block_hash,
         parent_hash: block.parent_block_hash,
@@ -1023,7 +1449,7 @@ fn l2_update(
             .unwrap_or(SequencerAddress(Felt::ZERO)),
         starknet_version: block.starknet_version,
         event_commitment,
-        state_commitment,
+        state_commitment: block.state_commitment,
         transaction_commitment,
         transaction_count,
         event_count,
@@ -1033,18 +1459,7 @@ fn l2_update(
         state_diff_length: state_update.state_diff_length(),
     };
 
-    transaction
-        .insert_block_header(&header)
-        .context("Inserting block header into database")?;
-
-    // Insert the transactions.
-    anyhow::ensure!(
-        block.transactions.len() == block.transaction_receipts.len(),
-        "Transactions and receipts mismatch. There were {} transactions and {} receipts.",
-        block.transactions.len(),
-        block.transaction_receipts.len()
-    );
-    let (transactions_data, events_data): (Vec<_>, Vec<_>) = block
+    let (transactions_and_receipts, events) = block
         .transactions
         .iter()
         .cloned()
@@ -1052,59 +1467,31 @@ fn l2_update(
         .map(|(tx, (receipt, events))| ((tx, receipt), events))
         .unzip();
 
-    transaction
-        .insert_transaction_data(header.number, &transactions_data, Some(&events_data))
-        .context("Insert transaction data into database")?;
-
-    // Insert state updates
-    transaction
-        .insert_state_update(block.block_number, &state_update)
-        .context("Insert state update into database")?;
-
-    // Insert signature
-    transaction
-        .insert_signature(block.block_number, &signature)
-        .context("Insert signature into database")?;
-
-    // Track combined L1 and L2 state.
-    let l1_l2_head = transaction.l1_l2_pointer().context("Query L1-L2 head")?;
-    let expected_next = l1_l2_head
-        .map(|head| head + 1)
-        .unwrap_or(BlockNumber::GENESIS);
-
-    if expected_next == header.number {
-        if let Some(l1_state) = transaction
-            .l1_state_at_number(header.number)
-            .context("Query L1 state")?
-        {
-            if l1_state.block_hash == header.hash {
-                transaction
-                    .update_l1_l2_pointer(Some(header.number))
-                    .context("Update L1-L2 head")?;
-            }
-        }
-    }
-
-    Ok(header)
+    Ok(L2Block {
+        header,
+        state_update,
+        transactions_and_receipts,
+        events,
+    })
 }
 
 enum Notification {
-    L2Block(Box<Block>, Box<BlockHeader>),
+    L2Block(Arc<L2Block>),
     L2Reorg(Reorg),
 }
 
 fn send_notification(notification: Notification, notifications: &mut Notifications) {
     match notification {
-        Notification::L2Block(block, header) => {
+        Notification::L2Block(block) => {
             notifications
                 .block_headers
-                .send(header.into())
+                .send(Arc::new(block.header.clone()))
                 // Ignore errors in case nobody is listening. New listeners may subscribe in the
                 // future.
                 .ok();
             notifications
                 .l2_blocks
-                .send(block.into())
+                .send(block)
                 // Ignore errors in case nobody is listening. New listeners may subscribe in the
                 // future.
                 .ok();
@@ -1296,7 +1683,7 @@ mod tests {
                 state_update.with_parent_state_commitment(parent_state_commitment)
             });
 
-            let transactions = vec![
+            let transactions = [
                 Transaction {
                     hash: transaction_hash_bytes!(
                         &format!("declare v0 tx hash {block_num}").into_bytes()
@@ -1670,7 +2057,7 @@ mod tests {
         // Send block updates, followed by a reorg to genesis.
         for (a, b, c, d, e) in block_data {
             event_tx
-                .send(SyncEvent::Block(a, b, c, d, e))
+                .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                 .await
                 .unwrap();
         }
@@ -1685,6 +2072,7 @@ mod tests {
             pending_data: tx,
             verify_tree_hashes: false,
             notifications: Default::default(),
+            sync_to_consensus_tx: None,
         };
 
         let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -1720,7 +2108,7 @@ mod tests {
         // Send block updates, followed by a reorg to genesis.
         for (a, b, c, d, e) in generate_block_data() {
             event_tx
-                .send(SyncEvent::Block(a, b, c, d, e))
+                .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                 .await
                 .unwrap();
         }
@@ -1739,6 +2127,7 @@ mod tests {
             pending_data: tx,
             verify_tree_hashes: false,
             notifications: Default::default(),
+            sync_to_consensus_tx: None,
         };
 
         let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -1779,7 +2168,7 @@ mod tests {
         let block2 = blocks[2].clone();
         for (a, b, c, d, e) in blocks {
             event_tx
-                .send(SyncEvent::Block(a, b, c, d, e))
+                .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                 .await
                 .unwrap();
         }
@@ -1791,7 +2180,7 @@ mod tests {
         // updated after a reorg, causing the reorg'd block numbers to be considered
         // duplicates and skipped - breaking sync.
         event_tx
-            .send(SyncEvent::Block(
+            .send(SyncEvent::DownloadedBlock(
                 block2.0, block2.1, block2.2, block2.3, block2.4,
             ))
             .await
@@ -1807,6 +2196,7 @@ mod tests {
             pending_data: tx,
             verify_tree_hashes: false,
             notifications: Default::default(),
+            sync_to_consensus_tx: None,
         };
 
         let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -1841,7 +2231,7 @@ mod tests {
         // Send block updates, followed by a reorg to genesis.
         for (a, b, c, d, e) in generate_block_data() {
             event_tx
-                .send(SyncEvent::Block(a, b, c, d, e))
+                .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                 .await
                 .unwrap();
         }
@@ -1860,6 +2250,7 @@ mod tests {
             pending_data: tx,
             verify_tree_hashes: false,
             notifications: Default::default(),
+            sync_to_consensus_tx: None,
         };
 
         let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -1902,6 +2293,7 @@ mod tests {
             pending_data: tx,
             verify_tree_hashes: false,
             notifications: Default::default(),
+            sync_to_consensus_tx: None,
         };
 
         let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -1933,6 +2325,7 @@ mod tests {
                 sierra_hash: SierraHash(class_hash),
                 casm_definition: b"casm definition".to_vec(),
                 casm_hash: casm_hash_bytes!(b"casm hash"),
+                casm_hash_v2: casm_hash_bytes!(b"casm hash blake"),
             })
             .await
             .unwrap();
@@ -1947,6 +2340,7 @@ mod tests {
             pending_data: tx,
             verify_tree_hashes: false,
             notifications: Default::default(),
+            sync_to_consensus_tx: None,
         };
 
         let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -1956,6 +2350,9 @@ mod tests {
         let definition = tx.class_definition(ClassHash(class_hash)).unwrap().unwrap();
 
         assert_eq!(definition, expected_definition);
+
+        let casm_hash_v2 = tx.casm_hash_v2(ClassHash(class_hash)).unwrap().unwrap();
+        assert_eq!(casm_hash_v2, casm_hash_bytes!(b"casm hash blake"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1972,7 +2369,7 @@ mod tests {
         let (a, b, c, d, e) = blocks[0].clone();
 
         event_tx
-            .send(SyncEvent::Block(
+            .send(SyncEvent::DownloadedBlock(
                 a.clone(),
                 b.clone(),
                 c.clone(),
@@ -1982,7 +2379,7 @@ mod tests {
             .await
             .unwrap();
         event_tx
-            .send(SyncEvent::Block(a.clone(), b.clone(), c, d, e))
+            .send(SyncEvent::DownloadedBlock(a.clone(), b.clone(), c, d, e))
             .await
             .unwrap();
         drop(event_tx);
@@ -1995,6 +2392,7 @@ mod tests {
             pending_data: tx,
             verify_tree_hashes: false,
             notifications: Default::default(),
+            sync_to_consensus_tx: None,
         };
 
         let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2188,7 +2586,7 @@ mod tests {
             // Send block updates.
             for (a, b, c, d, e) in blocks {
                 event_tx
-                    .send(SyncEvent::Block(a, b, c, d, e))
+                    .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                     .await
                     .unwrap();
             }
@@ -2207,6 +2605,7 @@ mod tests {
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications,
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2249,7 +2648,7 @@ mod tests {
             // Send block updates.
             for (a, b, c, d, e) in blocks {
                 event_tx
-                    .send(SyncEvent::Block(a, b, c, d, e))
+                    .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                     .await
                     .unwrap();
             }
@@ -2266,6 +2665,7 @@ mod tests {
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications: Default::default(),
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2348,7 +2748,7 @@ mod tests {
             // Send block updates.
             for (a, b, c, d, e) in blocks {
                 event_tx
-                    .send(SyncEvent::Block(a, b, c, d, e))
+                    .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                     .await
                     .unwrap();
             }
@@ -2367,6 +2767,7 @@ mod tests {
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications,
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2393,6 +2794,7 @@ mod tests {
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications,
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2424,6 +2826,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications,
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2452,7 +2855,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
             // Send block updates.
             for (a, b, c, d, e) in blocks {
                 event_tx
-                    .send(SyncEvent::Block(a, b, c, d, e))
+                    .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                     .await
                     .unwrap();
             }
@@ -2471,6 +2874,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications,
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2500,6 +2904,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications,
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2540,7 +2945,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
             // Send block updates.
             for (a, b, c, d, e) in blocks {
                 event_tx
-                    .send(SyncEvent::Block(a, b, c, d, e))
+                    .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                     .await
                     .unwrap();
             }
@@ -2557,6 +2962,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications: Default::default(),
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2650,7 +3056,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
             // Send block updates.
             for (a, b, c, d, e) in blocks.into_iter() {
                 event_tx
-                    .send(SyncEvent::Block(a, b, c, d, e))
+                    .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                     .await
                     .unwrap();
             }
@@ -2677,6 +3083,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications: Default::default(),
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2748,7 +3155,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
             // Send all but one block update.
             for (a, b, c, d, e) in blocks.into_iter() {
                 event_tx
-                    .send(SyncEvent::Block(a, b, c, d, e))
+                    .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                     .await
                     .unwrap();
             }
@@ -2765,6 +3172,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications: Default::default(),
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2785,7 +3193,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
             // Send the last block update.
             let (a, b, c, d, e) = last_block;
             event_tx
-                .send(SyncEvent::Block(a, b, c, d, e))
+                .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                 .await
                 .unwrap();
             // Close the event channel which allows the consumer task to exit.
@@ -2801,6 +3209,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications: Default::default(),
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());
@@ -2837,6 +3246,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
             let sierra_definition = b"sierra definition".to_vec();
             let casm_definition = b"casm definition".to_vec();
             let casm_hash = casm_hash_bytes!(b"casm hash");
+            let casm_hash_v2 = casm_hash_bytes!(b"casm hash blake");
 
             // Add the class definition.
             event_tx
@@ -2845,6 +3255,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                     sierra_hash: removed_class_hash,
                     casm_definition,
                     casm_hash,
+                    casm_hash_v2,
                 })
                 .await
                 .unwrap();
@@ -2853,7 +3264,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
             let blocks = block_data_with_state_updates(reorg_regression_data.state_updates);
             for (a, b, c, d, e) in blocks {
                 event_tx
-                    .send(SyncEvent::Block(a, b, c, d, e))
+                    .send(SyncEvent::DownloadedBlock(a, b, c, d, e))
                     .await
                     .unwrap();
             }
@@ -2875,6 +3286,7 @@ Blockchain history must include the reorg tail and its parent block to perform a
                 pending_data: tx,
                 verify_tree_hashes: false,
                 notifications: Default::default(),
+                sync_to_consensus_tx: None,
             };
 
             let (tx, _rx) = tokio::sync::watch::channel(Default::default());

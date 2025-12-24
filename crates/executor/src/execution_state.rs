@@ -13,6 +13,7 @@ use pathfinder_common::prelude::*;
 use pathfinder_common::L1DataAvailabilityMode;
 use starknet_api::block::{BlockHashAndNumber, GasPrice, NonzeroGasPrice};
 use starknet_api::core::PatriciaKey;
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 
 use super::pending::PendingStateReader;
 use super::state_reader::PathfinderStateReader;
@@ -60,7 +61,7 @@ impl VersionedConstantsMap {
     }
 
     pub fn latest_version() -> StarknetVersion {
-        versions::STARKNET_VERSION_0_14_0
+        versions::STARKNET_VERSION_0_14_1
     }
 
     fn fill_default(data: &mut BTreeMap<StarknetVersion, Cow<'static, VersionedConstants>>) {
@@ -166,6 +167,7 @@ pub struct ExecutionState {
     eth_fee_address: ContractAddress,
     strk_fee_address: ContractAddress,
     native_class_cache: Option<NativeClassCache>,
+    native_execution_force_use_for_incompatible_classes: bool,
     is_l3: bool,
 }
 
@@ -271,6 +273,7 @@ impl ExecutionState {
             block_number,
             self.pending_state.is_some(),
             self.native_class_cache,
+            self.native_execution_force_use_for_incompatible_classes,
         );
         let pending_state_reader = PendingStateReader::new(raw_reader, self.pending_state.clone());
 
@@ -409,6 +412,7 @@ impl ExecutionState {
         eth_fee_address: ContractAddress,
         strk_fee_address: ContractAddress,
         native_class_cache: Option<NativeClassCache>,
+        native_execution_force_use_for_incompatible_classes: bool,
     ) -> Self {
         Self {
             chain_id,
@@ -420,6 +424,7 @@ impl ExecutionState {
             eth_fee_address,
             strk_fee_address,
             native_class_cache,
+            native_execution_force_use_for_incompatible_classes,
             is_l3,
         }
     }
@@ -435,6 +440,7 @@ impl ExecutionState {
         eth_fee_address: ContractAddress,
         strk_fee_address: ContractAddress,
         native_class_cache: Option<NativeClassCache>,
+        native_execution_force_use_for_incompatible_classes: bool,
     ) -> Self {
         Self {
             chain_id,
@@ -446,6 +452,7 @@ impl ExecutionState {
             eth_fee_address,
             strk_fee_address,
             native_class_cache,
+            native_execution_force_use_for_incompatible_classes,
             is_l3,
         }
     }
@@ -471,6 +478,7 @@ impl ExecutionState {
             eth_fee_address,
             strk_fee_address,
             native_class_cache,
+            native_execution_force_use_for_incompatible_classes: false,
             is_l3,
         }
     }

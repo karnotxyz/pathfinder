@@ -404,6 +404,14 @@ This should only be enabled for debugging purposes as it adds substantial proces
     )]
     fee_estimation_epsilon: Percentage,
 
+    #[arg(
+        long = "rpc.block-trace-cache-size",
+        long_help = "Number of block traces to cache in memory for RPC calls.",
+        default_value = "128",
+        env = "PATHFINDER_RPC_BLOCK_TRACE_CACHE_SIZE"
+    )]
+    rpc_block_trace_cache_size: std::num::NonZeroUsize,
+
     #[cfg_attr(
         all(
             feature = "consensus-integration-tests",
@@ -635,6 +643,24 @@ struct NativeExecutionCli {
         env = "PATHFINDER_RPC_NATIVE_EXECUTION_CLASS_CACHE_SIZE"
     )]
     class_cache_size: NonZeroUsize,
+
+    #[arg(
+        long = "rpc.native-execution-compiler-optimization-level",
+        long_help = "Optimization level for the Cairo native compiler. Valid values are 0(none), 1 (less), 2 (default), and 3 (aggressive).",
+        action = clap::ArgAction::Set,
+        default_value = "2",
+        env = "PATHFINDER_RPC_NATIVE_EXECUTION_COMPILER_OPTIMIZATION_LEVEL"
+    )]
+    optimization_level: u8,
+
+    #[arg(
+        long = "rpc.native-execution-force-use-for-incompatible-classes",
+        long_help = "Force use of Cairo native execution even for Sierra classes before 1.7.0 that are known to result in incorrect cost calculation.",
+        action = clap::ArgAction::Set,
+        default_value = "false",
+        env = "PATHFINDER_RPC_NATIVE_EXECUTION_FORCE_USE_FOR_INCOMPATIBLE_CLASSES"
+    )]
+    force_use_for_incompatible_classes: bool,
 }
 
 #[cfg(feature = "p2p")]
@@ -679,6 +705,17 @@ struct ConsensusCli {
         env = "PATHFINDER_CONSENSUS_PROPOSER_ADDRESSES",
     )]
     proposer_addresses: Vec<Felt>,
+
+    #[arg(
+        long = "consensus.history-depth",
+        long_help = "How many historical consensus engines (ie. those prior to the current one) to keep enabled. Warning! Setting this value to below 2 may stall small networks in some circumstances.",
+        action = clap::ArgAction::Set,
+        default_value = "10",
+        value_name = "DEPTH",
+        value_parser = clap::value_parser!(u64).range(0..=10),
+        env = "PATHFINDER_CONSENSUS_HISTORY_DEPTH",
+    )]
+    history_depth: u64,
 }
 
 #[derive(clap::ValueEnum, Clone, serde::Deserialize)]
@@ -871,6 +908,7 @@ pub struct Config {
     pub native_execution: NativeExecutionConfig,
     pub submission_tracker_time_limit: NonZeroU64,
     pub submission_tracker_size_limit: NonZeroUsize,
+    pub rpc_block_trace_cache_size: NonZeroUsize,
     pub consensus: Option<ConsensusConfig>,
     /// Integration testing config, only available on debug builds with `p2p`
     /// and `consensus-integration-tests` features enabled.
@@ -905,6 +943,8 @@ pub struct DebugConfig {
 pub struct NativeExecutionConfig {
     enabled: bool,
     class_cache_size: NonZeroUsize,
+    optimization_level: u8,
+    force_use_for_incompatible_classes: bool,
 }
 
 #[cfg(not(feature = "cairo-native"))]
@@ -920,6 +960,9 @@ pub struct ConsensusConfig {
     pub validator_addresses: Vec<ContractAddress>,
     /// The proposer addresses of all proposers in the proposer set.
     pub proposer_addresses: Vec<ContractAddress>,
+    /// How many historical consensus engines (ie. those prior to the current
+    /// one) to keep enabled.
+    pub history_depth: u64,
 }
 
 #[cfg(not(feature = "p2p"))]
@@ -1009,6 +1052,14 @@ impl NativeExecutionConfig {
     pub fn class_cache_size(&self) -> NonZeroUsize {
         NonZeroUsize::new(1).unwrap()
     }
+
+    pub fn optimization_level(&self) -> u8 {
+        0
+    }
+
+    pub fn force_use_for_incompatible_classes(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "cairo-native")]
@@ -1017,6 +1068,8 @@ impl NativeExecutionConfig {
         Self {
             enabled: args.is_native_execution_enabled,
             class_cache_size: args.class_cache_size,
+            optimization_level: args.optimization_level,
+            force_use_for_incompatible_classes: args.force_use_for_incompatible_classes,
         }
     }
 
@@ -1026,6 +1079,14 @@ impl NativeExecutionConfig {
 
     pub fn class_cache_size(&self) -> NonZeroUsize {
         self.class_cache_size
+    }
+
+    pub fn optimization_level(&self) -> u8 {
+        self.optimization_level
+    }
+
+    pub fn force_use_for_incompatible_classes(&self) -> bool {
+        self.force_use_for_incompatible_classes
     }
 }
 
@@ -1075,6 +1136,7 @@ impl ConsensusConfig {
                     .into_iter()
                     .map(ContractAddress)
                     .collect(),
+                history_depth: consensus_cli.history_depth,
             }
         })
     }
@@ -1137,6 +1199,7 @@ impl Config {
             native_execution: NativeExecutionConfig::parse(cli.native_execution),
             submission_tracker_time_limit: cli.submission_tracker_time_limit,
             submission_tracker_size_limit: cli.submission_tracker_size_limit,
+            rpc_block_trace_cache_size: cli.rpc_block_trace_cache_size,
             consensus: ConsensusConfig::parse_or_exit(cli.consensus),
             integration_testing: integration_testing::IntegrationTestingConfig::parse(
                 cli.integration_testing,

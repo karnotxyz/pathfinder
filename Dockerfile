@@ -9,7 +9,7 @@
 # Note that we're explicitly using the Debian bookworm image to make sure we're
 # compatible with the Debian container we'll be copying the pathfinder
 # executable to.
-FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:0.1.72-rust-1.88.0-slim-bookworm AS cargo-chef
+FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:0.1.73-rust-1.91.1-slim-bookworm AS cargo-chef
 WORKDIR /usr/src/pathfinder
 
 FROM --platform=$BUILDPLATFORM cargo-chef AS rust-planner
@@ -53,7 +53,7 @@ RUN groupadd --gid 1000 pathfinder && useradd --no-log-init --uid 1000 --gid pat
 COPY --from=rust-builder /usr/src/pathfinder/pathfinder-${TARGETARCH} /usr/local/bin/pathfinder
 
 # Hack to enable `ld` link with glibc without the libc6-dev package being installed
-RUN if [[ ${TARGETARCH} == "amd64" ]]; then ln -s /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libc.so; fi
+RUN if [ "${TARGETARCH}" = "amd64" ]; then ln -s /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libc.so; fi
 
 # Create directory and volume for persistent data
 RUN install --owner 1000 --group 1000 --mode 0755 -d /usr/share/pathfinder/data

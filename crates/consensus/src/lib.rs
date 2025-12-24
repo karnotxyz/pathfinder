@@ -169,10 +169,12 @@ use serde::{Deserialize, Serialize};
 
 // Re-export consensus types needed by the public API
 pub use crate::config::{Config, TimeoutValues};
+pub use crate::error::ConsensusError;
 use crate::internal::{InternalConsensus, InternalParams};
-use crate::wal::{FileWalSink, NoopWal, WalSink};
+use crate::wal::{delete_wal_file, FileWalSink, NoopWal, WalSink};
 
 mod config;
+mod error;
 mod internal;
 mod wal;
 
@@ -327,6 +329,7 @@ pub struct Consensus<
     config: Config<A>,
     proposer_selector: P,
     min_kept_height: Option<u64>,
+    last_decided_height: Option<u64>,
 }
 
 impl<
@@ -355,6 +358,7 @@ impl<
             config,
             proposer_selector: RoundRobinProposerSelector,
             min_kept_height: None,
+            last_decided_height: None,
         }
     }
 
@@ -384,6 +388,7 @@ impl<
             config,
             proposer_selector,
             min_kept_height: None,
+            last_decided_height: None,
         }
     }
 
@@ -397,6 +402,7 @@ impl<
     ///
     /// - `config`: The consensus configuration
     /// - `validator_sets`: A provider for validator sets at different heights
+    /// - `highest_committed`: The highest committed block in main storage
     ///
     /// ## Example
     ///
@@ -407,13 +413,13 @@ impl<
     pub fn recover<VS: ValidatorSetProvider<A> + 'static>(
         config: Config<A>,
         validator_sets: Arc<VS>,
-        highest_finalized: Option<u64>,
+        highest_committed: Option<u64>,
     ) -> anyhow::Result<DefaultConsensus<V, A>> {
         Self::recover_inner(
             Self::new(config.clone()),
             config,
             validator_sets,
-            highest_finalized,
+            highest_committed,
         )
     }
 
@@ -443,13 +449,13 @@ impl<
         config: Config<A>,
         validator_sets: Arc<VS>,
         proposer_selector: PS,
-        highest_finalized: Option<u64>,
+        highest_committed: Option<u64>,
     ) -> anyhow::Result<Consensus<V, A, PS>> {
         Self::recover_inner(
             Self::with_proposer_selector(config.clone(), proposer_selector),
             config,
             validator_sets,
-            highest_finalized,
+            highest_committed,
         )
     }
 
@@ -460,7 +466,7 @@ impl<
         mut consensus: Consensus<V, A, PS>,
         config: Config<A>,
         validator_sets: Arc<VS>,
-        highest_finalized: Option<u64>,
+        highest_committed: Option<u64>,
     ) -> anyhow::Result<Consensus<V, A, PS>> {
         use crate::wal::recovery;
 
@@ -471,15 +477,19 @@ impl<
         );
 
         // Read the write-ahead log and recover all incomplete heights.
-        let incomplete_heights =
-            match recovery::recover_incomplete_heights(&config.wal_dir, highest_finalized) {
-                Ok(heights) => {
+        // This also returns finalized heights and the highest Decision height found
+        // (even in finalized heights).
+        let (incomplete_heights, finalized_heights, highest_decision) =
+            match recovery::recover_incomplete_heights(&config.wal_dir, highest_committed) {
+                Ok((incomplete, finalized, decision_height)) => {
                     tracing::info!(
                         validator = ?config.address,
-                        incomplete_heights = heights.len(),
-                        "Found incomplete heights to recover"
+                        incomplete_heights = incomplete.len(),
+                        finalized_heights = finalized.len(),
+                        highest_decision = ?decision_height,
+                        "Found incomplete and finalized heights in WAL"
                     );
-                    heights
+                    (incomplete, finalized, decision_height)
                 }
                 Err(e) => {
                     tracing::error!(
@@ -488,9 +498,73 @@ impl<
                         error = %e,
                         "Failed to recover incomplete heights from WAL"
                     );
-                    Vec::new()
+                    (Vec::new(), Vec::new(), None)
                 }
             };
+
+        // Set last_decided_height from the highest Decision found during recovery.
+        consensus.last_decided_height = highest_decision;
+        if let Some(h) = highest_decision {
+            tracing::info!(
+                validator = ?consensus.config.address,
+                last_decided_height = %h,
+                "Set last_decided_height from WAL recovery"
+            );
+        }
+
+        // Determine the maximum height we're recovering (incomplete or finalized).
+        let max_height = incomplete_heights
+            .iter()
+            .chain(finalized_heights.iter())
+            .map(|(height, _)| *height)
+            .max()
+            .or(highest_decision);
+
+        // Calculate the minimum height to keep based on history_depth.
+        // This matches the pruning logic used during normal operation.
+        let min_height_to_restore =
+            max_height.and_then(|max| max.checked_sub(config.history_depth));
+
+        // Restore finalized heights that are within history_depth.
+        // This ensures we can accept votes for these heights, matching the behavior
+        // during normal operation where finalized heights remain in memory until
+        // pruned.
+        for (height, entries) in finalized_heights {
+            // Only restore finalized heights that are within history_depth.
+            // (if max_height < history_depth, restore all finalized heights)
+            let should_restore = min_height_to_restore
+                .map(|min| height >= min)
+                .unwrap_or(true);
+
+            if should_restore {
+                tracing::info!(
+                    validator = ?consensus.config.address,
+                    height = %height,
+                    "Restoring finalized height within history_depth"
+                );
+
+                let validator_set = validator_sets.get_validator_set(height)?;
+                let mut internal_consensus = consensus.create_consensus(height, &validator_set);
+
+                // Recover from WAL first to restore the engine state.
+                internal_consensus.recover_from_wal(entries);
+
+                // Only call StartHeight if the height is not already finalized.
+                if !internal_consensus.is_finalized() {
+                    internal_consensus
+                        .handle_command(ConsensusCommand::StartHeight(height, validator_set));
+                }
+
+                consensus.internal.insert(height, internal_consensus);
+            } else {
+                tracing::debug!(
+                    validator = ?consensus.config.address,
+                    height = %height,
+                    min_height = ?min_height_to_restore,
+                    "Skipping finalized height outside history_depth"
+                );
+            }
+        }
 
         // Manually recover all incomplete heights.
         for (height, entries) in incomplete_heights {
@@ -498,7 +572,7 @@ impl<
                 validator = ?consensus.config.address,
                 height = %height,
                 entry_count = entries.len(),
-                "Recovering height from WAL"
+                "Recovering incomplete height from WAL"
             );
 
             let validator_set = validator_sets.get_validator_set(height)?;
@@ -508,9 +582,15 @@ impl<
             consensus.internal.insert(height, internal_consensus);
         }
 
+        // Set min_kept_height to match what we've restored, so that is_height_finalized
+        // correctly identifies finalized heights that were pruned.
+        consensus.min_kept_height = min_height_to_restore;
+
         tracing::info!(
             validator = ?consensus.config.address,
             recovered_heights = consensus.internal.len(),
+            last_decided_height = ?consensus.last_decided_height,
+            min_kept_height = ?consensus.min_kept_height,
             "Completed consensus recovery"
         );
 
@@ -647,9 +727,15 @@ impl<
                     event = ?event,
                     "Engine returned event"
                 );
-                // Track finished heights.
+                // Track finished heights and update last_decided_height.
                 if let ConsensusEvent::Decision { height, .. } = &event {
                     finished_heights.push(*height);
+                    // Update last_decided_height to track the highest decided height.
+                    self.last_decided_height = Some(
+                        self.last_decided_height
+                            .map(|h| h.max(*height))
+                            .unwrap_or(*height),
+                    );
                 }
                 // Push the event to the queue.
                 self.event_queue.push_back(event);
@@ -672,14 +758,38 @@ impl<
             let new_min_height = max_height.checked_sub(self.config.history_depth);
 
             if let Some(new_min) = new_min_height {
+                // Collect heights that will be pruned (before we remove them from the map).
+                let pruned_heights: Vec<u64> = self
+                    .internal
+                    .keys()
+                    .filter(|height| **height < new_min)
+                    .copied()
+                    .collect();
+
+                // Prune the internal map and set the new min_kept_height.
                 self.min_kept_height = Some(new_min);
                 self.internal.retain(|height, _| *height >= new_min);
+
+                // Delete WAL files for pruned heights.
+                for height in &pruned_heights {
+                    if let Err(e) =
+                        delete_wal_file(&self.config.address, *height, &self.config.wal_dir)
+                    {
+                        tracing::warn!(
+                            validator = ?self.config.address,
+                            height = %height,
+                            error = %e,
+                            "Failed to delete WAL file for pruned height"
+                        );
+                    }
+                }
 
                 tracing::debug!(
                     validator = ?self.config.address,
                     min_height = %new_min,
                     max_height = %max_height,
-                    "Pruned old consensus engines"
+                    pruned_count = pruned_heights.len(),
+                    "Pruned old consensus engines and deleted WAL files"
                 );
             }
         }
@@ -718,9 +828,37 @@ impl<
         }
     }
 
-    /// Get the current maximum height being tracked by the consensus engine.
-    pub fn current_height(&self) -> Option<u64> {
+    /// Check if a specific height is actively tracked by the consensus engine.
+    ///
+    /// ## Arguments
+    ///
+    /// - `height`: The height to check
+    ///
+    /// ## Returns
+    ///
+    /// Returns `true` if the height is active, `false` otherwise.
+    pub fn is_height_active(&self, height: u64) -> bool {
+        self.internal.contains_key(&height)
+    }
+
+    /// Get the maximum height actively being tracked by the consensus engine.
+    ///
+    /// This returns the highest height that consensus is currently working on,
+    /// which includes incomplete heights that haven't reached a decision yet.
+    /// Returns `None` if there are no actively tracked heights.
+    pub fn max_active_height(&self) -> Option<u64> {
         self.internal.keys().max().copied()
+    }
+
+    /// Get the highest height that consensus has decided on.
+    ///
+    /// This returns the highest height that has a Decision entry, even if that
+    /// height is no longer actively tracked (e.g., after recovery when it was
+    /// skipped).
+    ///
+    /// Returns `None` if no decisions have been made yet.
+    pub fn last_decided_height(&self) -> Option<u64> {
+        self.last_decided_height
     }
 }
 
@@ -1073,7 +1211,7 @@ pub enum ConsensusEvent<V, A> {
     ///
     /// The application should handle this error appropriately, possibly by
     /// logging it or taking corrective action.
-    Error(anyhow::Error),
+    Error(ConsensusError),
 }
 
 impl<V: Debug, A: Debug> std::fmt::Debug for ConsensusEvent<V, A> {

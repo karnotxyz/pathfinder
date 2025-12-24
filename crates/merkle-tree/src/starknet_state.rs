@@ -43,7 +43,9 @@ pub fn update_starknet_state(
                                 .into())
                             }
                         };
-                        let transaction = connection.transaction()?;
+                        let transaction = connection
+                            .transaction()
+                            .map_err(|e| StateUpdateError::StorageError(e.into()))?;
                         update_contract_state(
                             **contract_address,
                             update.storage,
@@ -116,7 +118,11 @@ pub fn update_starknet_state(
     }
     .with_verify_hashes(verify_hashes);
 
-    for (sierra, casm) in state_update.declared_sierra_classes {
+    for (sierra, casm) in state_update
+        .declared_sierra_classes
+        .iter()
+        .chain(state_update.migrated_compiled_classes.iter())
+    {
         let leaf_hash = pathfinder_common::calculate_class_commitment_leaf_hash(*casm);
 
         transaction

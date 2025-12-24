@@ -22,6 +22,7 @@ pub mod hash;
 mod header;
 pub mod integration_testing;
 mod l1;
+mod l2;
 mod macros;
 pub mod prelude;
 pub mod receipt;
@@ -33,6 +34,7 @@ pub mod trie;
 
 pub use header::{BlockHeader, BlockHeaderBuilder, L1DataAvailabilityMode, SignedBlockHeader};
 pub use l1::{L1BlockNumber, L1TransactionHash};
+pub use l2::{ConsensusFinalizedBlockHeader, ConsensusFinalizedL2Block, L2Block, L2BlockToCommit};
 pub use signature::BlockCommitmentSignature;
 pub use state_update::StateUpdate;
 
@@ -689,10 +691,12 @@ pub fn calculate_class_commitment_leaf_hash(
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct ConsensusInfo {
-    pub highest_decided_height: BlockNumber,
-    pub highest_decided_value: ProposalCommitment,
+    /// Highest decided height and value.
+    pub highest_decision: Option<(BlockNumber, ProposalCommitment)>,
+    /// Track the number of times peer scores were changed.
+    pub peer_score_change_counter: u64,
 }
 
 #[cfg(test)]

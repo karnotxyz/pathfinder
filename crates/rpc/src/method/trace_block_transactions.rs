@@ -146,6 +146,9 @@ pub async fn trace_block_transactions(
             context.contract_addresses.eth_l2_token_address,
             context.contract_addresses.strk_l2_token_address,
             context.native_class_cache,
+            context
+                .config
+                .native_execution_force_use_for_incompatible_classes,
         );
         let traces =
             match pathfinder_executor::trace(db_tx, state, cache, hash, executor_transactions) {
@@ -646,6 +649,12 @@ impl From<anyhow::Error> for TraceBlockTransactionsError {
     }
 }
 
+impl From<pathfinder_storage::StorageError> for TraceBlockTransactionsError {
+    fn from(value: pathfinder_storage::StorageError) -> Self {
+        Self::Internal(value.into())
+    }
+}
+
 impl From<TraceBlockTransactionsError> for crate::error::ApplicationError {
     fn from(value: TraceBlockTransactionsError) -> Self {
         match value {
@@ -717,14 +726,14 @@ pub(crate) mod tests {
         let context = RpcContext::for_tests().with_storage(storage.clone());
 
         let (next_block_header, transactions, traces) = {
-            let mut db = storage.connection()?;
+            let mut db = storage.connection().map_err(anyhow::Error::from)?;
             let tx = db.transaction()?;
 
-            tx.insert_sierra_class(
+            tx.insert_sierra_class_definition(
                 &SierraHash(fixtures::SIERRA_HASH.0),
                 fixtures::SIERRA_DEFINITION,
-                &fixtures::CASM_HASH,
                 fixtures::CASM_DEFINITION,
+                &casm_hash_bytes!(b"casm hash blake"),
             )?;
 
             let next_block_header = BlockHeader::child_builder(&last_block_header)
@@ -905,7 +914,7 @@ pub(crate) mod tests {
         ) = setup_storage_with_starknet_version(StarknetVersion::new(0, 13, 1, 1)).await;
         let context = RpcContext::for_tests().with_storage(storage.clone());
 
-        let transactions = vec![
+        let transactions = &[
             fixtures::input::declare(account_contract_address).try_into_common(context.chain_id)?,
             fixtures::input::universal_deployer(
                 account_contract_address,
@@ -915,7 +924,7 @@ pub(crate) mod tests {
             fixtures::input::invoke(account_contract_address).try_into_common(context.chain_id)?,
         ];
 
-        let traces = vec![
+        let traces = &[
             fixtures::expected_output_0_13_1_1::declare(
                 account_contract_address,
                 &last_block_header,
@@ -933,14 +942,14 @@ pub(crate) mod tests {
         ];
 
         let pending_block = {
-            let mut db = storage.connection()?;
+            let mut db = storage.connection().map_err(anyhow::Error::from)?;
             let tx = db.transaction()?;
 
-            tx.insert_sierra_class(
+            tx.insert_sierra_class_definition(
                 &SierraHash(fixtures::SIERRA_HASH.0),
                 fixtures::SIERRA_DEFINITION,
-                &fixtures::CASM_HASH,
                 fixtures::CASM_DEFINITION,
+                &casm_hash_bytes!(b"casm hash blake"),
             )?;
 
             let dummy_receipt = Receipt {
@@ -1024,7 +1033,7 @@ pub(crate) mod tests {
         ) = setup_storage_with_starknet_version(StarknetVersion::new(0, 14, 0, 0)).await;
         let context = RpcContext::for_tests().with_storage(storage.clone());
 
-        let pre_latest_transactions = vec![
+        let pre_latest_transactions = [
             fixtures::input::declare(account_contract_address).try_into_common(context.chain_id)?,
             fixtures::input::universal_deployer(
                 account_contract_address,
@@ -1034,7 +1043,7 @@ pub(crate) mod tests {
             fixtures::input::invoke(account_contract_address).try_into_common(context.chain_id)?,
         ];
 
-        let traces = vec![
+        let traces = &[
             fixtures::expected_output_0_14_0_0::declare(
                 account_contract_address,
                 &last_block_header,
@@ -1052,14 +1061,14 @@ pub(crate) mod tests {
         ];
 
         let pending_data = {
-            let mut db = storage.connection()?;
+            let mut db = storage.connection().map_err(anyhow::Error::from)?;
             let tx = db.transaction()?;
 
-            tx.insert_sierra_class(
+            tx.insert_sierra_class_definition(
                 &SierraHash(fixtures::SIERRA_HASH.0),
                 fixtures::SIERRA_DEFINITION,
-                &fixtures::CASM_HASH,
                 fixtures::CASM_DEFINITION,
+                &casm_hash_bytes!(b"casm hash blake"),
             )?;
 
             let dummy_receipt = Receipt {
@@ -1088,7 +1097,7 @@ pub(crate) mod tests {
                 status: starknet_gateway_types::reply::Status::Pending,
                 timestamp: last_block_header.timestamp,
                 transaction_receipts,
-                transactions: pre_latest_transactions.clone(),
+                transactions: pre_latest_transactions.clone().into(),
                 starknet_version: last_block_header.starknet_version,
                 l1_da_mode: L1DataAvailabilityMode::Blob,
             };
@@ -1180,7 +1189,7 @@ pub(crate) mod tests {
             fixtures::input::invoke(account_contract_address).try_into_common(context.chain_id)?,
         ];
 
-        let traces = vec![
+        let traces = &[
             fixtures::expected_output_0_14_0_0::declare(
                 account_contract_address,
                 &last_block_header,
@@ -1198,14 +1207,14 @@ pub(crate) mod tests {
         ];
 
         let pending_data = {
-            let mut db = storage.connection()?;
+            let mut db = storage.connection().map_err(anyhow::Error::from)?;
             let tx = db.transaction()?;
 
-            tx.insert_sierra_class(
+            tx.insert_sierra_class_definition(
                 &SierraHash(fixtures::SIERRA_HASH.0),
                 fixtures::SIERRA_DEFINITION,
-                &fixtures::CASM_HASH,
                 fixtures::CASM_DEFINITION,
+                &casm_hash_bytes!(b"casm hash blake"),
             )?;
 
             let transaction_receipts: Vec<_> = pre_confirmed_transactions

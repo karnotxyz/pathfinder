@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/block-hashes",
+    "crates/casm-hashes",
     "crates/class-hash",
     "crates/common",
     "crates/compiler",
@@ -33,7 +34,7 @@ exclude = ["crates/load-test", "utils/pathfinder-probe"]
 resolver = "2"
 
 [workspace.package]
-version = "0.20.5"
+version = "0.21.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
@@ -48,14 +49,14 @@ axum = "0.8.4"
 base64 = "0.22.1"
 bincode = "2.0.1"
 bitvec = "1.0.1"
-blockifier = { version = "0.16.0-rc.1", features = ["node_api", "reexecution"] }
+blockifier = { version = "0.16.0-rc.2", features = ["node_api", "reexecution"] }
 bloomfilter = "1.0.16"
 bytes = "1.4.0"
 cached = "0.44.0"
 # This one needs to match the version used by blockifier
 cairo-lang-starknet-classes = "=2.12.3"
 # This one needs to match the version used by blockifier
-cairo-native = "0.6.0"
+cairo-native = "0.7.2"
 # This one needs to match the version used by blockifier
 cairo-vm = "=2.5.0"
 casm-compiler-v1_0_0-alpha6 = { package = "cairo-lang-starknet", git = "https://github.com/starkware-libs/cairo", tag = "v1.0.0-alpha.6" }
@@ -63,7 +64,7 @@ casm-compiler-v1_0_0-rc0 = { package = "cairo-lang-starknet", git = "https://git
 casm-compiler-v1_1_1 = { package = "cairo-lang-starknet", version = "=1.1.1" }
 casm-compiler-v2 = { package = "cairo-lang-starknet", version = "=2.12.3" }
 clap = "4.5.45"
-console-subscriber = "0.4.1"
+console-subscriber = "0.5"
 const-decoder = "0.4.0"
 const_format = "0.2.31"
 criterion = "0.5.1"
@@ -85,8 +86,8 @@ libp2p = { version = "0.55.0", default-features = false }
 libp2p-identity = "0.2.2"
 libp2p-plaintext = "0.43.0"
 libp2p-swarm-test = "0.5.0"
-metrics = "0.20.1"
-metrics-exporter-prometheus = "0.11.0"
+metrics = "0.24.3"
+metrics-exporter-prometheus = { version = "0.18.1", default-features = false }
 mime = "0.3"
 mockall = "0.11.4"
 num-bigint = "0.4.4"
@@ -112,6 +113,7 @@ reqwest = { version = "0.12.23", default-features = false, features = [
 ] }
 rstest = "0.18.2"
 rusqlite = "0.37.0"
+rustls = "0.23.35"
 semver = "1.0.18"
 serde = "1.0.192"
 serde_json = "1.0.142"
@@ -120,9 +122,9 @@ sha2 = "0.10.7"
 sha3 = "0.10"
 smallvec = "1.15.1"
 # This one needs to match the version used by blockifier
-starknet-types-core = "=0.2.3"
+starknet-types-core = "=0.2.4"
 # This one needs to match the version used by blockifier
-starknet_api = "0.16.0-rc.1"
+starknet_api = "0.16.0-rc.2"
 syn = "1.0"
 tempfile = "3.8"
 test-log = { version = "0.2.12", features = ["trace"] }

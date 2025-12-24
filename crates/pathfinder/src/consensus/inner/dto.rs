@@ -19,12 +19,12 @@ pub enum ProposalPart {
     Fin(ProposalFin),
     BlockInfo(BlockInfo),
     TransactionBatch(Vec<TransactionWithClass>),
-    ProposalCommitment(Box<ProposalCommitment>),
+    ExecutedTransactionCount(u64),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProposalInit {
-    pub block_number: u64,
+    pub height: u64,
     pub round: u32,
     pub valid_round: Option<u32>,
     pub proposer: MinimalFelt,
@@ -32,13 +32,13 @@ pub struct ProposalInit {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BlockInfo {
-    pub block_number: u64,
+    pub height: u64,
     pub builder: MinimalFelt,
     pub timestamp: u64,
     pub l2_gas_price_fri: u128,
     pub l1_gas_price_wei: u128,
     pub l1_data_gas_price_wei: u128,
-    pub eth_to_strk_rate: u128,
+    pub eth_to_fri_rate: u128,
     pub l1_da_mode: u8,
 }
 
@@ -51,28 +51,6 @@ pub struct ProposalFin {
 pub struct TransactionWithClass {
     pub variant: TransactionVariantWithClass,
     pub hash: MinimalFelt,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ProposalCommitment {
-    pub block_number: u64,
-    pub parent_commitment: MinimalFelt,
-    pub builder: MinimalFelt,
-    pub timestamp: u64,
-    pub protocol_version: String,
-    pub old_state_root: MinimalFelt,
-    pub version_constant_commitment: MinimalFelt,
-    pub state_diff_commitment: MinimalFelt,
-    pub transaction_commitment: MinimalFelt,
-    pub event_commitment: MinimalFelt,
-    pub receipt_commitment: MinimalFelt,
-    pub concatenated_counts: MinimalFelt,
-    pub l1_gas_price_fri: u128,
-    pub l1_data_gas_price_fri: u128,
-    pub l2_gas_price_fri: u128,
-    pub l2_gas_used: u128,
-    pub next_l2_gas_price_fri: u128,
-    pub l1_da_mode: u8,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -111,22 +89,20 @@ pub struct SierraEntryPoint {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub enum PersistentFinalizedBlock {
-    V0(FinalizedBlock),
+pub enum PersistentConsensusFinalizedBlock {
+    V0(ConsensusFinalizedBlock),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct FinalizedBlock {
-    pub header: BlockHeader,
+pub struct ConsensusFinalizedBlock {
+    pub header: ConsensusFinalizedBlockHeader,
     pub state_update: StateUpdateData,
     pub transactions_and_receipts: Vec<(TransactionV2, Receipt)>,
     pub events: Vec<Vec<pathfinder_common::event::Event>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct BlockHeader {
-    pub hash: pathfinder_common::BlockHash,
-    pub parent_hash: pathfinder_common::BlockHash,
+pub struct ConsensusFinalizedBlockHeader {
     pub number: pathfinder_common::BlockNumber,
     pub timestamp: pathfinder_common::BlockTimestamp,
     pub eth_l1_gas_price: pathfinder_common::GasPrice,
@@ -138,7 +114,6 @@ pub struct BlockHeader {
     pub sequencer_address: pathfinder_common::SequencerAddress,
     pub starknet_version: u32,
     pub event_commitment: pathfinder_common::EventCommitment,
-    pub state_commitment: pathfinder_common::StateCommitment,
     pub transaction_commitment: pathfinder_common::TransactionCommitment,
     pub transaction_count: u64,
     pub event_count: u64,
@@ -155,6 +130,8 @@ pub struct StateUpdateData {
         LinearMap<pathfinder_common::ContractAddress, SystemContractUpdate>,
     pub declared_cairo_classes: Vec<pathfinder_common::ClassHash>,
     pub declared_sierra_classes:
+        LinearMap<pathfinder_common::SierraHash, pathfinder_common::CasmHash>,
+    pub migrated_compiled_classes:
         LinearMap<pathfinder_common::SierraHash, pathfinder_common::CasmHash>,
 }
 

@@ -73,8 +73,11 @@ pub struct RpcConfig {
     pub versioned_constants_map: VersionedConstantsMap,
     pub native_execution: bool,
     pub native_class_cache_size: NonZeroUsize,
+    pub native_compiler_optimization_level: u8,
+    pub native_execution_force_use_for_incompatible_classes: bool,
     pub submission_tracker_time_limit: NonZeroU64,
     pub submission_tracker_size_limit: NonZeroUsize,
+    pub block_trace_cache_size: NonZeroUsize,
 }
 
 #[derive(Clone)]
@@ -94,7 +97,7 @@ pub struct RpcContext {
     pub ethereum: EthereumClient,
     pub config: RpcConfig,
     pub native_class_cache: Option<NativeClassCache>,
-    pub consensus_info_watch: Option<watch::Receiver<Option<ConsensusInfo>>>,
+    pub consensus_info_watch: Option<watch::Receiver<ConsensusInfo>>,
 }
 
 impl RpcContext {
@@ -118,12 +121,15 @@ impl RpcContext {
         );
         let pending_watcher = PendingWatcher::new(pending_data.clone());
         let native_class_cache = if config.native_execution {
-            Some(NativeClassCache::spawn(config.native_class_cache_size))
+            Some(NativeClassCache::spawn(
+                config.native_class_cache_size,
+                config.native_compiler_optimization_level,
+            ))
         } else {
             None
         };
         Self {
-            cache: Default::default(),
+            cache: TraceCache::with_size(config.block_trace_cache_size),
             storage,
             execution_storage,
             sync_status,
@@ -167,7 +173,7 @@ impl RpcContext {
 
     pub fn with_consensus_info_watch(
         self,
-        consensus_info_watch: watch::Receiver<Option<ConsensusInfo>>,
+        consensus_info_watch: watch::Receiver<ConsensusInfo>,
     ) -> Self {
         Self {
             consensus_info_watch: Some(consensus_info_watch),
@@ -241,8 +247,11 @@ impl RpcContext {
             versioned_constants_map: Default::default(),
             native_execution: true,
             native_class_cache_size: NonZeroUsize::new(10).unwrap(),
+            native_compiler_optimization_level: 0,
+            native_execution_force_use_for_incompatible_classes: false,
             submission_tracker_time_limit: NonZeroU64::new(300).unwrap(),
             submission_tracker_size_limit: NonZeroUsize::new(30000).unwrap(),
+            block_trace_cache_size: NonZeroUsize::new(1).unwrap(),
         };
 
         let ethereum =

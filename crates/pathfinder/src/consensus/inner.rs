@@ -4,39 +4,52 @@ mod conv;
 mod dto;
 mod fetch_proposers;
 mod fetch_validators;
+mod gossip_retry;
+mod integration_testing;
 mod p2p_task;
 mod persist_proposals;
 
 #[cfg(test)]
 mod test_helpers;
 
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use anyhow::Context;
-use p2p::consensus::{Client, Event, HeightAndRound};
+use p2p::consensus::{Event, HeightAndRound};
 use p2p_proto::consensus::ProposalPart;
-use pathfinder_common::{ChainId, ContractAddress, ProposalCommitment};
+use pathfinder_common::{
+    BlockNumber,
+    BlockTimestamp,
+    ChainId,
+    ConsensusFinalizedBlockHeader,
+    ConsensusFinalizedL2Block,
+    ConsensusInfo,
+    ContractAddress,
+    ProposalCommitment,
+    StarknetVersion,
+};
 use pathfinder_consensus::{ConsensusCommand, ConsensusEvent, NetworkMessage};
-use pathfinder_storage::pruning::BlockchainHistoryMode;
-use pathfinder_storage::{JournalMode, Storage, TriePruneMode};
+use pathfinder_storage::consensus::open_consensus_storage;
+use pathfinder_storage::Storage;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
-use super::ConsensusTaskHandles;
-use crate::config::{integration_testing, ConsensusConfig};
-use crate::validator::FinalizedBlock;
+use super::{ConsensusChannels, ConsensusTaskHandles};
+use crate::config::integration_testing::InjectFailureConfig;
+use crate::config::ConsensusConfig;
+use crate::SyncMessageToConsensus;
 
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     config: ConsensusConfig,
     chain_id: ChainId,
-    storage: Storage,
-    wal_directory: PathBuf,
-    p2p_client: Client,
+    main_storage: Storage,
+    p2p_consensus_client: p2p::consensus::Client,
     p2p_event_rx: mpsc::UnboundedReceiver<Event>,
+    wal_directory: PathBuf,
     data_directory: &Path,
-    inject_failure_config: integration_testing::InjectFailureConfig,
+    verify_tree_hashes: bool,
+    inject_failure_config: Option<InjectFailureConfig>,
 ) -> ConsensusTaskHandles {
     // Events that are produced by the P2P task and consumed by the consensus task.
     // TODO determine sufficient buffer size. 1 is not enough.
@@ -44,22 +57,29 @@ pub fn start(
     // Events that are produced by the consensus task and consumed by the P2P task.
     // TODO determine sufficient buffer size. 1 is not enough.
     let (tx_to_p2p, rx_from_consensus) = mpsc::channel::<P2PTaskEvent>(10);
+    // Requests sent to consensus by the sync task.
+    let (sync_to_consensus_tx, sync_to_consensus_rx) = mpsc::channel::<SyncMessageToConsensus>(10);
 
     let consensus_storage =
         open_consensus_storage(data_directory).expect("Consensus storage cannot be opened");
 
+    let (info_watch_tx, consensus_info_watch) = watch::channel(ConsensusInfo::default());
+
     let consensus_p2p_event_processing_handle = p2p_task::spawn(
         chain_id,
-        config.my_validator_address,
-        p2p_client,
-        storage.clone(),
+        (&config).into(),
+        p2p_consensus_client,
         p2p_event_rx,
         tx_to_consensus,
         rx_from_consensus,
+        sync_to_consensus_rx,
+        info_watch_tx,
+        main_storage.clone(),
         consensus_storage.clone(),
+        data_directory,
+        verify_tree_hashes,
+        inject_failure_config,
     );
-
-    let (info_watch_tx, consensus_info_watch) = watch::channel(None);
 
     let consensus_engine_handle = consensus_task::spawn(
         chain_id,
@@ -67,9 +87,7 @@ pub fn start(
         wal_directory,
         tx_to_p2p,
         rx_from_p2p,
-        info_watch_tx,
-        consensus_storage,
-        storage,
+        main_storage,
         data_directory,
         inject_failure_config,
     );
@@ -77,30 +95,11 @@ pub fn start(
     ConsensusTaskHandles {
         consensus_p2p_event_processing_handle,
         consensus_engine_handle,
-        consensus_info_watch: Some(consensus_info_watch),
+        consensus_channels: Some(ConsensusChannels {
+            consensus_info_watch,
+            sync_to_consensus_tx,
+        }),
     }
-}
-
-fn open_consensus_storage(data_directory: &Path) -> anyhow::Result<Storage> {
-    let storage_manager =
-        pathfinder_storage::StorageBuilder::file(data_directory.join("consensus.sqlite")) // TODO: https://github.com/eqlabs/pathfinder/issues/3047
-            .journal_mode(JournalMode::WAL)
-            .trie_prune_mode(Some(TriePruneMode::Archive))
-            .blockchain_history_mode(Some(BlockchainHistoryMode::Archive))
-            .migrate()?;
-    let available_parallelism = std::thread::available_parallelism()?;
-    let consensus_storage = storage_manager
-        .create_pool(NonZeroU32::new(5 + available_parallelism.get() as u32).unwrap())?;
-    let mut db_conn = consensus_storage
-        .connection()
-        .context("Creating database connection")?;
-    let db_tx = db_conn
-        .transaction()
-        .context("Creating database transaction")?;
-    db_tx.ensure_consensus_proposals_table_exists()?;
-    db_tx.ensure_consensus_finalized_blocks_table_exists()?;
-    db_tx.commit()?;
-    Ok(consensus_storage)
 }
 
 /// Events handled by the consensus task.
@@ -119,15 +118,32 @@ enum P2PTaskEvent {
     /// An event coming from the P2P network (from the consensus P2P network
     /// main loop).
     P2PEvent(Event),
+    /// A request coming from the sync task.
+    SyncRequest(SyncMessageToConsensus),
     /// The consensus engine requested that we produce a proposal, so we
     /// create it, feed it back to the consensus engine, and we must
     /// cache it for gossiping when the engine requests so.
-    CacheProposal(HeightAndRound, Vec<ProposalPart>, FinalizedBlock),
+    CacheProposal(HeightAndRound, Vec<ProposalPart>, ConsensusFinalizedL2Block),
     /// Consensus requested that we gossip a message via the P2P network.
     GossipRequest(NetworkMessage<ConsensusValue, ContractAddress>),
     /// Commit the given block and state update to the database. All proposals
     /// for this height are removed from the cache.
     CommitBlock(HeightAndRound, ConsensusValue),
+}
+
+#[derive(Copy, Clone, Debug)]
+struct P2PTaskConfig {
+    my_validator_address: ContractAddress,
+    history_depth: u64,
+}
+
+impl From<&ConsensusConfig> for P2PTaskConfig {
+    fn from(config: &ConsensusConfig) -> Self {
+        Self {
+            my_validator_address: config.my_validator_address,
+            history_depth: config.history_depth,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -149,5 +165,31 @@ impl HeightExt for NetworkMessage<ConsensusValue, ContractAddress> {
             NetworkMessage::Proposal(proposal) => proposal.proposal.height,
             NetworkMessage::Vote(vote) => vote.vote.height,
         }
+    }
+}
+
+/// Creates an empty finalized L2 block for the given height.
+///
+/// TODO: The consensus spec does not define this for empty proposals. However,
+/// the validator logic and storage usage patterns currently require a finalized
+/// block to be created even for empty proposals. For now, we create a (mostly)
+/// default block header with the necessary fields filled in.
+pub(crate) fn create_empty_block(height: u64) -> ConsensusFinalizedL2Block {
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // The only version handled by consensus, so far
+    let starknet_version = StarknetVersion::new(0, 14, 0, 0);
+
+    ConsensusFinalizedL2Block {
+        header: ConsensusFinalizedBlockHeader {
+            number: BlockNumber::new_or_panic(height),
+            timestamp: BlockTimestamp::new_or_panic(timestamp),
+            starknet_version,
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }

@@ -13,7 +13,7 @@ use config::BlockchainHistory;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use pathfinder_common::{BlockNumber, Chain, ChainId, EthereumChain};
 use pathfinder_ethereum::{EthereumApi, EthereumClient};
-use pathfinder_lib::consensus::ConsensusTaskHandles;
+use pathfinder_lib::consensus::{ConsensusChannels, ConsensusTaskHandles};
 use pathfinder_lib::state::SyncContext;
 use pathfinder_lib::{config, consensus, monitoring, p2p_network, state};
 use pathfinder_rpc::context::{EthContractAddresses, WebsocketContext};
@@ -51,6 +51,11 @@ async fn async_main() -> anyhow::Result<Storage> {
         // Disable all dependency logs by default.
         std::env::set_var("RUST_LOG", "pathfinder=info,error");
     }
+
+    // Configure rustls crypto provider.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("rustls crypto provider setup should not fail");
 
     let config = config::Config::parse();
 
@@ -237,8 +242,13 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         versioned_constants_map: config.versioned_constants_map.clone(),
         native_execution: config.native_execution.is_enabled(),
         native_class_cache_size: config.native_execution.class_cache_size(),
+        native_compiler_optimization_level: config.native_execution.optimization_level(),
+        native_execution_force_use_for_incompatible_classes: config
+            .native_execution
+            .force_use_for_incompatible_classes(),
         submission_tracker_time_limit: config.submission_tracker_time_limit,
         submission_tracker_size_limit: config.submission_tracker_size_limit,
+        block_trace_cache_size: config.rpc_block_trace_cache_size,
     };
 
     let notifications = Notifications::default();
@@ -303,7 +313,7 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
     let ConsensusTaskHandles {
         consensus_p2p_event_processing_handle,
         consensus_engine_handle,
-        consensus_info_watch,
+        consensus_channels,
     } = if let Some(consensus_config) = &config.consensus {
         let wal_directory = config.data_directory.join("consensus").join("wal");
         if !wal_directory.exists() {
@@ -318,10 +328,11 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
                 consensus_config.clone(),
                 chain_id,
                 consensus_storage,
-                wal_directory,
                 client,
                 event_rx,
+                wal_directory,
                 &config.data_directory,
+                config.verify_tree_hashes,
                 // Does nothing in production builds. Used for integration testing only.
                 integration_testing_config.inject_failure_config(),
             )
@@ -332,7 +343,10 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         ConsensusTaskHandles::pending()
     };
 
-    let context = if let Some(consensus_info_watch) = consensus_info_watch {
+    let context = if let Some(consensus_info_watch) = consensus_channels
+        .as_ref()
+        .map(|cc| cc.consensus_info_watch.clone())
+    {
         context.with_consensus_info_watch(consensus_info_watch)
     } else {
         context
@@ -361,6 +375,7 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
             &config,
             submitted_tx_tracker,
             tx_pending,
+            consensus_channels,
             notifications,
             gateway_public_key,
             sync_p2p_client,
@@ -526,6 +541,7 @@ fn start_sync(
     config: &config::Config,
     submitted_tx_tracker: pathfinder_rpc::tracker::SubmittedTransactionTracker,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
+    consensus_channels: Option<ConsensusChannels>,
     notifications: Notifications,
     gateway_public_key: pathfinder_common::PublicKey,
     p2p_client: Option<P2PSyncClient>,
@@ -540,6 +556,19 @@ fn start_sync(
             config,
             submitted_tx_tracker,
             tx_pending,
+            notifications,
+            gateway_public_key,
+        )
+    } else if let Some(cc) = consensus_channels {
+        start_consensus_aware_fgw_sync(
+            storage,
+            pathfinder_context,
+            ethereum_client,
+            sync_state,
+            config,
+            submitted_tx_tracker,
+            tx_pending,
+            cc.sync_to_consensus_tx,
             notifications,
             gateway_public_key,
         )
@@ -567,6 +596,7 @@ fn start_sync(
     config: &config::Config,
     submitted_tx_tracker: pathfinder_rpc::tracker::SubmittedTransactionTracker,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
+    _consensus_channels: Option<ConsensusChannels>,
     notifications: Notifications,
     gateway_public_key: pathfinder_common::PublicKey,
     _p2p_client: Option<P2PSyncClient>,
@@ -609,6 +639,8 @@ fn start_feeder_gateway_sync(
         l1_poll_interval: config.l1_poll_interval,
         pending_data: tx_pending,
         submitted_tx_tracker,
+        // Only used in consensus-aware sync.
+        sync_to_consensus_tx: None,
         block_validation_mode: state::l2::BlockValidationMode::Strict,
         notifications,
         block_cache_size: 10_000,
@@ -623,6 +655,51 @@ fn start_feeder_gateway_sync(
 }
 
 #[cfg(feature = "p2p")]
+#[allow(clippy::too_many_arguments)]
+fn start_consensus_aware_fgw_sync(
+    storage: Storage,
+    pathfinder_context: PathfinderContext,
+    ethereum_client: EthereumClient,
+    sync_state: Arc<SyncState>,
+    config: &config::Config,
+    submitted_tx_tracker: pathfinder_rpc::tracker::SubmittedTransactionTracker,
+    tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
+    sync_to_consensus_tx: tokio::sync::mpsc::Sender<pathfinder_lib::SyncMessageToConsensus>,
+    notifications: Notifications,
+    gateway_public_key: pathfinder_common::PublicKey,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let sync_context = SyncContext {
+        storage,
+        ethereum: ethereum_client,
+        chain: pathfinder_context.network,
+        chain_id: pathfinder_context.network_id,
+        core_address: pathfinder_context.contract_addresses.l1_contract_address,
+        sequencer: pathfinder_context.gateway,
+        state: sync_state.clone(),
+        head_poll_interval: config.poll_interval,
+        l1_poll_interval: config.l1_poll_interval,
+        pending_data: tx_pending,
+        submitted_tx_tracker,
+        sync_to_consensus_tx: Some(sync_to_consensus_tx),
+        block_validation_mode: state::l2::BlockValidationMode::Strict,
+        notifications,
+        block_cache_size: 10_000,
+        restart_delay: config.debug.restart_delay,
+        verify_tree_hashes: config.verify_tree_hashes,
+        sequencer_public_key: gateway_public_key,
+        fetch_concurrency: config.feeder_gateway_fetch_concurrency,
+        fetch_casm_from_fgw: config.fetch_casm_from_fgw,
+    };
+
+    util::task::spawn(state::consensus_sync(
+        sync_context,
+        state::l1::sync,
+        state::l2::consensus_sync,
+    ))
+}
+
+#[cfg(feature = "p2p")]
+#[allow(clippy::too_many_arguments)]
 fn start_p2p_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
@@ -662,10 +739,12 @@ async fn spawn_monitoring(
         .install_recorder()
         .context("Creating Prometheus recorder")?;
 
-    metrics::gauge!("pathfinder_build_info", 1.0, "version" => pathfinder_version::VERSION);
+    metrics::gauge!("pathfinder_build_info", "version" => pathfinder_version::VERSION).set(1.0);
 
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => metrics::gauge!("process_start_time_seconds", duration.as_secs() as f64),
+        Ok(duration) => {
+            metrics::gauge!("process_start_time_seconds").set(duration.as_secs() as f64)
+        }
         Err(err) => tracing::error!("Failed to read system time: {:?}", err),
     }
 

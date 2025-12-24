@@ -1,8 +1,12 @@
+use std::sync::{Arc, Mutex};
+
 use blockifier::execution::contract_class::RunnableCompiledClass;
 use blockifier::state::errors::StateError;
 use blockifier::state::state_api::StateReader;
+use cached::Cached;
 use pathfinder_common::{BlockNumber, ClassHash, StorageAddress, StorageValue};
 use pathfinder_crypto::Felt;
+use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
 use starknet_api::contract_class::SierraVersion;
 use starknet_api::StarknetApiError;
 use starknet_types_core::felt::Felt as CoreFelt;
@@ -26,7 +30,7 @@ pub struct NativeClassCache;
 
 #[cfg(not(feature = "cairo-native"))]
 impl NativeClassCache {
-    pub fn spawn(_cache_size: std::num::NonZeroUsize) -> Self {
+    pub fn spawn(_cache_size: std::num::NonZeroUsize, _compiler_optimization_level: u8) -> Self {
         Self {}
     }
 }
@@ -41,6 +45,10 @@ pub struct PathfinderStateReader<S> {
     ignore_block_number_for_classes: bool,
     #[allow(unused)]
     native_class_cache: Option<NativeClassCache>,
+    #[allow(unused)]
+    native_execution_force_use_for_incompatible_classes: bool,
+    casm_hash_v2_cache:
+        Arc<Mutex<cached::SizedCache<ClassHash, starknet_api::core::CompiledClassHash>>>,
 }
 
 impl<S: StorageAdapter> PathfinderStateReader<S> {
@@ -49,12 +57,15 @@ impl<S: StorageAdapter> PathfinderStateReader<S> {
         block_number: Option<BlockNumber>,
         ignore_block_number_for_classes: bool,
         native_class_cache: Option<NativeClassCache>,
+        native_execution_force_use_for_incompatible_classes: bool,
     ) -> Self {
         Self {
             storage_adapter,
             block_number,
             ignore_block_number_for_classes,
             native_class_cache,
+            native_execution_force_use_for_incompatible_classes,
+            casm_hash_v2_cache: Arc::new(Mutex::new(cached::SizedCache::with_size(1024))),
         }
     }
 
@@ -113,7 +124,9 @@ impl<S: StorageAdapter> PathfinderStateReader<S> {
                 let sierra_version = self.sierra_version_from_class(&class_definition)?;
 
                 #[cfg(feature = "cairo-native")]
-                let runnable_class = if sierra_version >= SierraVersion::new(1, 7, 0) {
+                let runnable_class = if self.native_execution_force_use_for_incompatible_classes
+                    || sierra_version >= SierraVersion::new(1, 7, 0)
+                {
                     if let Some(native_class_cache) = &self.native_class_cache {
                         match native_class_cache.get(
                             pathfinder_class_hash,
@@ -335,12 +348,60 @@ impl<S: StorageAdapter> StateReader for PathfinderStateReader<S> {
             self.storage_adapter.casm_hash_at(block_id, class_hash)
         };
 
-        let casm_hash = casm_hash?.ok_or_else(|| {
-            StateError::StateReadError("Error getting compiled class hash".to_owned())
-        })?;
+        let casm_hash = casm_hash?.unwrap_or_default();
 
         Ok(starknet_api::core::CompiledClassHash(
             casm_hash.0.into_starkfelt(),
         ))
+    }
+
+    fn get_compiled_class_hash_v2(
+        &self,
+        class_hash: starknet_api::core::ClassHash,
+        compiled_class: &RunnableCompiledClass,
+    ) -> blockifier::state::state_api::StateResult<starknet_api::core::CompiledClassHash> {
+        let pathfinder_class_hash = ClassHash(class_hash.0.into_felt());
+
+        tracing::trace!(class_hash=%pathfinder_class_hash, "Getting compiled class hash v2");
+
+        // First, look up in CASM v2 hash cache and return if found.
+        let casm_hash = self
+            .casm_hash_v2_cache
+            .lock()
+            .unwrap()
+            .cache_get(&pathfinder_class_hash)
+            .cloned();
+        if let Some(casm_hash) = casm_hash {
+            return Ok(casm_hash);
+        }
+
+        // Look up pre-computed CASM v2 hash from storage, fall back to computing it if
+        // not found.
+        let casm_hash = self.storage_adapter.casm_hash_v2(pathfinder_class_hash)?;
+        match casm_hash {
+            Some(casm_hash) => Ok(starknet_api::core::CompiledClassHash(
+                casm_hash.0.into_starkfelt(),
+            )),
+            None => {
+                tracing::trace!("CASM hash v2 not found in storage, computing from compiled class");
+
+                let casm_hash = match compiled_class {
+                    RunnableCompiledClass::V0(_) => {
+                        Err(StateError::MissingCompiledClassHashV2(class_hash))
+                    }
+                    RunnableCompiledClass::V1(class) => Ok(class.hash(&HashVersion::V2)),
+                    #[cfg(feature = "cairo-native")]
+                    RunnableCompiledClass::V1Native(class) => Ok(class.hash(&HashVersion::V2)),
+                };
+
+                if let Ok(compiled_class_hash) = casm_hash {
+                    self.casm_hash_v2_cache
+                        .lock()
+                        .unwrap()
+                        .cache_set(pathfinder_class_hash, compiled_class_hash);
+                }
+                casm_hash
+            }
+        }
     }
 }

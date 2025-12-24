@@ -1,4 +1,10 @@
-use pathfinder_common::{GasPrice, L1DataAvailabilityMode};
+use pathfinder_common::{
+    EventCommitment,
+    GasPrice,
+    L1DataAvailabilityMode,
+    StarknetVersion,
+    TransactionCommitment,
+};
 use serde::de::Error;
 
 use crate::dto::SerializeStruct;
@@ -81,6 +87,27 @@ impl crate::dto::SerializeForVersion for pathfinder_common::BlockHeader {
                     price_in_fri: self.strk_l2_gas_price,
                 },
             )?;
+        }
+
+        if serializer.version >= RpcVersion::V10 {
+            if self.starknet_version < StarknetVersion::V_0_13_2 {
+                // Pathfinder storage stores 0.13.2-style event and transaction commitments for
+                // pre-0.13.2 blocks. This is required so that we can serve the
+                // 0.13.2-style commitments over the P2P sync protocol. To avoid
+                // confusion, we return zeroed commitments for such blocks.
+                serializer.serialize_field("event_commitment", &EventCommitment::ZERO)?;
+                serializer
+                    .serialize_field("transaction_commitment", &TransactionCommitment::ZERO)?;
+            } else {
+                serializer.serialize_field("event_commitment", &self.event_commitment)?;
+                serializer
+                    .serialize_field("transaction_commitment", &self.transaction_commitment)?;
+            }
+            serializer.serialize_field("receipt_commitment", &self.receipt_commitment)?;
+            serializer.serialize_field("state_diff_commitment", &self.state_diff_commitment)?;
+            serializer.serialize_field("event_count", &self.event_count)?;
+            serializer.serialize_field("transaction_count", &self.transaction_count)?;
+            serializer.serialize_field("state_diff_length", &self.state_diff_length)?;
         }
 
         serializer.end()

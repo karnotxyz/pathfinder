@@ -361,6 +361,9 @@ pub mod test_utils {
         let class1_hash = class_hash_bytes!(b"class 1 hash");
         let class2_hash = class_hash_bytes!(b"class 2 hash (sierra)");
         let class_hash_pending = class_hash_bytes!(b"class pending hash");
+        let sierra_class = SierraHash(class2_hash.0);
+        let sierra_casm_hash = casm_hash_bytes!(b"casm hash");
+        let sierra_casm_hash_v2 = casm_hash_bytes!(b"casm hash blake");
 
         let storage_addr = storage_address_bytes!(b"storage addr 0");
 
@@ -377,6 +380,7 @@ pub mod test_utils {
             );
 
         let state_update2 = StateUpdate::default()
+            .with_declared_sierra_class(sierra_class, sierra_casm_hash)
             .with_deployed_contract(contract2_addr, class2_hash)
             .with_contract_nonce(contract1_addr, contract_nonce!("0x10"))
             .with_contract_nonce(contract2_addr, contract_nonce!("0xfeed"))
@@ -400,25 +404,22 @@ pub mod test_utils {
         let sierra_class_definition =
             starknet_gateway_test_fixtures::class_definitions::CAIRO_0_11_SIERRA.to_vec();
 
-        let sierra_class = SierraHash(class2_hash.0);
-        let sierra_casm_hash = casm_hash_bytes!(b"non-existent");
-
         db_txn
-            .insert_cairo_class(class0_hash, &class0_definition)
+            .insert_cairo_class_definition(class0_hash, &class0_definition)
             .unwrap();
         db_txn
-            .insert_cairo_class(class1_hash, class1_definition)
+            .insert_cairo_class_definition(class1_hash, class1_definition)
             .unwrap();
         db_txn
-            .insert_sierra_class(
+            .insert_sierra_class_definition(
                 &sierra_class,
                 &sierra_class_definition,
-                &sierra_casm_hash,
                 &[],
+                &sierra_casm_hash_v2,
             )
             .unwrap();
         db_txn
-            .insert_cairo_class(class_hash_pending, &class0_definition)
+            .insert_cairo_class_definition(class_hash_pending, &class0_definition)
             .unwrap();
 
         // Update block 0
@@ -451,6 +452,14 @@ pub mod test_utils {
         let header0 = BlockHeader::builder()
             .number(BlockNumber::GENESIS)
             .calculated_state_commitment(storage_commitment0, class_commitment0)
+            .event_commitment(event_commitment!("0xec00"))
+            .event_count(0)
+            .receipt_commitment(receipt_commitment!("0xdc00"))
+            .transaction_commitment(transaction_commitment!("0xac00"))
+            .transaction_count(0)
+            .state_diff_commitment(state_diff_commitment!("0xfc00"))
+            .state_diff_length(0)
+            .starknet_version(StarknetVersion::V_0_13_2)
             .finalize_with_hash(block_hash_bytes!(b"genesis"));
         db_txn.insert_block_header(&header0).unwrap();
         db_txn
@@ -493,6 +502,14 @@ pub mod test_utils {
             .calculated_state_commitment(storage_commitment1, class_commitment1)
             .eth_l1_gas_price(GasPrice::from(1))
             .sequencer_address(sequencer_address_bytes!(&[1u8]))
+            .event_commitment(event_commitment!("0xec01"))
+            .event_count(1)
+            .receipt_commitment(receipt_commitment!("0xdc01"))
+            .transaction_commitment(transaction_commitment!("0xac01"))
+            .transaction_count(1)
+            .state_diff_commitment(state_diff_commitment!("0xfc01"))
+            .state_diff_length(1)
+            .starknet_version(StarknetVersion::V_0_13_2)
             .finalize_with_hash(block_hash_bytes!(b"block 1"));
         db_txn.insert_block_header(&header1).unwrap();
         db_txn
@@ -577,6 +594,14 @@ pub mod test_utils {
             .calculated_state_commitment(storage_commitment2, class_commitment2)
             .eth_l1_gas_price(GasPrice::from(2))
             .sequencer_address(sequencer_address_bytes!(&[2u8]))
+            .event_commitment(event_commitment!("0xec02"))
+            .event_count(2)
+            .receipt_commitment(receipt_commitment!("0xdc02"))
+            .transaction_commitment(transaction_commitment!("0xac02"))
+            .transaction_count(2)
+            .state_diff_commitment(state_diff_commitment!("0xfc02"))
+            .state_diff_length(2)
+            .starknet_version(StarknetVersion::V_0_13_2)
             .finalize_with_hash(block_hash_bytes!(b"latest"));
 
         db_txn.insert_block_header(&header2).unwrap();
@@ -854,7 +879,7 @@ pub mod test_utils {
             timestamp: BlockTimestamp::new_or_panic(1234567),
             transaction_receipts,
             transactions,
-            starknet_version: StarknetVersion::new(0, 11, 0, 0),
+            starknet_version: StarknetVersion::new(0, 13, 2, 0),
             l1_da_mode: starknet_gateway_types::reply::L1DataAvailabilityMode::Calldata,
         };
 
@@ -867,11 +892,12 @@ pub mod test_utils {
                 starknet_gateway_test_fixtures::class_definitions::CONTRACT_DEFINITION;
 
             for cairo in state_update_copy.declared_cairo_classes {
-                tx.insert_cairo_class(cairo, class_definition).unwrap();
+                tx.insert_cairo_class_definition(cairo, class_definition)
+                    .unwrap();
             }
 
             for (sierra, casm) in state_update_copy.declared_sierra_classes {
-                tx.insert_sierra_class(&sierra, b"sierra def", &casm, b"casm def")
+                tx.insert_sierra_class_definition(&sierra, b"sierra def", b"casm def", &casm)
                     .unwrap();
             }
 
@@ -1047,7 +1073,7 @@ pub mod test_utils {
                 timestamp: BlockTimestamp::new_or_panic(1234567),
                 transaction_receipts,
                 transactions,
-                starknet_version: StarknetVersion::new(0, 11, 0, 0),
+                starknet_version: StarknetVersion::V_0_13_2,
                 l1_da_mode: L1DataAvailabilityMode::Calldata,
             }
             .into(),
@@ -1064,11 +1090,12 @@ pub mod test_utils {
                 starknet_gateway_test_fixtures::class_definitions::CONTRACT_DEFINITION;
 
             for cairo in state_update_copy.declared_cairo_classes {
-                tx.insert_cairo_class(cairo, class_definition).unwrap();
+                tx.insert_cairo_class_definition(cairo, class_definition)
+                    .unwrap();
             }
 
             for (sierra, casm) in state_update_copy.declared_sierra_classes {
-                tx.insert_sierra_class(&sierra, b"sierra def", &casm, b"casm def")
+                tx.insert_sierra_class_definition(&sierra, b"sierra def", b"casm def", &casm)
                     .unwrap();
             }
 
@@ -1244,7 +1271,7 @@ pub mod test_utils {
             timestamp: BlockTimestamp::new_or_panic(1234567),
             transaction_receipts: pre_latest_tx_receipts,
             transactions: pre_latest_transactions,
-            starknet_version: StarknetVersion::new(0, 11, 0, 0),
+            starknet_version: StarknetVersion::V_0_13_2,
             l1_da_mode: L1DataAvailabilityMode::Calldata,
         };
 
@@ -1396,7 +1423,7 @@ pub mod test_utils {
                 timestamp: BlockTimestamp::new_or_panic(1234567),
                 transaction_receipts: pre_confirmed_tx_receipts,
                 transactions: pre_confirmed_transactions,
-                starknet_version: StarknetVersion::new(0, 11, 0, 0),
+                starknet_version: StarknetVersion::V_0_13_2,
                 l1_da_mode: L1DataAvailabilityMode::Calldata,
             }
             .into(),
@@ -1420,18 +1447,20 @@ pub mod test_utils {
                 starknet_gateway_test_fixtures::class_definitions::CONTRACT_DEFINITION;
 
             for cairo in pre_latest_state_update.declared_cairo_classes {
-                tx.insert_cairo_class(cairo, class_definition).unwrap();
+                tx.insert_cairo_class_definition(cairo, class_definition)
+                    .unwrap();
             }
             for (sierra, casm) in pre_latest_state_update.declared_sierra_classes {
-                tx.insert_sierra_class(&sierra, b"sierra def", &casm, b"casm def")
+                tx.insert_sierra_class_definition(&sierra, b"sierra def", b"casm def", &casm)
                     .unwrap();
             }
 
             for cairo in pre_confirmed_state_update_copy.declared_cairo_classes {
-                tx.insert_cairo_class(cairo, class_definition).unwrap();
+                tx.insert_cairo_class_definition(cairo, class_definition)
+                    .unwrap();
             }
             for (sierra, casm) in pre_confirmed_state_update_copy.declared_sierra_classes {
-                tx.insert_sierra_class(&sierra, b"sierra def", &casm, b"casm def")
+                tx.insert_sierra_class_definition(&sierra, b"sierra def", b"casm def", &casm)
                     .unwrap();
             }
 
