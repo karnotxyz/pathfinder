@@ -32,7 +32,7 @@ RUN TARGETARCH=${TARGETARCH} ./cargo-chef-cook.sh --profile release-lto --recipe
 
 # Compile the actual libraries and binary now
 COPY --exclude=rust-toolchain.toml . .
-ARG PATHFINDER_FORCE_VERSION
+ARG PATHFINDER_FORCE_VERSION=0.0.0-docker
 COPY ./build/cargo-build.sh ./cargo-build.sh
 RUN TARGETARCH=${TARGETARCH} \
     PATHFINDER_FORCE_VERSION=${PATHFINDER_FORCE_VERSION} \

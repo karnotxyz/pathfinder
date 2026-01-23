@@ -2,9 +2,13 @@ use pathfinder_common::prelude::*;
 use pathfinder_crypto::Felt;
 
 /// Converts a `Signed<256, 4>` integer to a `BlockNumber`
+///
+/// Returns `BlockNumber::GENESIS` (0) if the value is negative or exceeds u64::MAX.
 pub(crate) fn get_block_number(block_number: alloy::primitives::Signed<256, 4>) -> BlockNumber {
-    let block_number = block_number.as_u64();
-    BlockNumber::new_or_panic(block_number)
+    block_number
+        .try_into()
+        .map(BlockNumber::new_or_panic)
+        .unwrap_or(BlockNumber::GENESIS)
 }
 
 /// Converts an `alloy` block hash to a `pathfinder` block hash
