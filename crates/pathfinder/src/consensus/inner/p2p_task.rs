@@ -366,6 +366,7 @@ pub fn spawn(
 
                                 use crate::validator;
 
+                                let starknet_version = block.header.starknet_version;
                                 let state_commitment = update_starknet_state(
                                     &main_db_tx,
                                     block.state_update.as_ref(),
@@ -374,7 +375,9 @@ pub fn spawn(
                                     main_readonly_storage.clone(),
                                 )
                                 .context("Updating Starknet state")
-                                .map(|(storage, class)| StateCommitment::calculate(storage, class));
+                                .map(|(storage, class)| {
+                                    StateCommitment::calculate(storage, class, starknet_version)
+                                });
 
                                 // Do not commit this.
                                 drop(main_db_tx);
