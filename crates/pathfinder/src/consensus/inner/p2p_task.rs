@@ -274,6 +274,7 @@ pub fn spawn(
                                 let dex = deferred_executions.clone();
                                 let result = handle_incoming_proposal_part::<ProdTransactionMapper>(
                                     chain_id,
+                                    config.is_l3,
                                     height_and_round,
                                     proposal_part,
                                     &mut incoming_proposals,
@@ -1053,6 +1054,7 @@ async fn send_proposal_to_consensus(
 #[allow(clippy::too_many_arguments)]
 fn handle_incoming_proposal_part<T: TransactionExt>(
     chain_id: ChainId,
+    is_l3: bool,
     height_and_round: HeightAndRound,
     proposal_part: ProposalPart,
     incoming_proposals: &mut HashMap<HeightAndRound, ProposalPartsValidator>,
@@ -1084,7 +1086,7 @@ fn handle_incoming_proposal_part<T: TransactionExt>(
 
     match (result, proposal_part) {
         (ValidationResult::Accepted, ProposalPart::Init(init)) => {
-            let validator = ValidatorBlockInfoStage::new(chain_id, init)?;
+            let validator = ValidatorBlockInfoStage::new_with_l3(chain_id, is_l3, init)?;
             validator_cache.insert(height_and_round, ValidatorStage::BlockInfo(validator));
             Ok(None)
         }
@@ -1654,6 +1656,7 @@ mod tests {
                     let proposal_commitment =
                         handle_incoming_proposal_part::<ProdTransactionMapper>(
                             ChainId::SEPOLIA_TESTNET,
+                            false,
                             HeightAndRound::new(h, 0),
                             proposal_part,
                             &mut incoming_proposals,

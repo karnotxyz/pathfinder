@@ -58,8 +58,34 @@ impl ConcurrentBlockExecutor {
         worker_pool: Arc<WorkerPool<CachedState<ConcurrentStateReader>>>,
         block_deadline: Option<Instant>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_l3(
+            chain_id,
+            false,
+            block_info,
+            eth_fee_address,
+            strk_fee_address,
+            db_conn,
+            decided_blocks,
+            worker_pool,
+            block_deadline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_l3(
+        chain_id: ChainId,
+        is_l3: bool,
+        block_info: BlockInfo,
+        eth_fee_address: ContractAddress,
+        strk_fee_address: ContractAddress,
+        db_conn: pathfinder_storage::Connection,
+        decided_blocks: DecidedBlocks,
+        worker_pool: Arc<WorkerPool<CachedState<ConcurrentStateReader>>>,
+        block_deadline: Option<Instant>,
+    ) -> anyhow::Result<Self> {
         Self::new_with_config(
             chain_id,
+            is_l3,
             block_info,
             eth_fee_address,
             strk_fee_address,
@@ -75,6 +101,7 @@ impl ConcurrentBlockExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
         chain_id: ChainId,
+        is_l3: bool,
         block_info: BlockInfo,
         eth_fee_address: ContractAddress,
         strk_fee_address: ContractAddress,
@@ -88,6 +115,7 @@ impl ConcurrentBlockExecutor {
 
         let execution_state = ExecutionState::validation(
             chain_id,
+            is_l3,
             block_info,
             None,
             versioned_constants_map.clone(),

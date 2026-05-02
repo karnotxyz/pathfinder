@@ -41,6 +41,7 @@ use crate::SyncMessageToConsensus;
 pub fn start(
     config: ConsensusConfig,
     chain_id: ChainId,
+    is_l3: bool,
     main_storage: Storage,
     p2p_consensus_client: p2p::consensus::Client,
     p2p_event_rx: mpsc::UnboundedReceiver<Event>,
@@ -67,7 +68,7 @@ pub fn start(
 
     let (consensus_p2p_event_processing_handle, worker_pool) = p2p_task::spawn(
         chain_id,
-        (&config).into(),
+        P2PTaskConfig::from_consensus_config(&config, is_l3),
         p2p_consensus_client,
         p2p_event_rx,
         tx_to_consensus,
@@ -142,13 +143,15 @@ enum P2PTaskEvent {
 #[derive(Copy, Clone, Debug)]
 struct P2PTaskConfig {
     my_validator_address: ContractAddress,
+    is_l3: bool,
     history_depth: u64,
 }
 
-impl From<&ConsensusConfig> for P2PTaskConfig {
-    fn from(config: &ConsensusConfig) -> Self {
+impl P2PTaskConfig {
+    fn from_consensus_config(config: &ConsensusConfig, is_l3: bool) -> Self {
         Self {
             my_validator_address: config.my_validator_address,
+            is_l3,
             history_depth: config.history_depth,
         }
     }

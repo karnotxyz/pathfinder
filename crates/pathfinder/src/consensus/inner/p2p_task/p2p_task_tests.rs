@@ -96,6 +96,7 @@ impl TestEnvironment {
             chain_id,
             P2PTaskConfig {
                 my_validator_address: validator_address,
+                is_l3: false,
                 history_depth: Self::HISTORY_DEPTH,
             },
             p2p_client,

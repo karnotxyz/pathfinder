@@ -139,6 +139,7 @@ pub fn new(
 #[derive(Debug)]
 pub struct ValidatorBlockInfoStage {
     chain_id: ChainId,
+    is_l3: bool,
     proposal_height: BlockNumber,
 }
 
@@ -147,9 +148,18 @@ impl ValidatorBlockInfoStage {
         chain_id: ChainId,
         proposal_init: ProposalInit,
     ) -> Result<ValidatorBlockInfoStage, ProposalHandlingError> {
+        Self::new_with_l3(chain_id, false, proposal_init)
+    }
+
+    pub fn new_with_l3(
+        chain_id: ChainId,
+        is_l3: bool,
+        proposal_init: ProposalInit,
+    ) -> Result<ValidatorBlockInfoStage, ProposalHandlingError> {
         // TODO(validator) how can we validate the proposal init?
         Ok(ValidatorBlockInfoStage {
             chain_id,
+            is_l3,
             proposal_height: BlockNumber::new(proposal_init.height)
                 .context("ProposalInit height exceeds i64::MAX")
                 .map_err(ProposalHandlingError::recoverable)?,
@@ -187,6 +197,7 @@ impl ValidatorBlockInfoStage {
 
         let Self {
             chain_id,
+            is_l3,
             proposal_height,
         } = self;
 
@@ -273,6 +284,7 @@ impl ValidatorBlockInfoStage {
             main_storage,
             declared_classes: Vec::new(),
             decided_blocks,
+            is_l3,
         })
     }
 
@@ -297,6 +309,7 @@ impl ValidatorBlockInfoStage {
 
         let Self {
             chain_id,
+            is_l3,
             proposal_height,
         } = self;
 
@@ -340,6 +353,7 @@ impl ValidatorBlockInfoStage {
             main_storage,
             declared_classes: Vec::new(),
             decided_blocks,
+            is_l3,
         })
     }
 }
@@ -498,6 +512,7 @@ fn validate_l2_gas_price(
 /// rollback support through `close_block(n)`.
 pub struct ValidatorTransactionBatchStage {
     chain_id: ChainId,
+    is_l3: bool,
     block_info: pathfinder_executor::types::BlockInfo,
     /// Accumulated executed transactions across batches
     transactions: Vec<Transaction>,
@@ -582,8 +597,9 @@ impl ValidatorTransactionBatchStage {
         // Initialize executor on first batch
         if self.executor.is_none() {
             self.executor = Some(
-                ConcurrentBlockExecutor::new(
+                ConcurrentBlockExecutor::new_with_l3(
                     self.chain_id,
+                    self.is_l3,
                     self.block_info,
                     ETH_FEE_TOKEN_ADDRESS,
                     STRK_FEE_TOKEN_ADDRESS,

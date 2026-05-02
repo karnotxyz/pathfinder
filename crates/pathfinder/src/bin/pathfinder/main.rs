@@ -386,6 +386,7 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
                 consensus::start(
                     consensus_config.clone(),
                     chain_id,
+                    pathfinder_context.is_l3,
                     consensus_storage,
                     client,
                     event_rx,
