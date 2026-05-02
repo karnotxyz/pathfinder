@@ -1,23 +1,28 @@
 default:
     just --summary --unsorted
 
-test $RUST_BACKTRACE="1" *args="": test-consensus build-pathfinder-release
+test $RUST_BACKTRACE="1" *args="": build-pathfinder-release
     cargo nextest run --no-fail-fast --all-targets --features p2p --workspace --locked \
-    -E 'not (test(/^p2p_network::sync_handlers::tests::prop/) | test(/^test::consensus_3_nodes/))' \
+    -E 'not (test(/^p2p_network::sync::sync_handlers::tests::prop/) | test(/^consensus::inner::p2p_task::handler_proptest/) | test(/^test::consensus_[34]_nodes/))' \
     {{args}}
 
-test-all-features $RUST_BACKTRACE="1" *args="": test-consensus build-pathfinder-release
+test-all-features $RUST_BACKTRACE="1" *args="": build-pathfinder-release
     cargo nextest run --no-fail-fast --all-targets --all-features --workspace --locked \
-    -E 'not (test(/^p2p_network::sync_handlers::tests::prop/) | test(/^test::consensus_3_nodes/))' \
+    -E 'not (test(/^p2p_network::sync::sync_handlers::tests::prop/) | test(/^consensus::inner::p2p_task::handler_proptest/) | test(/^test::consensus_[34]_nodes/))' \
     {{args}}
 
-test-consensus $RUST_BACKTRACE="1" *args="":
-    PATHFINDER_TEST_ENABLE_PORT_MARKER_FILES=1 cargo nextest run --test consensus -p pathfinder --features p2p,consensus-integration-tests --locked \
+test-consensus $RUST_BACKTRACE="1" *args="": build-pathfinder build-feeder-gateway
+    PATHFINDER_TEST_ENABLE_MARKER_FILES=1 cargo nextest run --test consensus -p pathfinder --retries 2 -j 1 --features p2p,consensus-integration-tests --locked \
     {{args}}
 
-proptest $RUST_BACKTRACE="1" *args="":
-    cargo nextest run --no-fail-fast --all-targets --features p2p --workspace --locked \
+proptest-sync-handlers $RUST_BACKTRACE="1" *args="":
+    cargo nextest run --no-fail-fast --retries 2 --all-targets --features p2p --workspace --locked \
     -E 'test(/^p2p_network::sync::sync_handlers::tests::prop/)' \
+    {{args}}
+
+proptest-consensus-handler $RUST_BACKTRACE="1" *args="":
+    cargo nextest run --no-fail-fast --retries 2 --all-targets --features p2p --workspace --locked \
+    -E 'test(/^consensus::inner::p2p_task::handler_proptest/)' \
     {{args}}
 
 build:
@@ -29,6 +34,12 @@ build-all-features:
 # This target is used in `integration_testing_cli` test.
 build-pathfinder-release:
     cargo build --release -p pathfinder --bin pathfinder -F p2p,consensus-integration-tests
+
+build-pathfinder:
+    cargo build -p pathfinder --bin pathfinder -F p2p,consensus-integration-tests
+
+build-feeder-gateway:
+    cargo build -p feeder-gateway -F small_aggregate_filters --bin feeder-gateway
 
 check:
     cargo check --workspace --all-targets

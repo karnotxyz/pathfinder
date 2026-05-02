@@ -80,14 +80,14 @@ pub async fn estimate_fee(
             .context("Creating database transaction")?;
 
         let (header, pending) = match input.block_id {
-            BlockId::Pending => {
+            BlockId::PreConfirmed => {
                 let pending = context
                     .pending_data
                     .get(&db_tx, rpc_version)
                     .context("Querying pending data")?;
 
                 (
-                    pending.pending_header(),
+                    pending.pre_confirmed_header(),
                     Some(pending.aggregated_state_update()),
                 )
             }
@@ -107,6 +107,7 @@ pub async fn estimate_fee(
 
         let state = ExecutionState::simulation(
             context.chain_id,
+            context.is_l3,
             header,
             pending,
             L1BlobDataAvailability::Enabled,
@@ -114,6 +115,9 @@ pub async fn estimate_fee(
             context.contract_addresses.eth_l2_token_address,
             context.contract_addresses.strk_l2_token_address,
             context.native_class_cache,
+            context
+                .config
+                .native_execution_force_use_for_incompatible_classes,
         );
 
         let skip_validate = input
@@ -128,6 +132,8 @@ pub async fn estimate_fee(
                 crate::executor::map_broadcasted_transaction(
                     &tx,
                     context.chain_id,
+                    context.config.compiler_resource_limits,
+                    context.config.blockifier_libfuncs,
                     skip_validate,
                     true,
                 )
@@ -227,6 +233,7 @@ impl crate::dto::SerializeForVersion for Output {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
+    use pathfinder_common::class_definition::SerializedOpaqueClassDefinition;
     use pathfinder_common::macro_prelude::*;
     use pathfinder_common::prelude::*;
     use pathfinder_common::transaction::{DataAvailabilityMode, ResourceBound, ResourceBounds};
@@ -260,11 +267,12 @@ mod tests {
         let casm_hash =
             casm_hash!("0x069032ff71f77284e1a0864a573007108ca5cc08089416af50f03260f5d6d4d8");
 
-        let contract_class: SierraContractClass =
-            ContractClass::from_definition_bytes(sierra_definition)
-                .unwrap()
-                .as_sierra()
-                .unwrap();
+        let contract_class: SierraContractClass = ContractClass::from_serialized_def(
+            &SerializedOpaqueClassDefinition::from_slice(sierra_definition),
+        )
+        .unwrap()
+        .as_sierra()
+        .unwrap();
 
         assert_eq!(contract_class.class_hash().unwrap().hash(), sierra_hash);
 
@@ -393,6 +401,8 @@ mod tests {
                 account_deployment_data: vec![],
                 nonce_data_availability_mode: DataAvailabilityMode::L1,
                 fee_data_availability_mode: DataAvailabilityMode::L1,
+                proof_facts: vec![],
+                proof: Default::default(),
             },
         ))
     }
@@ -597,11 +607,49 @@ mod tests {
         let casm_hash =
             casm_hash!("0x02F58B23F7D98FF076AE59C08125AAFFD6DECCF1A7E97378D1A303B1A4223989");
 
-        let contract_class: SierraContractClass =
-            ContractClass::from_definition_bytes(sierra_definition)
-                .unwrap()
-                .as_sierra()
-                .unwrap();
+        let contract_class: SierraContractClass = ContractClass::from_serialized_def(
+            &SerializedOpaqueClassDefinition::from_slice(sierra_definition),
+        )
+        .unwrap()
+        .as_sierra()
+        .unwrap();
+
+        self::assert_eq!(contract_class.class_hash().unwrap().hash(), sierra_hash);
+
+        BroadcastedTransaction::Declare(BroadcastedDeclareTransaction::V3(
+            BroadcastedDeclareTransactionV3 {
+                version: TransactionVersion::THREE,
+                signature: vec![],
+                nonce: transaction_nonce!("0x0"),
+                resource_bounds: ResourceBounds::default(),
+                tip: Tip(0),
+                paymaster_data: vec![],
+                account_deployment_data: vec![],
+                nonce_data_availability_mode: DataAvailabilityMode::L1,
+                fee_data_availability_mode: DataAvailabilityMode::L1,
+                compiled_class_hash: casm_hash,
+                contract_class,
+                sender_address,
+            },
+        ))
+    }
+
+    fn declare_v3_transaction_with_blake2_casm_hash(
+        sender_address: ContractAddress,
+    ) -> BroadcastedTransaction {
+        let sierra_definition =
+            include_bytes!("../../fixtures/contracts/l2_gas_accounting/l2_gas_accounting.json");
+        let sierra_hash =
+            class_hash!("0x01A48FD3F75D0A7C2288AC23FB6ABA26CD375607BA63E4A3B3ED47FC8E99DC21");
+        let casm_hash =
+            casm_hash!("0x138cd11c6de707426665bd8b0425d7411bb8dc5cbee15867025007a933b3379");
+
+        let contract_class: SierraContractClass = ContractClass::from_serialized_def(
+            &SerializedOpaqueClassDefinition::from_slice(sierra_definition),
+        )
+        .unwrap()
+        .as_sierra()
+        .unwrap();
 
         self::assert_eq!(contract_class.class_hash().unwrap().hash(), sierra_hash);
 
@@ -661,6 +709,8 @@ mod tests {
                     // calldata_len
                     call_param!("0x0"),
                 ],
+                proof_facts: vec![],
+                proof: Default::default(),
             },
         ))
     }
@@ -710,6 +760,8 @@ mod tests {
                 account_deployment_data: vec![],
                 nonce_data_availability_mode: DataAvailabilityMode::L2,
                 fee_data_availability_mode: DataAvailabilityMode::L2,
+                proof_facts: vec![],
+                proof: Default::default(),
             },
         ))
     }
@@ -719,6 +771,7 @@ mod tests {
     #[case::v07(RpcVersion::V07)]
     #[case::v08(RpcVersion::V08)]
     #[case::v09(RpcVersion::V09)]
+    #[case::v10(RpcVersion::V10)]
     #[tokio::test]
     async fn declare_deploy_and_invoke_sierra_class_starknet_0_13_4(#[case] version: RpcVersion) {
         let (context, last_block_header, account_contract_address, universal_deployer_address) =
@@ -768,6 +821,117 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
+    #[case::v10(RpcVersion::V10)]
+    #[tokio::test]
+    async fn declare_deploy_and_invoke_sierra_class_starknet_0_14_0(#[case] version: RpcVersion) {
+        let (context, last_block_header, account_contract_address, universal_deployer_address) =
+            crate::test_setup::test_context_with_starknet_version(StarknetVersion::new(
+                0, 14, 0, 0,
+            ))
+            .await;
+
+        // declare test class
+        let declare_transaction = declare_v3_transaction(account_contract_address);
+        // deploy with universal deployer contract
+        let deploy_transaction =
+            deploy_v3_transaction(account_contract_address, universal_deployer_address);
+        // invoke deployed contract
+        let invoke_transaction = invoke_v3_transaction_with_data_gas(
+            account_contract_address,
+            transaction_nonce!("0x2"),
+            call_param!("7"),
+        );
+        // Invoke once more to test that the execution state updates properly with L2
+        // gas accounting aware code.
+        let invoke_transaction2 = invoke_v3_transaction_with_data_gas(
+            account_contract_address,
+            transaction_nonce!("0x3"),
+            call_param!("7"),
+        );
+
+        let input = Input {
+            request: vec![
+                declare_transaction,
+                deploy_transaction,
+                invoke_transaction,
+                invoke_transaction2,
+            ],
+            simulation_flags: vec![SimulationFlag::SkipValidate],
+            block_id: BlockId::Number(last_block_header.number),
+        };
+        let result = super::estimate_fee(context, input, RPC_VERSION)
+            .await
+            .unwrap();
+
+        let output_json = result.serialize(Serializer { version }).unwrap();
+        crate::assert_json_matches_fixture!(
+            output_json,
+            version,
+            "fee_estimates/declare_deploy_invoke_sierra_0_14_0.json"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::v06(RpcVersion::V06)]
+    #[case::v07(RpcVersion::V07)]
+    #[case::v08(RpcVersion::V08)]
+    #[case::v09(RpcVersion::V09)]
+    #[case::v10(RpcVersion::V10)]
+    #[tokio::test]
+    async fn declare_deploy_and_invoke_sierra_class_starknet_0_14_1(#[case] version: RpcVersion) {
+        let (context, last_block_header, account_contract_address, universal_deployer_address) =
+            crate::test_setup::test_context_with_starknet_version(StarknetVersion::new(
+                0, 14, 1, 0,
+            ))
+            .await;
+
+        // declare test class
+        let declare_transaction =
+            declare_v3_transaction_with_blake2_casm_hash(account_contract_address);
+        // deploy with universal deployer contract
+        let deploy_transaction =
+            deploy_v3_transaction(account_contract_address, universal_deployer_address);
+        // invoke deployed contract
+        let invoke_transaction = invoke_v3_transaction_with_data_gas(
+            account_contract_address,
+            transaction_nonce!("0x2"),
+            call_param!("7"),
+        );
+        // Invoke once more to test that the execution state updates properly with L2
+        // gas accounting aware code.
+        let invoke_transaction2 = invoke_v3_transaction_with_data_gas(
+            account_contract_address,
+            transaction_nonce!("0x3"),
+            call_param!("7"),
+        );
+
+        let input = Input {
+            request: vec![
+                declare_transaction,
+                deploy_transaction,
+                invoke_transaction,
+                invoke_transaction2,
+            ],
+            simulation_flags: vec![SimulationFlag::SkipValidate],
+            block_id: BlockId::Number(last_block_header.number),
+        };
+        let result = super::estimate_fee(context, input, RPC_VERSION)
+            .await
+            .unwrap();
+
+        let output_json = result.serialize(Serializer { version }).unwrap();
+        crate::assert_json_matches_fixture!(
+            output_json,
+            version,
+            "fee_estimates/declare_deploy_invoke_sierra_0_14_1.json"
+        );
+    }
+
     /// Invokes the test contract with an invalid entry point so that
     /// the transaction is expected to be reverted.
     fn invoke_v3_transaction_with_invalid_entry_point(
@@ -813,6 +977,8 @@ mod tests {
                 account_deployment_data: vec![],
                 nonce_data_availability_mode: DataAvailabilityMode::L2,
                 fee_data_availability_mode: DataAvailabilityMode::L2,
+                proof_facts: vec![],
+                proof: Default::default(),
             },
         ))
     }
@@ -1119,6 +1285,8 @@ mod tests {
                 nonce_data_availability_mode: DataAvailabilityMode::L1,
                 fee_data_availability_mode: DataAvailabilityMode::L1,
                 sender_address: contract_address!("0xdeadbeef"),
+                proof_facts: vec![],
+                proof: Default::default(),
             },
         );
 
@@ -1157,6 +1325,8 @@ mod tests {
                 fee_data_availability_mode: DataAvailabilityMode::L1,
                 sender_address: contract_address!("0xdeadbeef"),
                 calldata: vec![],
+                proof_facts: vec![],
+                proof: Default::default(),
             },
         );
 

@@ -73,11 +73,11 @@ pub async fn trace_transaction(
                 .context("Querying pending data")?;
 
             let (header, transactions, cache) = if let Some(pending_tx) = pending
-                .pending_transactions()
+                .pre_confirmed_transactions()
                 .iter()
                 .find(|tx| tx.hash == input.transaction_hash)
             {
-                let header = pending.pending_header();
+                let header = pending.pre_confirmed_header();
 
                 if header.starknet_version
                     < VERSIONS_LOWER_THAN_THIS_SHOULD_FALL_BACK_TO_FETCHING_TRACE_FROM_GATEWAY
@@ -87,7 +87,7 @@ pub async fn trace_transaction(
 
                 (
                     header,
-                    pending.pending_transactions().to_vec(),
+                    pending.pre_confirmed_transactions().to_vec(),
                     // Can't use the cache for pending blocks since they have no block hash.
                     pathfinder_executor::TraceCache::default(),
                 )
@@ -170,22 +170,37 @@ pub async fn trace_transaction(
             let hash = header.hash;
             let state = pathfinder_executor::ExecutionState::trace(
                 context.chain_id,
+                context.is_l3,
                 header,
                 None,
                 context.config.versioned_constants_map,
                 context.contract_addresses.eth_l2_token_address,
                 context.contract_addresses.strk_l2_token_address,
                 context.native_class_cache,
+                context
+                    .config
+                    .native_execution_force_use_for_incompatible_classes,
             );
+
+            // The flag is not included in the spec for this method. Moreover, it isn't
+            // possible to return per-transaction initial reads at the moment.
+            let return_initial_reads = false;
 
             let executor_transactions = transactions
                 .iter()
                 .map(|transaction| compose_executor_transaction(transaction, &db_tx))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            match pathfinder_executor::trace(db_tx, state, cache, hash, executor_transactions) {
-                Ok(txs) => {
-                    let trace = txs
+            match pathfinder_executor::trace(
+                db_tx,
+                state,
+                cache,
+                hash,
+                executor_transactions,
+                return_initial_reads,
+            ) {
+                Ok(pathfinder_executor::BlockTraces::TracesOnly(traces)) => {
+                    let trace = traces
                         .into_iter()
                         .find_map(|(tx_hash, trace)| {
                             if tx_hash == input.transaction_hash {
@@ -201,6 +216,9 @@ pub async fn trace_transaction(
                             ))
                         })?;
                     Ok(LocalExecution::Success(trace))
+                }
+                Ok(pathfinder_executor::BlockTraces::TracesWithInitialReads { .. }) => {
+                    unreachable!("return_initial_reads is false")
                 }
                 Err(e) => Err(e.into()),
             }
@@ -301,7 +319,6 @@ impl From<TraceTransactionError> for ApplicationError {
 pub mod tests {
 
     use super::super::trace_block_transactions::tests::{
-        setup_multi_tx_trace_pending_test,
         setup_multi_tx_trace_pre_confirmed_test,
         setup_multi_tx_trace_pre_latest_test,
         setup_multi_tx_trace_test,
@@ -315,38 +332,6 @@ pub mod tests {
     #[tokio::test]
     async fn test_multiple_transactions() -> anyhow::Result<()> {
         let (context, _, traces) = setup_multi_tx_trace_test().await?;
-
-        for trace in traces {
-            let input = Input {
-                transaction_hash: trace.transaction_hash,
-            };
-            let output = trace_transaction(context.clone(), input, RPC_VERSION)
-                .await
-                .unwrap();
-            let expected = Output(crate::dto::TransactionTrace {
-                trace: trace.trace_root,
-                include_state_diff: false,
-            });
-            pretty_assertions_sorted::assert_eq!(
-                output
-                    .serialize(Serializer {
-                        version: RPC_VERSION
-                    })
-                    .unwrap(),
-                expected
-                    .serialize(Serializer {
-                        version: RPC_VERSION
-                    })
-                    .unwrap()
-            );
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_multiple_pending_transactions() -> anyhow::Result<()> {
-        let (context, traces) = setup_multi_tx_trace_pending_test().await?;
 
         for trace in traces {
             let input = Input {

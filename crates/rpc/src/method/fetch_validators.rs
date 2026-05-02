@@ -109,6 +109,7 @@ pub async fn fetch_validators(
         consensus_fetcher::get_validators_at_height(
             &context.storage,
             context.chain_id,
+            context.is_l3,
             input.height,
         )
     })

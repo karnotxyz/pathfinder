@@ -1,0 +1,29 @@
+//! Gas Price Validation
+//!
+//! This module provides gas price validation for consensus proposals
+
+mod l1;
+mod l1_to_fri;
+mod l2;
+mod oracle;
+
+pub use l1::{
+    AddSampleError,
+    L1GasPriceConfig,
+    L1GasPriceProvider,
+    L1GasPriceValidationError,
+    L1GasPriceValidationResult,
+};
+pub use l1_to_fri::{L1ToFriValidationConfig, L1ToFriValidationResult, L1ToFriValidator};
+pub use l2::{L2GasPriceConstants, L2GasPriceProvider, L2GasPriceValidationResult};
+pub use oracle::{EthToFriOracle, EthToFriOracleError};
+
+/// Calculates the percentage deviation between two values.
+/// Returns 0.0 for equal values, 0.10 for 10% deviation, etc.
+pub(crate) fn deviation_pct(proposed: u128, expected: u128) -> f64 {
+    match (expected, proposed) {
+        (0, 0) => 0.0,
+        (0, _) => f64::INFINITY,
+        _ => (proposed as f64 - expected as f64).abs() / expected as f64,
+    }
+}

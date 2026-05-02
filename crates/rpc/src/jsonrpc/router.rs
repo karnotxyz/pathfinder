@@ -124,12 +124,17 @@ impl RpcRouter {
             return Some(RpcResponse::method_not_found(request.id, self.version));
         };
 
-        metrics::increment_counter!("rpc_method_calls_total", "method" => method_name, "version" => self.version.to_str());
+        metrics::counter!("rpc_method_calls_total", "method" => method_name, "version" => self.version.to_str()).increment(1);
+
+        let start = std::time::Instant::now();
 
         let method = method
             .invoke(self.context.clone(), request.params, self.version)
             .instrument(tracing::debug_span!("rpc_call", method=%method_name));
         let result = std::panic::AssertUnwindSafe(method).catch_unwind().await;
+
+        let duration = start.elapsed();
+        metrics::histogram!("rpc_method_calls_duration_milliseconds", "method" => method_name, "version" => self.version.to_str()).record(duration.as_millis() as f64);
 
         let output = match result {
             Ok(output) => output,
@@ -142,7 +147,7 @@ impl RpcRouter {
         };
 
         if output.is_err() {
-            metrics::increment_counter!("rpc_method_calls_failed_total", "method" => method_name, "version" => self.version.to_str());
+            metrics::counter!("rpc_method_calls_failed_total", "method" => method_name, "version" => self.version.to_str()).increment(1);
         }
 
         Some(RpcResponse {
@@ -196,10 +201,11 @@ pub async fn rpc_handler(
                 return StatusCode::FORBIDDEN.into_response();
             }
 
-            ws.on_upgrade(|ws| async move {
-                let (ws_tx, ws_rx) = split_ws(ws, state.version);
-                handle_json_rpc_socket(state, ws_tx, ws_rx);
-            })
+            ws.max_message_size(crate::REQUEST_MAX_SIZE)
+                .on_upgrade(|ws| async move {
+                    let (ws_tx, ws_rx) = split_ws(ws, state.version);
+                    handle_json_rpc_socket(state, ws_tx, ws_rx);
+                })
         }
         Err(_) => {
             if method != http::Method::POST {
@@ -487,8 +493,6 @@ mod tests {
                 Ok(Value::Number((input.0.iter().sum::<i32>()).into()))
             }
 
-            #[derive(Debug, Deserialize, Serialize)]
-            struct GetDataInput;
             #[derive(Debug, Deserialize, Serialize)]
             struct GetDataOutput(Vec<Value>);
             async fn get_data() -> Result<GetDataOutput, ExampleError> {

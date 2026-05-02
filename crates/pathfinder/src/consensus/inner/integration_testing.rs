@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use p2p_proto::consensus::ProposalPart;
+use pathfinder_consensus::VoteType;
 
 use crate::config::integration_testing::{InjectFailureConfig, InjectFailureTrigger};
 
@@ -110,19 +111,15 @@ pub fn debug_fail_on_proposal_part(
                         ProposalPart::BlockInfo(_),
                         InjectFailureTrigger::BlockInfoRx
                     )
+                    | (ProposalPart::Fin(_), InjectFailureTrigger::ProposalFinRx)
                     | (
                         ProposalPart::TransactionBatch(_),
                         InjectFailureTrigger::TransactionBatchRx
                     )
                     | (
-                        ProposalPart::ProposalCommitment(_),
-                        InjectFailureTrigger::ProposalCommitmentRx
+                        ProposalPart::ExecutedTransactionCount(_),
+                        InjectFailureTrigger::ExecutedTransactionCountRx
                     )
-                    | (
-                        ProposalPart::TransactionsFin(_),
-                        InjectFailureTrigger::TransactionsFinRx
-                    )
-                    | (ProposalPart::Fin(_), InjectFailureTrigger::ProposalFinRx)
             )
         },
         height,
@@ -131,26 +128,13 @@ pub fn debug_fail_on_proposal_part(
     );
 }
 
-pub fn debug_fail_on_entire_proposal_rx(
+pub fn debug_fail_on_proposal_finalized(
     height: u64,
     inject_failure: Option<InjectFailureConfig>,
     data_directory: &Path,
 ) {
     debug_fail_on(
-        |trigger| matches!(trigger, InjectFailureTrigger::EntireProposalRx),
-        height,
-        inject_failure,
-        data_directory,
-    );
-}
-
-pub fn debug_fail_on_entire_proposal_persisted(
-    height: u64,
-    inject_failure: Option<InjectFailureConfig>,
-    data_directory: &Path,
-) {
-    debug_fail_on(
-        |trigger| matches!(trigger, InjectFailureTrigger::EntireProposalPersisted),
+        |trigger| matches!(trigger, InjectFailureTrigger::ProposalFinalized),
         height,
         inject_failure,
         data_directory,
@@ -188,7 +172,7 @@ pub fn debug_fail_on_vote(
                 )
             )
         },
-        vote.block_number,
+        vote.height,
         inject_failure,
         data_directory,
     );
@@ -205,4 +189,81 @@ pub fn debug_fail_on_decided(
         inject_failure,
         data_directory,
     );
+}
+
+#[cfg(all(
+    feature = "p2p",
+    feature = "consensus-integration-tests",
+    debug_assertions
+))]
+pub fn send_outdated_vote(vote_height: u64, inject_failure: Option<InjectFailureConfig>) -> bool {
+    matches!(inject_failure,
+        Some(InjectFailureConfig {
+            height,
+            trigger: InjectFailureTrigger::OutdatedVote,
+        }) if vote_height >= height
+    )
+}
+
+#[cfg(not(all(
+    feature = "p2p",
+    feature = "consensus-integration-tests",
+    debug_assertions
+)))]
+pub fn send_outdated_vote(
+    _proposal_height: u64,
+    _inject_failure: Option<InjectFailureConfig>,
+) -> bool {
+    false
+}
+
+#[cfg(all(
+    feature = "p2p",
+    feature = "consensus-integration-tests",
+    debug_assertions
+))]
+pub fn debug_ignore_received_vote(
+    vote_type: VoteType,
+    vote_height: u64,
+    vote_round: Option<u32>,
+    inject_failure: Option<InjectFailureConfig>,
+) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static IGNORE_RECEIVED_VOTE: AtomicBool = AtomicBool::new(true);
+
+    let ret = if matches!(vote_type, VoteType::Precommit)
+        && matches!(vote_round, Some(0))
+        && matches!(inject_failure,
+                    Some(InjectFailureConfig {
+                        height,
+                        trigger: InjectFailureTrigger::CommittedVoteLost,
+                    }) if vote_height == height
+        ) {
+        // Drop the message just once, not on re-send.
+        IGNORE_RECEIVED_VOTE.swap(false, Ordering::Relaxed)
+    } else {
+        false
+    };
+    if ret {
+        tracing::info!(
+            "💥 Integration testing: ignoring PRECOMMIT vote at height {vote_height}, as \
+             configured"
+        );
+    }
+    ret
+}
+
+#[cfg(not(all(
+    feature = "p2p",
+    feature = "consensus-integration-tests",
+    debug_assertions
+)))]
+pub fn debug_ignore_received_vote(
+    _vote_type: VoteType,
+    _proposal_height: u64,
+    _vote_round: Option<u32>,
+    _inject_failure: Option<InjectFailureConfig>,
+) -> bool {
+    false
 }

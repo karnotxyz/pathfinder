@@ -14,7 +14,7 @@ path = "src/lib.rs"
 cairo-native = ["pathfinder-executor/cairo-native"]
 consensus-integration-tests = []
 tokio-console = ["console-subscriber", "tokio/tracing"]
-p2p = ["pathfinder-consensus"]
+p2p = ["pathfinder-consensus", "pathfinder-validator"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -34,9 +34,11 @@ ipnet = { workspace = true }
 jemallocator = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+num-bigint = { workspace = true }
 p2p = { path = "../p2p" }
 p2p_proto = { path = "../p2p_proto" }
 paste = { workspace = true }
+pathfinder-block-commitments = { path = "../block-commitments" }
 pathfinder-block-hashes = { path = "../block-hashes" }
 pathfinder-casm-hashes = { path = "../casm-hashes" }
 pathfinder-class-hash = { path = "../class-hash" }
@@ -47,22 +49,23 @@ pathfinder-consensus-fetcher = { path = "../consensus-fetcher" }
 pathfinder-crypto = { path = "../crypto" }
 pathfinder-ethereum = { path = "../ethereum" }
 pathfinder-executor = { path = "../executor" }
+pathfinder-gas-price = { path = "../gas-price" }
 pathfinder-merkle-tree = { path = "../merkle-tree" }
 pathfinder-retry = { path = "../retry" }
 pathfinder-rpc = { path = "../rpc" }
 pathfinder-serde = { path = "../serde" }
 pathfinder-storage = { path = "../storage" }
+pathfinder-validator = { path = "../validator", optional = true }
 pathfinder-version = { path = "../version" }
 primitive-types = { workspace = true }
 rand = { workspace = true }
+rand_chacha = { workspace = true }
 rayon = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = [
-    "arbitrary_precision",
-    "raw_value",
-] }
+serde_json = { workspace = true, features = ["arbitrary_precision", "raw_value"] }
 sha3 = { workspace = true }
 starknet-gateway-client = { path = "../gateway-client" }
 starknet-gateway-types = { path = "../gateway-types" }
@@ -73,11 +76,7 @@ time = { workspace = true, features = ["macros"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = [
-    "env-filter",
-    "time",
-    "ansi",
-] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time", "ansi"] }
 url = { workspace = true }
 util = { path = "../util" }
 zeroize = { workspace = true }
@@ -92,12 +91,10 @@ pathfinder-common = { path = "../common", features = ["full-serde"] }
 pathfinder-compiler = { path = "../compiler" }
 pathfinder-executor = { path = "../executor" }
 pathfinder-rpc = { path = "../rpc" }
-pathfinder-storage = { path = "../storage", features = [
-    "small_aggregate_filters",
-] }
+pathfinder-storage = { path = "../storage", features = ["small_aggregate_filters"] }
+pathfinder-validator = { path = "../validator", features = ["skip-commitment-validation"] }
 pretty_assertions_sorted = { workspace = true }
 proptest = { workspace = true }
-rand_chacha = { workspace = true }
 rstest = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled"] }
 serde_with = { workspace = true }

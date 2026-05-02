@@ -112,6 +112,7 @@ pub enum AddDeployAccountTransactionError {
     NonAccount,
     UnsupportedTransactionVersion,
     UnexpectedError(String),
+    ForwardedError(reqwest::Error),
 }
 
 impl From<anyhow::Error> for AddDeployAccountTransactionError {
@@ -133,6 +134,7 @@ impl From<AddDeployAccountTransactionError> for crate::error::ApplicationError {
             NonAccount => Self::NonAccount,
             UnsupportedTransactionVersion => Self::UnsupportedTxVersion,
             UnexpectedError(data) => Self::UnexpectedError { data },
+            ForwardedError(error) => Self::ForwardedError(error),
         }
     }
 }
@@ -177,6 +179,11 @@ impl From<SequencerError> for AddDeployAccountTransactionError {
             }
             SequencerError::StarknetError(e) if e.code == EntryPointNotFound.into() => {
                 AddDeployAccountTransactionError::NonAccount
+            }
+            SequencerError::ReqwestError(e)
+                if e.status() == Some(reqwest::StatusCode::PAYLOAD_TOO_LARGE) =>
+            {
+                AddDeployAccountTransactionError::ForwardedError(e)
             }
             _ => AddDeployAccountTransactionError::UnexpectedError(e.to_string()),
         }
@@ -335,6 +342,8 @@ mod tests {
     use pathfinder_common::macro_prelude::*;
     use pathfinder_common::prelude::*;
     use pathfinder_common::transaction::{DataAvailabilityMode, ResourceBound, ResourceBounds};
+    use starknet_gateway_types::error::{test_response_from, KnownStarknetErrorCode};
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::dto::{SerializeForVersion, Serializer};
@@ -380,11 +389,7 @@ mod tests {
 
     #[test]
     fn unexpected_error_message() {
-        use starknet_gateway_types::error::{
-            KnownStarknetErrorCode,
-            StarknetError,
-            StarknetErrorCode,
-        };
+        use starknet_gateway_types::error::{StarknetError, StarknetErrorCode};
         let starknet_error = SequencerError::StarknetError(StarknetError {
             code: StarknetErrorCode::Known(KnownStarknetErrorCode::TransactionLimitExceeded),
             message: "StarkNet Alpha throughput limit reached, please wait a few minutes and try \
@@ -439,13 +444,21 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "gateway 429"]
     async fn duplicate_transaction() {
-        let context = RpcContext::for_tests();
+        let (body, code) = test_response_from(KnownStarknetErrorCode::DuplicatedTransaction);
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/gateway/add_transaction"))
+            .respond_with(ResponseTemplate::new(code).set_body_string(body))
+            .mount(&server)
+            .await;
+        let mut context = RpcContext::for_tests();
+        context.sequencer =
+            starknet_gateway_client::Client::for_test(server.uri().parse().unwrap())
+                .unwrap()
+                .disable_retry_for_tests();
 
-        let input = get_input();
-
-        let error = add_deploy_account_transaction(context, input)
+        let error = add_deploy_account_transaction(context, get_input())
             .await
             .expect_err("add_deploy_account_transaction");
         assert_matches::assert_matches!(
@@ -455,49 +468,50 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "gateway 429"]
     // https://external.integration.starknet.io/feeder_gateway/get_transaction?transactionHash=0x29fd7881f14380842414cdfdd8d6c0b1f2174f8916edcfeb1ede1eb26ac3ef0
     async fn duplicate_v3_transaction() {
-        let context = RpcContext::for_tests_on(pathfinder_common::Chain::SepoliaIntegration);
-
-        let input = BroadcastedDeployAccountTransactionV3 {
-            version: TransactionVersion::THREE,
-            signature: vec![
-                transaction_signature_elem!(
-                    "0x6d756e754793d828c6c1a89c13f7ec70dbd8837dfeea5028a673b80e0d6b4ec"
-                ),
-                transaction_signature_elem!(
-                    "0x4daebba599f860daee8f6e100601d98873052e1c61530c630cc4375c6bd48e3"
-                ),
-            ],
-            nonce: transaction_nonce!("0x0"),
-            resource_bounds: ResourceBounds {
-                l1_gas: ResourceBound {
-                    max_amount: ResourceAmount(0x186a0),
-                    max_price_per_unit: ResourcePricePerUnit(0x5af3107a4000),
-                },
-                l2_gas: ResourceBound {
-                    max_amount: ResourceAmount(0),
-                    max_price_per_unit: ResourcePricePerUnit(0),
-                },
-                l1_data_gas: None,
-            },
-            tip: Tip(0),
-            paymaster_data: vec![],
-            nonce_data_availability_mode: DataAvailabilityMode::L1,
-            fee_data_availability_mode: DataAvailabilityMode::L1,
-            contract_address_salt: contract_address_salt!("0x0"),
-            constructor_calldata: vec![call_param!(
-                "0x5cd65f3d7daea6c63939d659b8473ea0c5cd81576035a4d34e52fb06840196c"
-            )],
-            class_hash: class_hash!(
-                "0x2338634f11772ea342365abd5be9d9dc8a6f44f159ad782fdebd3db5d969738"
-            ),
-        };
+        let (body, code) = test_response_from(KnownStarknetErrorCode::DuplicatedTransaction);
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/gateway/add_transaction"))
+            .respond_with(ResponseTemplate::new(code).set_body_string(body))
+            .mount(&server)
+            .await;
+        let mut context = RpcContext::for_tests_on(pathfinder_common::Chain::SepoliaIntegration);
+        context.sequencer =
+            starknet_gateway_client::Client::for_test(server.uri().parse().unwrap())
+                .unwrap()
+                .disable_retry_for_tests();
 
         let input = Input {
             deploy_account_transaction: Transaction::DeployAccount(
-                BroadcastedDeployAccountTransaction::V3(input),
+                BroadcastedDeployAccountTransaction::V3(BroadcastedDeployAccountTransactionV3 {
+                    version: TransactionVersion::THREE,
+                    signature: vec![],
+                    nonce: transaction_nonce!("0x0"),
+                    resource_bounds: ResourceBounds {
+                        l1_gas: ResourceBound {
+                            max_amount: ResourceAmount(0x186a0),
+                            max_price_per_unit: ResourcePricePerUnit(0x5af3107a4000),
+                        },
+                        l2_gas: ResourceBound {
+                            max_amount: ResourceAmount(0),
+                            max_price_per_unit: ResourcePricePerUnit(0),
+                        },
+                        l1_data_gas: None,
+                    },
+                    tip: Tip(0),
+                    paymaster_data: vec![],
+                    nonce_data_availability_mode: DataAvailabilityMode::L1,
+                    fee_data_availability_mode: DataAvailabilityMode::L1,
+                    contract_address_salt: contract_address_salt!("0x0"),
+                    constructor_calldata: vec![call_param!(
+                        "0x5cd65f3d7daea6c63939d659b8473ea0c5cd81576035a4d34e52fb06840196c"
+                    )],
+                    class_hash: class_hash!(
+                        "0x2338634f11772ea342365abd5be9d9dc8a6f44f159ad782fdebd3db5d969738"
+                    ),
+                }),
             ),
         };
 

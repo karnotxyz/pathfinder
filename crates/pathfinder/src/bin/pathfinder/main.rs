@@ -11,21 +11,29 @@ use ::p2p::sync::client::peer_agnostic::Client as P2PSyncClient;
 use anyhow::Context;
 use config::BlockchainHistory;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use pathfinder_common::class_definition::SerializedSierraDefinition;
 use pathfinder_common::{BlockNumber, Chain, ChainId, EthereumChain};
-use pathfinder_ethereum::{EthereumApi, EthereumClient};
+use pathfinder_ethereum::EthereumClient;
+use pathfinder_gas_price::{L1GasPriceConfig, L1GasPriceProvider};
+#[cfg(feature = "p2p")]
 use pathfinder_lib::consensus::ConsensusTaskHandles;
-use pathfinder_lib::state::SyncContext;
+use pathfinder_lib::state::{sync_gas_prices, L1GasPriceSyncConfig, SyncContext};
+use pathfinder_lib::ConsensusChannels;
+#[cfg(feature = "p2p")]
 use pathfinder_lib::{config, consensus, monitoring, p2p_network, state};
+#[cfg(not(feature = "p2p"))]
+use pathfinder_lib::{config, monitoring, p2p_network, state};
 use pathfinder_rpc::context::{EthContractAddresses, WebsocketContext};
 use pathfinder_rpc::{Notifications, SyncState};
 use pathfinder_storage::Storage;
 use starknet_gateway_client::GatewayApi;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinError;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::config::{NetworkConfig, StateTries};
+use crate::config::{CompileConfig, NetworkConfig, StateTries};
 
+mod http_client_refresh;
 mod update;
 
 // The Cairo VM allocates felts on the stack, so during execution it's making
@@ -35,24 +43,33 @@ mod update;
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn main() -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
-        .build()
-        .unwrap()
-        .block_on(async {
-            async_main().await?;
-            Ok(())
-        })
+    let cli = config::parse_cli();
+    match cli.command {
+        config::Command::Node(args) => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(8 * 1024 * 1024)
+            .build()
+            .unwrap()
+            .block_on(async move {
+                node_main(args).await?;
+                Ok(())
+            }),
+        config::Command::Compile(config) => compile_main(config),
+    }
 }
 
-async fn async_main() -> anyhow::Result<Storage> {
+async fn node_main(args: Box<config::NodeArgs>) -> anyhow::Result<Storage> {
     if std::env::var_os("RUST_LOG").is_none() {
         // Disable all dependency logs by default.
         std::env::set_var("RUST_LOG", "pathfinder=info,error");
     }
 
-    let config = config::Config::parse();
+    // Configure rustls crypto provider.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("rustls crypto provider setup should not fail");
+
+    let config = config::Config::parse(args);
 
     setup_tracing(
         config.color,
@@ -111,6 +128,7 @@ async fn async_main() -> anyhow::Result<Storage> {
         &config.data_directory,
         config.gateway_api_key.clone(),
         config.gateway_timeout,
+        config.gateway_dns_refresh_interval,
     )
     .await
     .context("Configuring pathfinder")?;
@@ -237,8 +255,15 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         versioned_constants_map: config.versioned_constants_map.clone(),
         native_execution: config.native_execution.is_enabled(),
         native_class_cache_size: config.native_execution.class_cache_size(),
+        native_compiler_optimization_level: config.native_execution.optimization_level(),
+        native_execution_force_use_for_incompatible_classes: config
+            .native_execution
+            .force_use_for_incompatible_classes(),
         submission_tracker_time_limit: config.submission_tracker_time_limit,
         submission_tracker_size_limit: config.submission_tracker_size_limit,
+        block_trace_cache_size: config.rpc_block_trace_cache_size,
+        compiler_resource_limits: config.compiler_resource_limits,
+        blockifier_libfuncs: config.blockifier_libfuncs,
     };
 
     let notifications = Notifications::default();
@@ -247,6 +272,7 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         execution_storage,
         sync_state.clone(),
         pathfinder_context.network_id,
+        pathfinder_context.is_l3,
         pathfinder_context.contract_addresses,
         pathfinder_context.gateway.clone(),
         rx_pending.clone(),
@@ -299,39 +325,112 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
     .await;
 
     let integration_testing_config = config.integration_testing;
-    let ConsensusTaskHandles {
-        consensus_p2p_event_processing_handle,
-        consensus_engine_handle,
-        consensus_info_watch,
-    } = if let Some(consensus_config) = &config.consensus {
-        let wal_directory = config.data_directory.join("consensus").join("wal");
-        if !wal_directory.exists() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .create(&wal_directory)
-                .context("Creating consensus wal directory")?;
-        }
 
-        if let Some((event_rx, client)) = consensus_p2p_client_and_event_rx {
-            consensus::start(
-                consensus_config.clone(),
-                chain_id,
-                consensus_storage,
-                wal_directory,
-                client,
-                event_rx,
-                &config.data_directory,
-                // Does nothing in production builds. Used for integration testing only.
-                integration_testing_config.inject_failure_config(),
+    // Create L1 gas price provider and sync task if consensus is enabled
+    let gas_price_provider = if integration_testing_config.is_gas_price_validation_disabled() {
+        None
+    } else if let Some(consensus_config) = &config.consensus {
+        let provider = L1GasPriceProvider::new({
+            #[cfg(feature = "p2p")]
+            {
+                L1GasPriceConfig {
+                    tolerance: consensus_config.l1_gas_price_tolerance,
+                    max_time_gap_seconds: consensus_config.l1_gas_price_max_time_gap,
+                    ..Default::default()
+                }
+            }
+            #[cfg(not(feature = "p2p"))]
+            {
+                let _ = consensus_config;
+                L1GasPriceConfig::default()
+            }
+        });
+
+        // Spawn the L1 gas price sync task
+        let sync_provider = provider.clone();
+        let ethereum_client = ethereum.client.clone();
+        util::task::spawn(async move {
+            if let Err(e) = sync_gas_prices(
+                ethereum_client,
+                sync_provider,
+                L1GasPriceSyncConfig::default(),
             )
-        } else {
-            ConsensusTaskHandles::pending()
-        }
+            .await
+            {
+                tracing::error!(error = %e, "L1 gas price sync task failed");
+            }
+        });
+
+        Some(provider)
     } else {
-        ConsensusTaskHandles::pending()
+        None
     };
 
-    let context = if let Some(consensus_info_watch) = consensus_info_watch {
+    #[cfg(feature = "p2p")]
+    let (
+        consensus_p2p_event_processing_handle,
+        consensus_engine_handle,
+        consensus_channels,
+        worker_pool,
+    ) = {
+        let handles = if let Some(consensus_config) = &config.consensus {
+            let wal_directory = config.data_directory.join("consensus").join("wal");
+            if !wal_directory.exists() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .create(&wal_directory)
+                    .context("Creating consensus wal directory")?;
+            }
+
+            if let Some((event_rx, client)) = consensus_p2p_client_and_event_rx {
+                consensus::start(
+                    consensus_config.clone(),
+                    chain_id,
+                    pathfinder_context.is_l3,
+                    consensus_storage,
+                    client,
+                    event_rx,
+                    wal_directory,
+                    &config.data_directory,
+                    gas_price_provider.clone(),
+                    config.verify_tree_hashes,
+                    config.compiler_resource_limits,
+                    config.blockifier_libfuncs,
+                    // Does nothing in production builds. Used for integration testing only.
+                    integration_testing_config.inject_failure_config(),
+                )
+            } else {
+                ConsensusTaskHandles::pending()
+            }
+        } else {
+            ConsensusTaskHandles::pending()
+        };
+        (
+            handles.consensus_p2p_event_processing_handle,
+            handles.consensus_engine_handle,
+            handles.consensus_channels,
+            handles.worker_pool,
+        )
+    };
+
+    #[cfg(not(feature = "p2p"))]
+    let (consensus_p2p_event_processing_handle, consensus_engine_handle, consensus_channels) = {
+        let _ = (
+            consensus_storage,
+            consensus_p2p_client_and_event_rx,
+            gas_price_provider,
+        );
+        (
+            tokio::task::spawn(std::future::pending::<anyhow::Result<()>>()),
+            tokio::task::spawn(std::future::pending::<anyhow::Result<()>>()),
+            None::<ConsensusChannels>,
+        )
+    };
+
+    let context = if let Some(consensus_info_watch) = consensus_channels
+        .as_ref()
+        .map(|cc| cc.consensus_info_watch.clone())
+    {
         context.with_consensus_info_watch(consensus_info_watch)
     } else {
         context
@@ -351,6 +450,23 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         None => rpc_server,
     };
 
+    let http_client_refresh_handle =
+        util::task::spawn(http_client_refresh::refresh_http_client_periodically(
+            pathfinder_context.gateway.clone(),
+            pathfinder_context.gateway_dns_refresh_interval,
+        ));
+
+    // Nodes that ran v0.17.0–v0.19.x with pruning enabled may have
+    // class_definitions rows where definition IS NULL that were never filled due
+    // to a storage bug. This task re-downloads any such definitions on startup.
+    util::task::spawn(state::repair::repair_missing_class_definitions(
+        sync_storage.clone(),
+        pathfinder_context.gateway.clone(),
+        config.compiler_resource_limits,
+        config.blockifier_libfuncs,
+        config.fetch_casm_from_fgw,
+    ));
+
     let sync_handle = if config.is_sync_enabled {
         start_sync(
             sync_storage,
@@ -360,10 +476,10 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
             &config,
             submitted_tx_tracker,
             tx_pending,
+            consensus_channels,
             notifications,
             gateway_public_key,
             sync_p2p_client,
-            config.verify_tree_hashes,
         )
     } else {
         tokio::task::spawn(futures::future::pending())
@@ -402,6 +518,7 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         result = consensus_p2p_handle => handle_critical_task_result("Consensus P2P network", result),
         result = consensus_p2p_event_processing_handle => handle_critical_task_result("Consensus P2P event processing", result),
         result = consensus_engine_handle => handle_critical_task_result("Consensus engine", result),
+        result = http_client_refresh_handle => handle_critical_task_result("HTTP client refresh", result),
         _ = term_signal.recv() => {
             tracing::info!("TERM signal received");
             Ok(())
@@ -426,6 +543,21 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
         }
     }
 
+    // Join all worker pool threads so that they don't panic when the `p2p_task` is
+    // cancelled.
+    #[cfg(feature = "p2p")]
+    if let Some(worker_pool) = worker_pool {
+        match Arc::try_unwrap(worker_pool) {
+            Ok(pool) => pool.join(),
+            Err(pool) => {
+                tracing::error!(
+                    "Failed to join worker pool, refcount is: {}",
+                    Arc::strong_count(&pool)
+                );
+            }
+        }
+    }
+
     let jh = tokio::task::spawn_blocking(|| -> anyhow::Result<Storage> {
         shutdown_storage
             .connection()
@@ -446,6 +578,27 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
     // that all RO pools and all but one RW pools are dropped when task tracker
     // finishes waiting, and then we drop the last RW pool.
     main_result.map(|_| shutdown_storage)
+}
+
+fn compile_main(config: CompileConfig) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+
+    const SIERRA_DEFINITION_SIZE_ESTIMATE: usize = 400 * 1024; // 400 KiB
+    let mut sierra_bytes = Vec::with_capacity(SIERRA_DEFINITION_SIZE_ESTIMATE);
+    std::io::stdin()
+        .read_to_end(&mut sierra_bytes)
+        .context("reading Sierra from stdin")?;
+    let sierra_definition = SerializedSierraDefinition::from_bytes(sierra_bytes);
+
+    let casm = pathfinder_compiler::compile_sierra_to_casm_impl(
+        &sierra_definition,
+        config.blockifier_libfuncs.into(),
+    )
+    .context("compiling Sierra to CASM")?;
+
+    std::io::stdout()
+        .write_all(casm.as_bytes())
+        .context("writing CASM to stdout")
 }
 
 #[cfg(feature = "tokio-console")]
@@ -525,10 +678,10 @@ fn start_sync(
     config: &config::Config,
     submitted_tx_tracker: pathfinder_rpc::tracker::SubmittedTransactionTracker,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
+    consensus_channels: Option<ConsensusChannels>,
     notifications: Notifications,
     gateway_public_key: pathfinder_common::PublicKey,
     p2p_client: Option<P2PSyncClient>,
-    verify_tree_hashes: bool,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     if config.sync_p2p.proxy {
         start_feeder_gateway_sync(
@@ -542,6 +695,19 @@ fn start_sync(
             notifications,
             gateway_public_key,
         )
+    } else if let Some(consensus_channels) = consensus_channels {
+        start_consensus_aware_fgw_sync(
+            storage,
+            pathfinder_context,
+            ethereum_client,
+            sync_state,
+            config,
+            submitted_tx_tracker,
+            tx_pending,
+            notifications,
+            gateway_public_key,
+            consensus_channels,
+        )
     } else {
         let p2p_client = p2p_client.expect("P2P client is expected with the p2p feature enabled");
         start_p2p_sync(
@@ -551,7 +717,9 @@ fn start_sync(
             p2p_client,
             gateway_public_key,
             config.sync_p2p.l1_checkpoint_override,
-            verify_tree_hashes,
+            config.verify_tree_hashes,
+            config.compiler_resource_limits,
+            config.blockifier_libfuncs,
         )
     }
 }
@@ -566,10 +734,10 @@ fn start_sync(
     config: &config::Config,
     submitted_tx_tracker: pathfinder_rpc::tracker::SubmittedTransactionTracker,
     tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
+    _consensus_channels: Option<ConsensusChannels>,
     notifications: Notifications,
     gateway_public_key: pathfinder_common::PublicKey,
     _p2p_client: Option<P2PSyncClient>,
-    _verify_tree_hashes: bool,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     start_feeder_gateway_sync(
         storage,
@@ -616,12 +784,61 @@ fn start_feeder_gateway_sync(
         sequencer_public_key: gateway_public_key,
         fetch_concurrency: config.feeder_gateway_fetch_concurrency,
         fetch_casm_from_fgw: config.fetch_casm_from_fgw,
+        compiler_resource_limits: config.compiler_resource_limits,
+        blockifier_libfuncs: config.blockifier_libfuncs,
     };
 
     util::task::spawn(state::sync(sync_context, state::l1::sync, state::l2::sync))
 }
 
 #[cfg(feature = "p2p")]
+#[allow(clippy::too_many_arguments)]
+fn start_consensus_aware_fgw_sync(
+    storage: Storage,
+    pathfinder_context: PathfinderContext,
+    ethereum_client: EthereumClient,
+    sync_state: Arc<SyncState>,
+    config: &config::Config,
+    submitted_tx_tracker: pathfinder_rpc::tracker::SubmittedTransactionTracker,
+    tx_pending: tokio::sync::watch::Sender<pathfinder_rpc::PendingData>,
+    notifications: Notifications,
+    gateway_public_key: pathfinder_common::PublicKey,
+    consensus_channels: ConsensusChannels,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let sync_context = SyncContext {
+        storage,
+        ethereum: ethereum_client,
+        chain: pathfinder_context.network,
+        chain_id: pathfinder_context.network_id,
+        core_address: pathfinder_context.contract_addresses.l1_contract_address,
+        sequencer: pathfinder_context.gateway,
+        state: sync_state.clone(),
+        head_poll_interval: config.poll_interval,
+        l1_poll_interval: config.l1_poll_interval,
+        pending_data: tx_pending,
+        submitted_tx_tracker,
+        block_validation_mode: state::l2::BlockValidationMode::Strict,
+        notifications,
+        block_cache_size: 10_000,
+        restart_delay: config.debug.restart_delay,
+        verify_tree_hashes: config.verify_tree_hashes,
+        sequencer_public_key: gateway_public_key,
+        compiler_resource_limits: config.compiler_resource_limits,
+        blockifier_libfuncs: config.blockifier_libfuncs,
+        fetch_concurrency: config.feeder_gateway_fetch_concurrency,
+        fetch_casm_from_fgw: config.fetch_casm_from_fgw,
+    };
+
+    util::task::spawn(state::consensus_sync(
+        sync_context,
+        state::l1::sync,
+        state::l2::consensus_sync,
+        consensus_channels,
+    ))
+}
+
+#[cfg(feature = "p2p")]
+#[allow(clippy::too_many_arguments)]
 fn start_p2p_sync(
     storage: Storage,
     pathfinder_context: PathfinderContext,
@@ -630,6 +847,8 @@ fn start_p2p_sync(
     gateway_public_key: pathfinder_common::PublicKey,
     l1_checkpoint_override: Option<pathfinder_ethereum::EthereumStateUpdate>,
     verify_tree_hashes: bool,
+    compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     use pathfinder_block_hashes::BlockHashDb;
 
@@ -643,6 +862,8 @@ fn start_p2p_sync(
         public_key: gateway_public_key,
         l1_checkpoint_override,
         verify_tree_hashes,
+        compiler_resource_limits,
+        blockifier_libfuncs,
         block_hash_db: Some(BlockHashDb::new(pathfinder_context.network)),
     };
     util::task::spawn(sync.run())
@@ -661,10 +882,12 @@ async fn spawn_monitoring(
         .install_recorder()
         .context("Creating Prometheus recorder")?;
 
-    metrics::gauge!("pathfinder_build_info", 1.0, "version" => pathfinder_version::VERSION);
+    metrics::gauge!("pathfinder_build_info", "version" => pathfinder_version::VERSION).set(1.0);
 
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => metrics::gauge!("process_start_time_seconds", duration.as_secs() as f64),
+        Ok(duration) => {
+            metrics::gauge!("process_start_time_seconds").set(duration.as_secs() as f64)
+        }
         Err(err) => tracing::error!("Failed to read system time: {:?}", err),
     }
 
@@ -688,16 +911,13 @@ struct EthereumContext {
 impl EthereumContext {
     /// Configure an [EthereumContext]'s transport and read the chain ID using
     /// it.
-    async fn setup(mut url: reqwest::Url, password: &Option<String>) -> anyhow::Result<Self> {
-        // Make sure the URL is a WS URL
-        if url.scheme().eq("http") {
-            warn!("The provided Ethereum URL is using HTTP, converting to WS");
-            url.set_scheme("ws")
-                .map_err(|_| anyhow::anyhow!("Failed to set Ethereum URL scheme to ws"))?;
-        } else if url.scheme().eq("https") {
-            warn!("The provided Ethereum URL is using HTTPS, converting to WSS");
-            url.set_scheme("wss")
-                .map_err(|_| anyhow::anyhow!("Failed to set Ethereum URL scheme to wss"))?;
+    async fn setup(url: reqwest::Url, password: &Option<String>) -> anyhow::Result<Self> {
+        // Require WebSocket URL - EthereumClient uses WebSocket for all operations
+        if !matches!(url.scheme(), "ws" | "wss") {
+            anyhow::bail!(
+                "Ethereum URL must use WebSocket protocol (ws:// or wss://), got: {url}\n\nHint: \
+                 Change your --ethereum.url from http(s):// to ws(s)://"
+            );
         }
 
         let client = if let Some(password) = password.as_ref() {
@@ -708,7 +928,7 @@ impl EthereumContext {
 
         let chain = client.get_chain().await.context(
             r"Determining Ethereum chain.
-                            
+
 Hint: Make sure the provided ethereum.url and ethereum.password are good.",
         )?;
 
@@ -736,7 +956,9 @@ If you are trying to connect to a custom Starknet on another Ethereum network, p
 struct PathfinderContext {
     network: Chain,
     network_id: ChainId,
+    is_l3: bool,
     gateway: starknet_gateway_client::Client,
+    gateway_dns_refresh_interval: std::time::Duration,
     database: PathBuf,
     contract_addresses: EthContractAddresses,
 }
@@ -747,7 +969,7 @@ mod pathfinder_context {
     use std::time::Duration;
 
     use anyhow::Context;
-    use pathfinder_common::{Chain, ChainId};
+    use pathfinder_common::{Chain, ChainId, SettlementLayerAddress};
     use pathfinder_ethereum::core_addr;
     use pathfinder_rpc::context::EthContractAddresses;
     use reqwest::Url;
@@ -762,27 +984,34 @@ mod pathfinder_context {
             data_directory: &Path,
             api_key: Option<String>,
             gateway_timeout: Duration,
+            gateway_dns_refresh_interval: Duration,
         ) -> anyhow::Result<Self> {
             let context = match cfg {
                 NetworkConfig::Mainnet => Self {
                     network: Chain::Mainnet,
                     network_id: ChainId::MAINNET,
+                    is_l3: false,
                     gateway: GatewayClient::mainnet(gateway_timeout).with_api_key(api_key),
+                    gateway_dns_refresh_interval,
                     database: data_directory.join("mainnet.sqlite"),
                     contract_addresses: EthContractAddresses::new_known(core_addr::MAINNET),
                 },
                 NetworkConfig::SepoliaTestnet => Self {
                     network: Chain::SepoliaTestnet,
                     network_id: ChainId::SEPOLIA_TESTNET,
+                    is_l3: false,
                     gateway: GatewayClient::sepolia_testnet(gateway_timeout).with_api_key(api_key),
+                    gateway_dns_refresh_interval,
                     database: data_directory.join("testnet-sepolia.sqlite"),
                     contract_addresses: EthContractAddresses::new_known(core_addr::SEPOLIA_TESTNET),
                 },
                 NetworkConfig::SepoliaIntegration => Self {
                     network: Chain::SepoliaIntegration,
                     network_id: ChainId::SEPOLIA_INTEGRATION,
+                    is_l3: false,
                     gateway: GatewayClient::sepolia_integration(gateway_timeout)
                         .with_api_key(api_key),
+                    gateway_dns_refresh_interval,
                     database: data_directory.join("integration-sepolia.sqlite"),
                     contract_addresses: EthContractAddresses::new_known(
                         core_addr::SEPOLIA_INTEGRATION,
@@ -792,13 +1021,18 @@ mod pathfinder_context {
                     gateway,
                     feeder_gateway,
                     chain_id,
+                    compress_gateway_requests,
+                    is_l3,
                 } => Self::configure_custom(
-                    gateway,
-                    feeder_gateway,
+                    *gateway,
+                    *feeder_gateway,
                     chain_id,
+                    is_l3,
                     data_directory,
                     api_key,
                     gateway_timeout,
+                    gateway_dns_refresh_interval,
+                    compress_gateway_requests,
                 )
                 .await
                 .context("Configuring custom network")?,
@@ -811,20 +1045,25 @@ mod pathfinder_context {
         /// additional verification by checking for a proxy gateway by
         /// comparing against L1 starknet address against of
         /// the known networks.
+        #[allow(clippy::too_many_arguments)]
         async fn configure_custom(
             gateway: Url,
             feeder: Url,
             chain_id: String,
+            is_l3: bool,
             data_directory: &Path,
             api_key: Option<String>,
             gateway_timeout: Duration,
+            gateway_dns_refresh_interval: Duration,
+            compress_gateway_requests: bool,
         ) -> anyhow::Result<Self> {
             use pathfinder_crypto::Felt;
             use starknet_gateway_client::GatewayApi;
 
             let gateway = GatewayClient::with_urls(gateway, feeder, gateway_timeout)
                 .context("Creating gateway client")?
-                .with_api_key(api_key);
+                .with_api_key(api_key)
+                .with_compress_gateway_requests(compress_gateway_requests);
 
             let network_id =
                 ChainId(Felt::from_be_slice(chain_id.as_bytes()).context("Parsing chain ID")?);
@@ -833,7 +1072,30 @@ mod pathfinder_context {
                 .eth_contract_addresses()
                 .await
                 .context("Downloading starknet L1 address from gateway for proxy check")?;
-            let l1_core_address = reply_contract_addresses.starknet.0;
+
+            let l1_core_address = if is_l3 {
+                // For L3 networks, assert we got Starknet variant (ContractAddress)
+                match reply_contract_addresses.starknet {
+                    SettlementLayerAddress::Starknet(_contract_address) => {
+                        // TODO(mehul 14/11/2025): This is a placeholder return. L1 syncing for L3 networks would
+                        // require significant changes that are not prioritized for pathfinder.
+                        // Returning 0 address as a dummy return
+                        primitive_types::H160::zero()
+                    }
+                    SettlementLayerAddress::Ethereum(_) => {
+                        anyhow::bail!("L3 networks should have ContractAddress (Starknet variant) in starknet field, but got EthereumAddress (Ethereum variant)");
+                    }
+                }
+            } else {
+                // For L2 networks, assert we got Ethereum variant (EthereumAddress)
+                match reply_contract_addresses.starknet {
+                    SettlementLayerAddress::Starknet(_) => {
+                        anyhow::bail!("L2 networks should have EthereumAddress (Ethereum variant) in starknet field, but got ContractAddress (Starknet variant)");
+                    }
+                    SettlementLayerAddress::Ethereum(address) => address.0,
+                }
+            };
+
             let contract_addresses = EthContractAddresses::new_custom(
                 l1_core_address,
                 reply_contract_addresses.eth_l2_token_address,
@@ -856,7 +1118,9 @@ mod pathfinder_context {
             let context = Self {
                 network,
                 network_id,
+                is_l3,
                 gateway,
+                gateway_dns_refresh_interval,
                 database: data_directory.join("custom.sqlite"),
                 contract_addresses,
             };
@@ -902,9 +1166,7 @@ async fn verify_database(
 
     if let Some(database_genesis) = db_genesis {
         use pathfinder_common::consts::{
-            MAINNET_GENESIS_HASH,
-            SEPOLIA_INTEGRATION_GENESIS_HASH,
-            SEPOLIA_TESTNET_GENESIS_HASH,
+            MAINNET_GENESIS_HASH, SEPOLIA_INTEGRATION_GENESIS_HASH, SEPOLIA_TESTNET_GENESIS_HASH,
         };
 
         let db_network = match database_genesis {

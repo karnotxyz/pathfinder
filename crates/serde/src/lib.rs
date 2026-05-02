@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::str::FromStr;
 
 use num_bigint::BigUint;
-use pathfinder_common::prelude::*;
+use pathfinder_common::{SettlementLayerAddress, prelude::*};
 use pathfinder_crypto::{Felt, HexParseError, OverflowError};
 use primitive_types::{H160, H256, U256};
 use serde::de::Visitor;
@@ -87,6 +87,77 @@ impl<'de> DeserializeAs<'de, EthereumAddress> for EthereumAddressAsHexStr {
         deserializer.deserialize_str(EthereumAddressVisitor)
     }
 }
+
+pub struct SettlementLayerAddressAsHexStr;
+
+impl SerializeAs<SettlementLayerAddress> for SettlementLayerAddressAsHexStr {
+    fn serialize_as<S>(source: &SettlementLayerAddress, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer {
+        match source {
+            SettlementLayerAddress::Ethereum(address) => {
+                EthereumAddressAsHexStr::serialize_as(address, serializer)
+            },
+            SettlementLayerAddress::Starknet(address) => {
+                // ContractAddress is a Felt, serialize as 64-char hex string
+                let bytes = address.0.to_be_bytes();
+                // ContractAddress is "0x" + 64 digits
+                let mut buf = [0u8; 2 + 64];
+                let s = bytes_as_hex_str(&bytes, &mut buf);
+                serializer.serialize_str(s)
+            }
+        }
+    }
+}
+
+impl<'de> DeserializeAs<'de, SettlementLayerAddress> for SettlementLayerAddressAsHexStr {
+    fn deserialize_as<D>(deserializer: D) -> Result<SettlementLayerAddress, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SettlementLayerAddressVisitor;
+
+        impl Visitor<'_> for SettlementLayerAddressVisitor {
+            type Value = SettlementLayerAddress;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a hex string of 40 digits (Ethereum) or 41-64 digits (Starknet) with an optional '0x' prefix")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                
+                let hex_str = v.strip_prefix("0x").unwrap_or(v);
+                let hex_len = hex_str.len();
+
+                if hex_len <= 40 {
+                    // Ethereum address: 20 bytes = 40 hex digits
+                    let bytes = bytes_from_hex_str::<{ H160::len_bytes() }>(hex_str)
+                        .map_err(serde::de::Error::custom)?;
+                    Ok(SettlementLayerAddress::Ethereum(EthereumAddress(H160::from(bytes))))
+                } else if hex_len <= 64 {
+                    // Starknet ContractAddress: 32 bytes = 64 hex digits
+                    let bytes = bytes_from_hex_str::<32>(hex_str)
+                        .map_err(serde::de::Error::custom)?;
+                    let felt = Felt::from_be_bytes(bytes)
+                        .map_err(|e| serde::de::Error::custom(format!("Felt overflow: {}", e)))?;
+                    Ok(SettlementLayerAddress::Starknet(ContractAddress(felt)))
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "hex string too long: expected at most 64 digits (with optional '0x' prefix), got {}",
+                        hex_len
+                    )))
+                }
+            }
+        }
+
+        deserializer.deserialize_str(SettlementLayerAddressVisitor)
+    }
+}
+
+
 
 pub struct H256AsNoLeadingZerosHexStr;
 

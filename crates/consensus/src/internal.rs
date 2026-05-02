@@ -17,11 +17,19 @@ use malachite_consensus::{
     State,
 };
 use malachite_signing_ed25519::Signature;
-use malachite_types::{Height as _, SignedMessage, ThresholdParams, Timeout, ValuePayload};
+use malachite_types::{
+    Height as _,
+    SignedMessage,
+    ThresholdParams,
+    Timeout,
+    TimeoutKind,
+    ValuePayload,
+};
 use tokio::time::Instant;
 use wal::*;
 
 use crate::config::TimeoutValues;
+use crate::error::ConsensusError;
 use crate::wal::{WalEntry, WalSink};
 use crate::{
     ConsensusCommand,
@@ -29,6 +37,7 @@ use crate::{
     NetworkMessage,
     Proposal,
     ProposerSelector,
+    Round,
     SignedProposal,
     SignedVote,
     ValidatorSet,
@@ -98,23 +107,46 @@ impl<
     }
 
     /// Recover the consensus from a list of write-ahead log entries.
-    pub fn recover_from_wal(&mut self, entries: Vec<WalEntry<V, A>>) {
+    pub fn recover_from_wal(&mut self, entries: Vec<WalEntry<V, A>>) -> Option<Round> {
         tracing::debug!(
             validator = %self.state.address(),
             entry_count = entries.len(),
             "Recovering consensus from WAL entries"
         );
 
+        // Check if any entry is a Decision, which indicates this height is finalized.
+        let has_decision = entries
+            .iter()
+            .any(|e| matches!(e, WalEntry::Decision { .. }));
+
+        // Mark the WAL as finalized if we're recovering from a Decision entry.
+        if has_decision {
+            self.wal.mark_as_finalized();
+        }
+
+        // Now process the entries.
+        let mut max_round: Option<u32> = None;
         for (i, entry) in entries.into_iter().enumerate() {
+            // We skip Decision entries as they're just markers.
+            if matches!(entry, WalEntry::Decision { .. }) {
+                continue;
+            }
+
+            // Find the last round with votes
+            max_round = max_round.max(Self::get_vote_round(&entry));
+
             let input = convert_wal_entry_to_input(entry);
             if let Err(e) = self.process_input(input) {
-                tracing::error!(
+                tracing::warn!(
                     validator = %self.state.address(),
                     entry_index = i,
                     error = %e,
-                    "Failed to process WAL entry during recovery"
+                    "Failed to process WAL entry during recovery - skipping corrupted entry"
                 );
-                self.output_queue.push_back(ConsensusEvent::Error(e.into()));
+                self.output_queue
+                    .push_back(ConsensusEvent::Error(ConsensusError::wal_recovery(
+                        e.into(),
+                    )));
             }
         }
 
@@ -122,6 +154,16 @@ impl<
             validator = %self.state.address(),
             "Completed WAL recovery"
         );
+
+        max_round.map(Round::from)
+    }
+
+    /// Schedule rebroadcast timeout.
+    pub fn schedule_rebroadcast(&mut self, round: Round) {
+        self.timeout_manager.schedule_timeout(Timeout {
+            kind: TimeoutKind::Rebroadcast,
+            round: round.into(),
+        });
     }
 
     /// Check if this consensus engine has been finalized (i.e., a decision has
@@ -155,7 +197,8 @@ impl<
                 "Timeout elapsed"
             );
             if let Err(e) = self.process_input(input) {
-                self.output_queue.push_back(ConsensusEvent::Error(e.into()));
+                self.output_queue
+                    .push_back(ConsensusEvent::Error(ConsensusError::malachite(e)));
             }
         }
 
@@ -214,11 +257,20 @@ impl<
             };
 
             if let Err(e) = self.process_input(input) {
-                self.output_queue.push_back(ConsensusEvent::Error(e.into()));
+                self.output_queue
+                    .push_back(ConsensusEvent::Error(ConsensusError::malachite(e)));
             }
         }
 
         self.output_queue.pop_front()
+    }
+
+    fn get_vote_round(entry: &WalEntry<V, A>) -> Option<u32> {
+        if let WalEntry::SignedVote(signed) = entry {
+            signed.vote.round.0
+        } else {
+            None
+        }
     }
 
     #[allow(clippy::result_large_err)]

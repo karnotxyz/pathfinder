@@ -1,7 +1,10 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use pathfinder_common::{contract_address, ChainId, ConsensusInfo, ContractAddress};
+use pathfinder_common::{
+    consensus_info, contract_address, ChainId, ContractAddress, EthereumAddress,
+    SettlementLayerAddress,
+};
 use pathfinder_ethereum::EthereumClient;
 use pathfinder_executor::{NativeClassCache, TraceCache, VersionedConstantsMap};
 use pathfinder_storage::Storage;
@@ -73,8 +76,13 @@ pub struct RpcConfig {
     pub versioned_constants_map: VersionedConstantsMap,
     pub native_execution: bool,
     pub native_class_cache_size: NonZeroUsize,
+    pub native_compiler_optimization_level: u8,
+    pub native_execution_force_use_for_incompatible_classes: bool,
     pub submission_tracker_time_limit: NonZeroU64,
     pub submission_tracker_size_limit: NonZeroUsize,
+    pub block_trace_cache_size: NonZeroUsize,
+    pub compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    pub blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
 }
 
 #[derive(Clone)]
@@ -86,6 +94,7 @@ pub struct RpcContext {
     pub sync_status: Arc<SyncState>,
     pub submission_tracker: SubmittedTransactionTracker,
     pub chain_id: ChainId,
+    pub is_l3: bool,
     pub contract_addresses: EthContractAddresses,
     pub sequencer: SequencerClient,
     pub websocket: Option<WebsocketContext>,
@@ -93,7 +102,7 @@ pub struct RpcContext {
     pub ethereum: EthereumClient,
     pub config: RpcConfig,
     pub native_class_cache: Option<NativeClassCache>,
-    pub consensus_info_watch: Option<watch::Receiver<Option<ConsensusInfo>>>,
+    pub consensus_info_watch: Option<watch::Receiver<consensus_info::ConsensusInfo>>,
 }
 
 impl RpcContext {
@@ -103,6 +112,7 @@ impl RpcContext {
         execution_storage: Storage,
         sync_status: Arc<SyncState>,
         chain_id: ChainId,
+        is_l3: bool,
         contract_addresses: EthContractAddresses,
         sequencer: SequencerClient,
         pending_data: tokio_watch::Receiver<PendingData>,
@@ -116,17 +126,21 @@ impl RpcContext {
         );
         let pending_watcher = PendingWatcher::new(pending_data.clone());
         let native_class_cache = if config.native_execution {
-            Some(NativeClassCache::spawn(config.native_class_cache_size))
+            Some(NativeClassCache::spawn(
+                config.native_class_cache_size,
+                config.native_compiler_optimization_level,
+            ))
         } else {
             None
         };
         Self {
-            cache: Default::default(),
+            cache: TraceCache::with_size(config.block_trace_cache_size),
             storage,
             execution_storage,
             sync_status,
             submission_tracker,
             chain_id,
+            is_l3,
             contract_addresses,
             pending_data: pending_watcher,
             sequencer,
@@ -164,7 +178,7 @@ impl RpcContext {
 
     pub fn with_consensus_info_watch(
         self,
-        consensus_info_watch: watch::Receiver<Option<ConsensusInfo>>,
+        consensus_info_watch: watch::Receiver<consensus_info::ConsensusInfo>,
     ) -> Self {
         Self {
             consensus_info_watch: Some(consensus_info_watch),
@@ -238,8 +252,13 @@ impl RpcContext {
             versioned_constants_map: Default::default(),
             native_execution: true,
             native_class_cache_size: NonZeroUsize::new(10).unwrap(),
+            native_compiler_optimization_level: 0,
+            native_execution_force_use_for_incompatible_classes: false,
             submission_tracker_time_limit: NonZeroU64::new(300).unwrap(),
             submission_tracker_size_limit: NonZeroUsize::new(30000).unwrap(),
+            block_trace_cache_size: NonZeroUsize::new(1).unwrap(),
+            compiler_resource_limits: pathfinder_compiler::ResourceLimits::for_test(),
+            blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs::default(),
         };
 
         let ethereum =
@@ -250,6 +269,7 @@ impl RpcContext {
             storage,
             sync_state,
             chain_id,
+            false,
             EthContractAddresses::new_known(core_contract_address),
             sequencer.disable_retry_for_tests(),
             rx,
@@ -257,19 +277,6 @@ impl RpcContext {
             ethereum,
             config,
         )
-    }
-
-    #[cfg(test)]
-    pub async fn for_tests_with_pending() -> Self {
-        // This is a bit silly with the arc in and out, but since its for tests the
-        // ergonomics of having Arc also constructed is nice.
-        let context = Self::for_tests();
-        let pending_data = super::test_utils::create_pending_data(context.storage.clone()).await;
-
-        let (tx, rx) = tokio_watch::channel(Default::default());
-        tx.send(pending_data).unwrap();
-
-        context.with_pending_data(rx)
     }
 
     #[cfg(test)]

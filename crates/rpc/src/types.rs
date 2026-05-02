@@ -1,7 +1,6 @@
 //! Common data structures used by the JSON-RPC API methods.
 
 pub(crate) mod class;
-pub(crate) mod receipt;
 pub mod syncing;
 
 pub(crate) use class::ContractClass;
@@ -12,12 +11,13 @@ pub mod request {
     use anyhow::Context;
     use pathfinder_common::prelude::*;
     use pathfinder_common::transaction::{DataAvailabilityMode, ResourceBounds};
-    use pathfinder_common::TipHex;
+    use pathfinder_common::{Proof, ProofFactElem, TipHex};
     use serde::de::Error;
     use serde::Deserialize;
     use serde_with::serde_as;
 
     use crate::dto::U64Hex;
+    use crate::RpcVersion;
 
     /// A way of identifying a block in a JSON-RPC request.
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub mod request {
         Hash(BlockHash),
         L1Accepted,
         Latest,
-        Pending,
+        PreConfirmed,
     }
 
     impl From<BlockHash> for BlockId {
@@ -43,7 +43,7 @@ pub mod request {
 
     impl BlockId {
         pub fn is_pending(&self) -> bool {
-            matches!(self, BlockId::Pending)
+            matches!(self, BlockId::PreConfirmed)
         }
 
         /// Converts this [BlockId] to a [pathfinder_common::BlockId].
@@ -54,7 +54,7 @@ pub mod request {
         ///
         /// # Panics
         ///
-        /// If this [BlockId] is [`BlockId::Pending`].
+        /// If this [BlockId] is [`BlockId::PreConfirmed`].
         pub fn to_common_or_panic(
             self,
             tx: &pathfinder_storage::Transaction<'_>,
@@ -69,7 +69,9 @@ pub mod request {
                     Ok(pathfinder_common::BlockId::Number(block_number))
                 }
                 BlockId::Latest => Ok(pathfinder_common::BlockId::Latest),
-                BlockId::Pending => panic!("Cannot convert BlockId::Pending to FinalizedBlockId"),
+                BlockId::PreConfirmed => {
+                    panic!("Cannot convert BlockId::PreConfirmed to FinalizedBlockId")
+                }
             }
         }
 
@@ -79,7 +81,7 @@ pub mod request {
         /// number. Returns an error if there is no L1 accepted block number
         /// or the database lookup fails.
         ///
-        /// Coerces [`BlockId::Pending`] to
+        /// Coerces [`BlockId::PreConfirmed`] to
         /// [`pathfinder_common::BlockId::Latest`].
         pub fn to_common_coerced(
             self,
@@ -94,7 +96,7 @@ pub mod request {
                         .context("L1 accepted block number not found")?;
                     Ok(pathfinder_common::BlockId::Number(block_number))
                 }
-                BlockId::Latest | BlockId::Pending => Ok(pathfinder_common::BlockId::Latest),
+                BlockId::Latest | BlockId::PreConfirmed => Ok(pathfinder_common::BlockId::Latest),
             }
         }
     }
@@ -1032,6 +1034,14 @@ pub mod request {
                     fee_data_availability_mode: value.deserialize("fee_data_availability_mode")?,
                     sender_address: value.deserialize("sender_address").map(ContractAddress)?,
                     calldata,
+                    proof_facts: value
+                        .deserialize_optional_array("proof_facts", |value| {
+                            value.deserialize().map(ProofFactElem)
+                        })?
+                        .unwrap_or_default(),
+                    proof: value
+                        .deserialize_optional_serde::<Proof>("proof")?
+                        .unwrap_or_default(),
                 })),
                 _ => Err(serde_json::Error::custom("unknown transaction version")),
             }
@@ -1168,6 +1178,9 @@ pub mod request {
 
         pub sender_address: ContractAddress,
         pub calldata: Vec<CallParam>,
+
+        pub proof_facts: Vec<ProofFactElem>,
+        pub proof: Proof,
     }
 
     impl crate::dto::SerializeForVersion for BroadcastedInvokeTransactionV3 {
@@ -1193,6 +1206,16 @@ pub mod request {
             )?;
             serializer.serialize_field("sender_address", &self.sender_address)?;
             serializer.serialize_field("calldata", &self.calldata)?;
+
+            if serializer.version >= RpcVersion::V10 {
+                if !self.proof_facts.is_empty() {
+                    serializer.serialize_field("proof_facts", &self.proof_facts)?;
+                }
+                if !self.proof.is_empty() {
+                    serializer.serialize_field("proof", &self.proof)?;
+                }
+            }
+
             serializer.end()
         }
     }
@@ -1222,6 +1245,14 @@ pub mod request {
                     calldata: value.deserialize_array("calldata", |value| {
                         value.deserialize().map(CallParam)
                     })?,
+                    proof_facts: value
+                        .deserialize_optional_array("proof_facts", |value| {
+                            value.deserialize().map(ProofFactElem)
+                        })?
+                        .unwrap_or_default(),
+                    proof: value
+                        .deserialize_optional_serde::<Proof>("proof")?
+                        .unwrap_or_default(),
                 })
             })
         }
@@ -1341,6 +1372,7 @@ pub mod request {
                         paymaster_data: invoke.paymaster_data,
                         calldata: invoke.calldata,
                         account_deployment_data: invoke.account_deployment_data,
+                        proof_facts: invoke.proof_facts,
                     })
                 }
             };
@@ -1481,7 +1513,10 @@ pub mod request {
                                     max_amount: ResourceAmount(0),
                                     max_price_per_unit: ResourcePricePerUnit(0),
                                 },
-                                l1_data_gas: None,
+                                l1_data_gas: Some(ResourceBound {
+                                    max_amount: ResourceAmount(0),
+                                    max_price_per_unit: ResourcePricePerUnit(0),
+                                }),
                             },
                             tip: Tip(0x1234),
                             paymaster_data: vec![
@@ -1551,7 +1586,10 @@ pub mod request {
                                     max_amount: ResourceAmount(0),
                                     max_price_per_unit: ResourcePricePerUnit(0),
                                 },
-                                l1_data_gas: None,
+                                l1_data_gas: Some(ResourceBound {
+                                    max_amount: ResourceAmount(0),
+                                    max_price_per_unit: ResourcePricePerUnit(0),
+                                }),
                             },
                             tip: Tip(0x1234),
                             paymaster_data: vec![
@@ -1566,6 +1604,8 @@ pub mod request {
                             fee_data_availability_mode: DataAvailabilityMode::L2,
                             sender_address: contract_address!("0xaaa"),
                             calldata: vec![call_param!("0xff")],
+                            proof_facts: vec![proof_fact_elem!("0xabc"), proof_fact_elem!("0xdef")],
+                            proof: Proof(vec![11, 22]),
                         },
                     )),
                     BroadcastedTransaction::DeployAccount(BroadcastedDeployAccountTransaction::V3(
@@ -1582,7 +1622,10 @@ pub mod request {
                                     max_amount: ResourceAmount(0),
                                     max_price_per_unit: ResourcePricePerUnit(0),
                                 },
-                                l1_data_gas: None,
+                                l1_data_gas: Some(ResourceBound {
+                                    max_amount: ResourceAmount(0),
+                                    max_price_per_unit: ResourcePricePerUnit(0),
+                                }),
                             },
                             tip: Tip(0x1234),
                             paymaster_data: vec![
@@ -1599,90 +1642,23 @@ pub mod request {
                 ];
 
                 let json_fixture_str =
-                    include_str!(concat!("../fixtures/0.6.0/broadcasted_transactions.json"));
+                    include_str!(concat!("../fixtures/0.10.0/broadcasted_transactions.json"));
                 let json_fixture: serde_json::Value =
                     serde_json::from_str(json_fixture_str).unwrap();
 
-                let serializer = crate::dto::Serializer::new(crate::RpcVersion::V07);
+                let serializer = crate::dto::Serializer::new(crate::RpcVersion::V10);
                 let serialized = serializer
                     .serialize_iter(txs.len(), &mut txs.clone().into_iter())
                     .unwrap();
                 assert_eq!(serialized, json_fixture);
                 assert_eq!(
-                    crate::dto::Value::new(json_fixture, crate::RpcVersion::V07)
+                    crate::dto::Value::new(json_fixture, crate::RpcVersion::V10)
                         .deserialize_array(
                             <BroadcastedTransaction as DeserializeForVersion>::deserialize
                         )
                         .unwrap(),
                     txs
                 );
-            }
-        }
-    }
-}
-
-/// Groups all strictly output types of the RPC API.
-pub mod reply {
-    use serde::de::Error;
-
-    /// L2 Block status as returned by the RPC API.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub enum BlockStatus {
-        Pending,
-        AcceptedOnL2,
-        AcceptedOnL1,
-        Rejected,
-    }
-
-    impl BlockStatus {
-        pub fn is_pending(&self) -> bool {
-            self == &Self::Pending
-        }
-    }
-
-    impl crate::dto::SerializeForVersion for BlockStatus {
-        fn serialize(
-            &self,
-            serializer: crate::dto::Serializer,
-        ) -> Result<crate::dto::Ok, crate::dto::Error> {
-            serializer.serialize_str(match self {
-                Self::Pending => "PENDING",
-                Self::AcceptedOnL2 => "ACCEPTED_ON_L2",
-                Self::AcceptedOnL1 => "ACCEPTED_ON_L1",
-                Self::Rejected => "REJECTED",
-            })
-        }
-    }
-
-    impl crate::dto::DeserializeForVersion for BlockStatus {
-        fn deserialize(value: crate::dto::Value) -> Result<Self, crate::dto::Error> {
-            let status: String = value.deserialize()?;
-            match status.as_str() {
-                "PENDING" => Ok(Self::Pending),
-                "ACCEPTED_ON_L2" => Ok(Self::AcceptedOnL2),
-                "ACCEPTED_ON_L1" => Ok(Self::AcceptedOnL1),
-                "REJECTED" => Ok(Self::Rejected),
-                _ => Err(serde_json::Error::custom("Invalid block status")),
-            }
-        }
-    }
-
-    impl From<starknet_gateway_types::reply::Status> for BlockStatus {
-        fn from(status: starknet_gateway_types::reply::Status) -> Self {
-            use starknet_gateway_types::reply::Status::*;
-
-            match status {
-                // TODO verify this mapping with Starkware
-                AcceptedOnL1 => BlockStatus::AcceptedOnL1,
-                AcceptedOnL2 => BlockStatus::AcceptedOnL2,
-                NotReceived => BlockStatus::Rejected,
-                Pending => BlockStatus::Pending,
-                Received => BlockStatus::Pending,
-                Rejected => BlockStatus::Rejected,
-                Reverted => BlockStatus::Rejected,
-                Aborted => BlockStatus::Rejected,
-                Candidate => BlockStatus::Rejected,
-                PreConfirmed => BlockStatus::Rejected,
             }
         }
     }

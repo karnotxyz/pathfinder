@@ -4,6 +4,12 @@ use std::ops::RangeInclusive;
 
 use fake::{Fake, Faker};
 use pathfinder_class_hash::compute_class_hash;
+use pathfinder_common::class_definition::{
+    SerializedCairoDefinition,
+    SerializedCasmDefinition,
+    SerializedOpaqueClassDefinition,
+    SerializedSierraDefinition,
+};
 use pathfinder_common::event::Event;
 use pathfinder_common::prelude::*;
 use pathfinder_common::receipt::Receipt;
@@ -35,9 +41,14 @@ pub struct Block {
     /// [`fill`] by setting it to `None`.
     pub state_update: Option<StateUpdate>,
     // Cairo 0 definitions
-    pub cairo_defs: Vec<(ClassHash, Vec<u8>)>,
+    pub cairo_defs: Vec<(ClassHash, SerializedCairoDefinition)>,
     // Sierra + Casm definitions + Casm Blake2 hash
-    pub sierra_defs: Vec<(SierraHash, Vec<u8>, Vec<u8>, CasmHash)>,
+    pub sierra_defs: Vec<(
+        SierraHash,
+        SerializedSierraDefinition,
+        SerializedCasmDefinition,
+        CasmHash,
+    )>,
 }
 
 pub type BlockHashFn = Box<dyn Fn(&BlockHeader) -> BlockHash>;
@@ -209,11 +220,8 @@ pub fn fill(storage: &Storage, blocks: &[Block], update_tries: Option<UpdateTrie
 /// - transactions
 ///     - transaction hashes are calculated from their respective variant
 pub mod generate {
-    use pathfinder_common::{
-        class_definition,
-        BlockCommitmentSignature,
-        BlockCommitmentSignatureElem,
-    };
+    use pathfinder_common::class_definition::{self, SerializedClassDefinition};
+    use pathfinder_common::{BlockCommitmentSignature, BlockCommitmentSignatureElem};
 
     use super::*;
 
@@ -272,7 +280,7 @@ pub mod generate {
             // There must be at least 1 transaction per block
             let transaction_data = fake_non_empty_with_rng::<
                 Vec<_>,
-                crate::connection::transaction::dto::TransactionV2,
+                crate::connection::transaction::dto::TransactionV3,
             >(rng)
             .into_iter()
             .enumerate()
@@ -335,7 +343,12 @@ pub mod generate {
                         &Faker.fake_with_rng::<class_definition::Cairo<'_>, _>(rng),
                     )
                     .unwrap();
-                    (compute_class_hash(&def).unwrap().hash(), def)
+                    let def = SerializedOpaqueClassDefinition::from_bytes(def);
+                    let (hash, def) = compute_class_hash(def).unwrap();
+                    let SerializedClassDefinition::Cairo(def) = def else {
+                        panic!("Expected a Cairo class definition");
+                    };
+                    (hash.hash(), def)
                 })
                 .collect::<HashMap<_, _>>();
             let sierra_defs = (0..num_sierra_classes)
@@ -344,11 +357,20 @@ pub mod generate {
                         &Faker.fake_with_rng::<class_definition::Sierra<'_>, _>(rng),
                     )
                     .unwrap();
+                    let def = SerializedOpaqueClassDefinition::from_bytes(def);
+                    let (hash, sierra_def) = compute_class_hash(def).unwrap();
+                    let SerializedClassDefinition::Sierra(sierra_def) = sierra_def else {
+                        panic!("Expected a Sierra class definition");
+                    };
+                    let hash = SierraHash(hash.hash().0);
+                    let casm_def = SerializedCasmDefinition::from_bytes(
+                        Faker.fake_with_rng::<String, _>(rng).into_bytes(),
+                    );
                     (
-                        SierraHash(compute_class_hash(&def).unwrap().hash().0),
+                        hash,
                         (
-                            def,
-                            Faker.fake_with_rng::<String, _>(rng).into_bytes(),
+                            sierra_def,
+                            casm_def,
                             Faker.fake_with_rng::<CasmHash, _>(rng),
                         ),
                     )
@@ -520,7 +542,11 @@ pub mod generate {
                 dummy_storage.clone(),
             )
             .unwrap();
-            let state_commitment = StateCommitment::calculate(storage_commitment, class_commitment);
+            let state_commitment = StateCommitment::calculate(
+                storage_commitment,
+                class_commitment,
+                header.header.starknet_version,
+            );
             header.header.state_commitment = state_commitment;
             state_update.state_commitment = state_commitment;
         }

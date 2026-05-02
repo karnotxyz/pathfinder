@@ -19,7 +19,13 @@ use p2p_proto::sync::transaction::{
     TransactionsRequest,
     TransactionsResponse,
 };
-use pathfinder_common::{class_definition, BlockHash, BlockNumber, SignedBlockHeader};
+use pathfinder_common::class_definition::{
+    self,
+    SerializedCairoDefinition,
+    SerializedClassDefinition,
+    SerializedSierraDefinition,
+};
+use pathfinder_common::{BlockHash, BlockNumber, SignedBlockHeader};
 use pathfinder_storage::{Storage, Transaction};
 use tokio::sync::mpsc;
 
@@ -144,32 +150,32 @@ fn get_header(
     Ok(false)
 }
 
-#[derive(Debug, Clone)]
-enum ClassDefinition {
-    Cairo(Vec<u8>),
-    Sierra { sierra: Vec<u8>, _casm: Vec<u8> },
-}
-
 fn get_classes_for_block(
     db_tx: &Transaction<'_>,
     block_number: BlockNumber,
     tx: &mpsc::Sender<ClassesResponse>,
 ) -> anyhow::Result<bool> {
     let get_definition =
-        |block_number: BlockNumber, class_hash| -> anyhow::Result<ClassDefinition> {
+        |block_number: BlockNumber, class_hash| -> anyhow::Result<SerializedClassDefinition> {
             let definition = db_tx
                 .class_definition_at(block_number.into(), class_hash)?
                 .context(format!(
                     "Class definition {class_hash} not found at block {block_number}",
                 ))?;
-            let casm_definition = db_tx.casm_definition(class_hash)?;
-            Ok(match casm_definition {
-                Some(_casm) => ClassDefinition::Sierra {
-                    sierra: definition,
-                    _casm: Vec::new(), // TODO casm
-                },
-                None => ClassDefinition::Cairo(definition),
-            })
+            let class_def = if db_tx
+                .is_sierra(class_hash)?
+                .expect("Class definition exists in storage")
+            {
+                SerializedClassDefinition::Sierra(SerializedSierraDefinition::from_bytes(
+                    definition.into_bytes(),
+                ))
+            } else {
+                SerializedClassDefinition::Cairo(SerializedCairoDefinition::from_bytes(
+                    definition.into_bytes(),
+                ))
+            };
+
+            Ok(class_def)
         };
 
     let Some(declared_classes) = db_tx.declared_classes_at(block_number.into())? else {
@@ -182,20 +188,18 @@ fn get_classes_for_block(
         tracing::trace!(?class_hash, "Sending class definition");
 
         let class: Class = match class_definition {
-            ClassDefinition::Cairo(definition) => {
+            SerializedClassDefinition::Cairo(cairo) => {
                 let cairo_class =
-                    serde_json::from_slice::<class_definition::Cairo<'_>>(&definition)?;
+                    serde_json::from_slice::<class_definition::Cairo<'_>>(cairo.as_bytes())?;
                 Class::Cairo0 {
                     class: cairo_class.to_dto(),
                     domain: 0, // TODO
                     class_hash: Hash(class_hash.0),
                 }
             }
-            ClassDefinition::Sierra {
-                sierra,
-                _casm: _, // TODO
-            } => {
-                let sierra_class = serde_json::from_slice::<class_definition::Sierra<'_>>(&sierra)?;
+            SerializedClassDefinition::Sierra(sierra) => {
+                let sierra_class =
+                    serde_json::from_slice::<class_definition::Sierra<'_>>(sierra.as_bytes())?;
 
                 Class::Cairo1 {
                     class: sierra_class.to_dto(),
@@ -402,7 +406,7 @@ fn get_start_block_number(
 /// This function must detach the thread used to run the blocking DB operation
 /// otherwise the entire p2p swarm will be blocked.
 ///
-/// Related issue: <https://github.com/eqlabs/pathfinder/issues/2351>
+/// Related issue: <https://github.com/equilibriumco/pathfinder/issues/2351>
 async fn spawn_blocking_get<Request, Response, Getter>(
     request: Request,
     storage: Storage,

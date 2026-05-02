@@ -93,7 +93,11 @@ impl BlockHeaderBuilder {
         storage_commitment: StorageCommitment,
         class_commitment: ClassCommitment,
     ) -> Self {
-        self.0.state_commitment = StateCommitment::calculate(storage_commitment, class_commitment);
+        self.0.state_commitment = StateCommitment::calculate(
+            storage_commitment,
+            class_commitment,
+            self.0.starknet_version,
+        );
         self
     }
 
@@ -169,6 +173,16 @@ impl BlockHeaderBuilder {
 
     pub fn receipt_commitment(mut self, receipt_commitment: ReceiptCommitment) -> Self {
         self.0.receipt_commitment = receipt_commitment;
+        self
+    }
+
+    pub fn state_diff_commitment(mut self, state_diff_commitment: StateDiffCommitment) -> Self {
+        self.0.state_diff_commitment = state_diff_commitment;
+        self
+    }
+
+    pub fn state_diff_length(mut self, state_diff_length: u64) -> Self {
+        self.0.state_diff_length = state_diff_length;
         self
     }
 

@@ -32,7 +32,7 @@ pub use executor::compose_executor_transaction;
 use http_body::Body;
 pub use jsonrpc::{Notifications, Reorg};
 use pathfinder_common::{integration_testing, AllowedOrigins};
-pub use pending::{FinalizedTxData, PendingBlockVariant, PendingData};
+pub use pending::{FinalizedTxData, PendingBlocks, PendingData};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
@@ -283,6 +283,11 @@ impl crate::dto::DeserializeForVersion for SubscriptionId {
 pub mod test_utils {
     use std::collections::HashMap;
 
+    use pathfinder_common::class_definition::{
+        SerializedCairoDefinition,
+        SerializedCasmDefinition,
+        SerializedSierraDefinition,
+    };
     use pathfinder_common::event::Event;
     use pathfinder_common::macro_prelude::*;
     use pathfinder_common::prelude::*;
@@ -398,11 +403,13 @@ pub mod test_utils {
         let contract1_update2 =
             HashMap::from([(storage_addr, storage_value_bytes!(b"storage value 2"))]);
 
-        let class0_definition =
-            starknet_gateway_test_fixtures::class_definitions::CONTRACT_DEFINITION.to_vec();
+        let class0_definition = SerializedCairoDefinition::from_slice(
+            starknet_gateway_test_fixtures::class_definitions::CONTRACT_DEFINITION,
+        );
         let class1_definition = &class0_definition;
-        let sierra_class_definition =
-            starknet_gateway_test_fixtures::class_definitions::CAIRO_0_11_SIERRA.to_vec();
+        let sierra_class_definition = SerializedSierraDefinition::from_slice(
+            starknet_gateway_test_fixtures::class_definitions::CAIRO_0_11_SIERRA,
+        );
 
         db_txn
             .insert_cairo_class_definition(class0_hash, &class0_definition)
@@ -414,7 +421,7 @@ pub mod test_utils {
             .insert_sierra_class_definition(
                 &sierra_class,
                 &sierra_class_definition,
-                &[],
+                &SerializedCasmDefinition::from_slice(&[]),
                 &sierra_casm_hash_v2,
             )
             .unwrap();
@@ -452,6 +459,14 @@ pub mod test_utils {
         let header0 = BlockHeader::builder()
             .number(BlockNumber::GENESIS)
             .calculated_state_commitment(storage_commitment0, class_commitment0)
+            .event_commitment(event_commitment!("0xec00"))
+            .event_count(0)
+            .receipt_commitment(receipt_commitment!("0xdc00"))
+            .transaction_commitment(transaction_commitment!("0xac00"))
+            .transaction_count(0)
+            .state_diff_commitment(state_diff_commitment!("0xfc00"))
+            .state_diff_length(0)
+            .starknet_version(StarknetVersion::V_0_13_2)
             .finalize_with_hash(block_hash_bytes!(b"genesis"));
         db_txn.insert_block_header(&header0).unwrap();
         db_txn
@@ -494,6 +509,14 @@ pub mod test_utils {
             .calculated_state_commitment(storage_commitment1, class_commitment1)
             .eth_l1_gas_price(GasPrice::from(1))
             .sequencer_address(sequencer_address_bytes!(&[1u8]))
+            .event_commitment(event_commitment!("0xec01"))
+            .event_count(1)
+            .receipt_commitment(receipt_commitment!("0xdc01"))
+            .transaction_commitment(transaction_commitment!("0xac01"))
+            .transaction_count(1)
+            .state_diff_commitment(state_diff_commitment!("0xfc01"))
+            .state_diff_length(1)
+            .starknet_version(StarknetVersion::V_0_13_2)
             .finalize_with_hash(block_hash_bytes!(b"block 1"));
         db_txn.insert_block_header(&header1).unwrap();
         db_txn
@@ -578,6 +601,14 @@ pub mod test_utils {
             .calculated_state_commitment(storage_commitment2, class_commitment2)
             .eth_l1_gas_price(GasPrice::from(2))
             .sequencer_address(sequencer_address_bytes!(&[2u8]))
+            .event_commitment(event_commitment!("0xec02"))
+            .event_count(2)
+            .receipt_commitment(receipt_commitment!("0xdc02"))
+            .transaction_commitment(transaction_commitment!("0xac02"))
+            .transaction_count(2)
+            .state_diff_commitment(state_diff_commitment!("0xfc02"))
+            .state_diff_length(2)
+            .starknet_version(StarknetVersion::V_0_13_2)
             .finalize_with_hash(block_hash_bytes!(b"latest"));
 
         db_txn.insert_block_header(&header2).unwrap();
@@ -633,7 +664,14 @@ pub mod test_utils {
         };
         let txn6 = Transaction {
             hash: transaction_hash_bytes!(b"txn 6"),
-            ..txn1.clone()
+            variant: TransactionVariant::InvokeV3(InvokeTransactionV3 {
+                sender_address: contract2_addr,
+                proof_facts: vec![
+                    proof_fact_elem_bytes!(b"proof fact 1"),
+                    proof_fact_elem_bytes!(b"proof fact 2"),
+                ],
+                ..Default::default()
+            }),
         };
         let txn_reverted = Transaction {
             hash: transaction_hash_bytes!(b"txn reverted"),
@@ -700,189 +738,6 @@ pub mod test_utils {
 
         db_txn.commit().unwrap();
         storage
-    }
-
-    /// Creates [PendingData] which correctly links to the provided [Storage].
-    ///
-    /// i.e. the pending block's parent hash will be the latest block's hash
-    /// from storage, and similarly for the pending state diffs state root.
-    pub async fn create_pending_data(storage: Storage) -> PendingData {
-        let storage2 = storage.clone();
-        let latest = tokio::task::spawn_blocking(move || {
-            let mut db = storage2.connection().unwrap();
-            let tx = db.transaction().unwrap();
-
-            tx.block_header(BlockId::Latest)
-                .unwrap()
-                .expect("Storage should contain a latest block")
-        })
-        .await
-        .unwrap();
-
-        let transactions: Vec<Transaction> = vec![
-            Transaction {
-                hash: transaction_hash_bytes!(b"pending tx hash 0"),
-                variant: TransactionVariant::InvokeV0(InvokeTransactionV0 {
-                    sender_address: contract_address_bytes!(b"pending contract addr 0"),
-                    entry_point_selector: entry_point_bytes!(b"entry point 0"),
-                    entry_point_type: Some(EntryPointType::External),
-                    ..Default::default()
-                }),
-            },
-            Transaction {
-                hash: transaction_hash_bytes!(b"pending tx hash 1"),
-                variant: TransactionVariant::DeployV0(DeployTransactionV0 {
-                    contract_address: contract_address!("0x1122355"),
-                    contract_address_salt: contract_address_salt_bytes!(b"salty"),
-                    class_hash: class_hash_bytes!(b"pending class hash 1"),
-                    ..Default::default()
-                }),
-            },
-            Transaction {
-                hash: transaction_hash_bytes!(b"pending reverted"),
-                variant: TransactionVariant::InvokeV0(InvokeTransactionV0 {
-                    sender_address: contract_address_bytes!(b"pending contract addr 0"),
-                    entry_point_selector: entry_point_bytes!(b"entry point 0"),
-                    entry_point_type: Some(EntryPointType::External),
-                    ..Default::default()
-                }),
-            },
-        ];
-
-        let transaction_receipts = vec![
-            (
-                Receipt {
-                    actual_fee: Fee::ZERO,
-                    execution_resources: ExecutionResources::default(),
-                    transaction_hash: transactions[0].hash,
-                    transaction_index: TransactionIndex::new_or_panic(0),
-                    ..Default::default()
-                },
-                vec![
-                    Event {
-                        data: vec![],
-                        from_address: contract_address!("0xabcddddddd"),
-                        keys: vec![event_key_bytes!(b"pending key")],
-                    },
-                    Event {
-                        data: vec![],
-                        from_address: contract_address!("0xabcddddddd"),
-                        keys: vec![
-                            event_key_bytes!(b"pending key"),
-                            event_key_bytes!(b"second pending key"),
-                        ],
-                    },
-                    Event {
-                        data: vec![],
-                        from_address: contract_address!("0xabcaaaaaaa"),
-                        keys: vec![event_key_bytes!(b"pending key 2")],
-                    },
-                ],
-            ),
-            (
-                Receipt {
-                    execution_resources: ExecutionResources::default(),
-                    transaction_hash: transactions[1].hash,
-                    transaction_index: TransactionIndex::new_or_panic(1),
-                    ..Default::default()
-                },
-                vec![],
-            ),
-            // Reverted and without events
-            (
-                Receipt {
-                    execution_resources: ExecutionResources::default(),
-                    transaction_hash: transactions[2].hash,
-                    transaction_index: TransactionIndex::new_or_panic(2),
-                    execution_status: ExecutionStatus::Reverted {
-                        reason: "Reverted!".to_owned(),
-                    },
-                    ..Default::default()
-                },
-                vec![],
-            ),
-        ];
-
-        let transactions = transactions.into_iter().collect();
-        let transaction_receipts = transaction_receipts.into_iter().collect();
-
-        let contract1 = contract_address_bytes!(b"pending contract 1 address");
-        let state_update = StateUpdate::default()
-            .with_parent_state_commitment(latest.state_commitment)
-            .with_declared_cairo_class(class_hash_bytes!(b"pending class 0 hash"))
-            .with_declared_cairo_class(class_hash_bytes!(b"pending class 1 hash"))
-            .with_deployed_contract(
-                contract_address_bytes!(b"pending contract 0 address"),
-                class_hash_bytes!(b"pending class 0 hash"),
-            )
-            .with_deployed_contract(contract1, class_hash_bytes!(b"pending class 1 hash"))
-            .with_storage_update(
-                contract1,
-                storage_address_bytes!(b"pending storage key 0"),
-                storage_value_bytes!(b"pending storage value 0"),
-            )
-            .with_storage_update(
-                contract1,
-                storage_address_bytes!(b"pending storage key 1"),
-                storage_value_bytes!(b"pending storage value 1"),
-            )
-            // This is not a real contract and should be re-worked..
-            .with_replaced_class(
-                contract_address_bytes!(b"pending contract 2 (replaced)"),
-                class_hash_bytes!(b"pending class 2 hash (replaced)"),
-            )
-            .with_contract_nonce(
-                contract_address_bytes!(b"contract 1"),
-                contract_nonce_bytes!(b"pending nonce"),
-            );
-
-        let block = starknet_gateway_types::reply::PendingBlock {
-            l1_gas_price: GasPrices {
-                price_in_wei: GasPrice::from_be_slice(b"gas price").unwrap(),
-                price_in_fri: GasPrice::from_be_slice(b"strk gas price").unwrap(),
-            },
-            l1_data_gas_price: GasPrices {
-                price_in_wei: GasPrice::from_be_slice(b"datgasprice").unwrap(),
-                price_in_fri: GasPrice::from_be_slice(b"strk datgasprice").unwrap(),
-            },
-            l2_gas_price: GasPrices {
-                price_in_wei: GasPrice::from_be_slice(b"l2 gas price").unwrap(),
-                price_in_fri: GasPrice::from_be_slice(b"strk l2gas price").unwrap(),
-            },
-            parent_hash: latest.hash,
-            sequencer_address: sequencer_address_bytes!(b"pending sequencer address"),
-            status: starknet_gateway_types::reply::Status::Pending,
-            timestamp: BlockTimestamp::new_or_panic(1234567),
-            transaction_receipts,
-            transactions,
-            starknet_version: StarknetVersion::new(0, 11, 0, 0),
-            l1_da_mode: starknet_gateway_types::reply::L1DataAvailabilityMode::Calldata,
-        };
-
-        // The class definitions must be inserted into the database.
-        let state_update_copy = state_update.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut db = storage.connection().unwrap();
-            let tx = db.transaction().unwrap();
-            let class_definition =
-                starknet_gateway_test_fixtures::class_definitions::CONTRACT_DEFINITION;
-
-            for cairo in state_update_copy.declared_cairo_classes {
-                tx.insert_cairo_class_definition(cairo, class_definition)
-                    .unwrap();
-            }
-
-            for (sierra, casm) in state_update_copy.declared_sierra_classes {
-                tx.insert_sierra_class_definition(&sierra, b"sierra def", b"casm def", &casm)
-                    .unwrap();
-            }
-
-            tx.commit().unwrap();
-        })
-        .await
-        .unwrap();
-
-        PendingData::from_pending_block(block, state_update, latest.number + 1)
     }
 
     /// Creates [PendingData] which correctly links to the provided [Storage].
@@ -1002,8 +857,8 @@ pub mod test_utils {
         let contract1 = contract_address_bytes!(b"preconfirmed contract 1 address");
         let state_update = StateUpdate::default()
             .with_parent_state_commitment(latest.state_commitment)
-            .with_declared_cairo_class(class_hash_bytes!(b"pre-confirmed class 0 hash"))
-            .with_declared_cairo_class(class_hash_bytes!(b"pre-confirmed class 1 hash"))
+            .with_declared_cairo_class(class_hash_bytes!(b"preconfirmed class 0 hash"))
+            .with_declared_cairo_class(class_hash_bytes!(b"preconfirmed class 1 hash"))
             .with_deployed_contract(
                 contract_address_bytes!(b"preconfirmed contract 0 address"),
                 class_hash_bytes!(b"preconfirmed class 0 hash"),
@@ -1029,8 +884,8 @@ pub mod test_utils {
                 contract_nonce_bytes!(b"preconfirmed nonce"),
             );
 
-        let block = crate::pending::PendingBlockVariant::PreConfirmed {
-            block: crate::pending::PreConfirmedBlock {
+        let block = crate::pending::PendingBlocks {
+            pre_confirmed: crate::pending::PreConfirmedBlock {
                 number: latest.number + 1,
                 l1_gas_price: GasPrices {
                     price_in_wei: GasPrice::from_be_slice(b"gas price").unwrap(),
@@ -1049,12 +904,11 @@ pub mod test_utils {
                 timestamp: BlockTimestamp::new_or_panic(1234567),
                 transaction_receipts,
                 transactions,
-                starknet_version: StarknetVersion::new(0, 11, 0, 0),
+                starknet_version: StarknetVersion::V_0_13_2,
                 l1_da_mode: L1DataAvailabilityMode::Calldata,
-            }
-            .into(),
+            },
+            pre_latest: None,
             candidate_transactions,
-            pre_latest_data: None,
         };
 
         // The class definitions must be inserted into the database.
@@ -1066,13 +920,21 @@ pub mod test_utils {
                 starknet_gateway_test_fixtures::class_definitions::CONTRACT_DEFINITION;
 
             for cairo in state_update_copy.declared_cairo_classes {
-                tx.insert_cairo_class_definition(cairo, class_definition)
-                    .unwrap();
+                tx.insert_cairo_class_definition(
+                    cairo,
+                    &SerializedCairoDefinition::from_slice(class_definition),
+                )
+                .unwrap();
             }
 
             for (sierra, casm) in state_update_copy.declared_sierra_classes {
-                tx.insert_sierra_class_definition(&sierra, b"sierra def", b"casm def", &casm)
-                    .unwrap();
+                tx.insert_sierra_class_definition(
+                    &sierra,
+                    &SerializedSierraDefinition::from_slice(b"sierra def"),
+                    &SerializedCasmDefinition::from_slice(b"casm def"),
+                    &casm,
+                )
+                .unwrap();
             }
 
             tx.commit().unwrap();
@@ -1247,7 +1109,7 @@ pub mod test_utils {
             timestamp: BlockTimestamp::new_or_panic(1234567),
             transaction_receipts: pre_latest_tx_receipts,
             transactions: pre_latest_transactions,
-            starknet_version: StarknetVersion::new(0, 11, 0, 0),
+            starknet_version: StarknetVersion::V_0_13_2,
             l1_da_mode: L1DataAvailabilityMode::Calldata,
         };
 
@@ -1377,8 +1239,8 @@ pub mod test_utils {
                 contract_nonce_bytes!(b"preconfirmed nonce"),
             );
 
-        let pre_confirmed_block = crate::pending::PendingBlockVariant::PreConfirmed {
-            block: crate::pending::PreConfirmedBlock {
+        let pre_confirmed_block = crate::pending::PendingBlocks {
+            pre_confirmed: crate::pending::PreConfirmedBlock {
                 // Pre-confirmed block is two blocks after latest when pre-latest
                 // is also present.
                 number: latest.number + 2,
@@ -1399,15 +1261,14 @@ pub mod test_utils {
                 timestamp: BlockTimestamp::new_or_panic(1234567),
                 transaction_receipts: pre_confirmed_tx_receipts,
                 transactions: pre_confirmed_transactions,
-                starknet_version: StarknetVersion::new(0, 11, 0, 0),
+                starknet_version: StarknetVersion::V_0_13_2,
                 l1_da_mode: L1DataAvailabilityMode::Calldata,
-            }
-            .into(),
-            candidate_transactions,
-            pre_latest_data: Some(Box::new(PreLatestData {
+            },
+            pre_latest: Some(PreLatestData {
                 block: pre_latest_block,
                 state_update: pre_latest_state_update.clone(),
-            })),
+            }),
+            candidate_transactions,
         };
 
         let aggregated_state_update = pre_latest_state_update
@@ -1423,21 +1284,37 @@ pub mod test_utils {
                 starknet_gateway_test_fixtures::class_definitions::CONTRACT_DEFINITION;
 
             for cairo in pre_latest_state_update.declared_cairo_classes {
-                tx.insert_cairo_class_definition(cairo, class_definition)
-                    .unwrap();
+                tx.insert_cairo_class_definition(
+                    cairo,
+                    &SerializedCairoDefinition::from_slice(class_definition),
+                )
+                .unwrap();
             }
             for (sierra, casm) in pre_latest_state_update.declared_sierra_classes {
-                tx.insert_sierra_class_definition(&sierra, b"sierra def", b"casm def", &casm)
-                    .unwrap();
+                tx.insert_sierra_class_definition(
+                    &sierra,
+                    &SerializedSierraDefinition::from_slice(b"sierra def"),
+                    &SerializedCasmDefinition::from_slice(b"casm def"),
+                    &casm,
+                )
+                .unwrap();
             }
 
             for cairo in pre_confirmed_state_update_copy.declared_cairo_classes {
-                tx.insert_cairo_class_definition(cairo, class_definition)
-                    .unwrap();
+                tx.insert_cairo_class_definition(
+                    cairo,
+                    &SerializedCairoDefinition::from_slice(class_definition),
+                )
+                .unwrap();
             }
             for (sierra, casm) in pre_confirmed_state_update_copy.declared_sierra_classes {
-                tx.insert_sierra_class_definition(&sierra, b"sierra def", b"casm def", &casm)
-                    .unwrap();
+                tx.insert_sierra_class_definition(
+                    &sierra,
+                    &SerializedSierraDefinition::from_slice(b"sierra def"),
+                    &SerializedCasmDefinition::from_slice(b"casm def"),
+                    &casm,
+                )
+                .unwrap();
             }
 
             tx.commit().unwrap();
@@ -1732,7 +1609,7 @@ mod tests {
             ));
         }
         let (_jh, addr) = RpcServer::new(addr, context, RpcVersion::V07)
-            .spawn(&PathBuf::default()) 
+            .spawn(&PathBuf::default())
             .await
             .unwrap();
 

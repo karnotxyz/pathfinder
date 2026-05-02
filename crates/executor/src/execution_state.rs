@@ -13,6 +13,7 @@ use pathfinder_common::prelude::*;
 use pathfinder_common::L1DataAvailabilityMode;
 use starknet_api::block::{BlockHashAndNumber, GasPrice, NonzeroGasPrice};
 use starknet_api::core::PatriciaKey;
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 
 use super::pending::PendingStateReader;
 use super::state_reader::PathfinderStateReader;
@@ -40,6 +41,8 @@ mod versions {
     pub(super) const STARKNET_VERSION_0_14_0: StarknetVersion = StarknetVersion::new(0, 14, 0, 0);
 
     pub(super) const STARKNET_VERSION_0_14_1: StarknetVersion = StarknetVersion::new(0, 14, 1, 0);
+
+    pub(super) const STARKNET_VERSION_0_14_2: StarknetVersion = StarknetVersion::new(0, 14, 2, 0);
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +63,7 @@ impl VersionedConstantsMap {
     }
 
     pub fn latest_version() -> StarknetVersion {
-        versions::STARKNET_VERSION_0_14_0
+        versions::STARKNET_VERSION_0_14_2
     }
 
     fn fill_default(data: &mut BTreeMap<StarknetVersion, Cow<'static, VersionedConstants>>) {
@@ -120,6 +123,12 @@ impl VersionedConstantsMap {
             VersionedConstants::get(&starknet_api::block::StarknetVersion::V0_14_1)
                 .expect("Failed to get versioned constants for 0.14.1"),
         );
+        Self::insert_default(
+            data,
+            &STARKNET_VERSION_0_14_2,
+            VersionedConstants::get(&starknet_api::block::StarknetVersion::V0_14_2)
+                .expect("Failed to get versioned constants for 0.14.2"),
+        );
     }
 
     fn insert_default(
@@ -166,6 +175,8 @@ pub struct ExecutionState {
     eth_fee_address: ContractAddress,
     strk_fee_address: ContractAddress,
     native_class_cache: Option<NativeClassCache>,
+    native_execution_force_use_for_incompatible_classes: bool,
+    is_l3: bool,
 }
 
 pub fn create_executor<S: StorageAdapter + Clone>(
@@ -235,7 +246,7 @@ impl ExecutionState {
         };
 
         let chain_info = self.chain_info()?;
-        let block_info = self.block_info()?;
+        let block_info = self.starknet_block_info()?;
 
         // Perform system contract updates if we are executing on top of a parent block.
         // Currently this is only the block hash from 10 blocks ago.
@@ -270,6 +281,7 @@ impl ExecutionState {
             block_number,
             self.pending_state.is_some(),
             self.native_class_cache,
+            self.native_execution_force_use_for_incompatible_classes,
         );
         let pending_state_reader = PendingStateReader::new(raw_reader, self.pending_state.clone());
 
@@ -289,7 +301,7 @@ impl ExecutionState {
         })
     }
 
-    fn chain_info(&self) -> anyhow::Result<ChainInfo> {
+    pub(crate) fn chain_info(&self) -> anyhow::Result<ChainInfo> {
         let eth_fee_token_address = starknet_api::core::ContractAddress(
             PatriciaKey::try_from(self.eth_fee_address.0.into_starkfelt())
                 .expect("ETH fee token address overflow"),
@@ -320,11 +332,11 @@ impl ExecutionState {
                 strk_fee_token_address,
                 eth_fee_token_address,
             },
-            is_l3: false,
+            is_l3: self.is_l3,
         })
     }
 
-    fn block_info(&self) -> anyhow::Result<starknet_api::block::BlockInfo> {
+    pub(crate) fn starknet_block_info(&self) -> anyhow::Result<starknet_api::block::BlockInfo> {
         let eth_l1_gas_price =
             NonzeroGasPrice::new(GasPrice(if self.block_info.eth_l1_gas_price.0 == 0 {
                 // Bad API design - the genesis block has 0 gas price, but
@@ -395,18 +407,26 @@ impl ExecutionState {
             },
             use_kzg_da: self.allow_use_kzg_data
                 && self.block_info.l1_da_mode == L1DataAvailabilityMode::Blob,
+            starknet_version: self
+                .block_info
+                .starknet_version
+                .to_string()
+                .try_into()
+                .unwrap_or(starknet_api::block::StarknetVersion::PreV0_9_1),
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn trace(
         chain_id: ChainId,
+        is_l3: bool,
         header: BlockHeader,
         pending_state: Option<Arc<StateUpdate>>,
         versioned_constants_map: VersionedConstantsMap,
         eth_fee_address: ContractAddress,
         strk_fee_address: ContractAddress,
         native_class_cache: Option<NativeClassCache>,
+        native_execution_force_use_for_incompatible_classes: bool,
     ) -> Self {
         Self {
             chain_id,
@@ -418,12 +438,15 @@ impl ExecutionState {
             eth_fee_address,
             strk_fee_address,
             native_class_cache,
+            native_execution_force_use_for_incompatible_classes,
+            is_l3,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn simulation(
         chain_id: ChainId,
+        is_l3: bool,
         header: BlockHeader,
         pending_state: Option<Arc<StateUpdate>>,
         l1_blob_data_availability: L1BlobDataAvailability,
@@ -431,6 +454,7 @@ impl ExecutionState {
         eth_fee_address: ContractAddress,
         strk_fee_address: ContractAddress,
         native_class_cache: Option<NativeClassCache>,
+        native_execution_force_use_for_incompatible_classes: bool,
     ) -> Self {
         Self {
             chain_id,
@@ -442,12 +466,15 @@ impl ExecutionState {
             eth_fee_address,
             strk_fee_address,
             native_class_cache,
+            native_execution_force_use_for_incompatible_classes,
+            is_l3,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn validation(
         chain_id: ChainId,
+        is_l3: bool,
         block_info: BlockInfo,
         pending_state: Option<Arc<StateUpdate>>,
         versioned_constants_map: VersionedConstantsMap,
@@ -465,6 +492,8 @@ impl ExecutionState {
             eth_fee_address,
             strk_fee_address,
             native_class_cache,
+            native_execution_force_use_for_incompatible_classes: false,
+            is_l3,
         }
     }
 }

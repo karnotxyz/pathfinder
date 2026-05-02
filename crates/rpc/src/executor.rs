@@ -1,16 +1,20 @@
 use anyhow::Context;
+use pathfinder_common::class_definition::{
+    SerializedOpaqueClassDefinition,
+    SerializedSierraDefinition,
+};
 use pathfinder_common::transaction::TransactionVariant;
-use pathfinder_common::{BlockNumber, ChainId, StarknetVersion};
+use pathfinder_common::{BlockNumber, ChainId, StarknetVersion, TransactionVersion};
+use pathfinder_crypto::Felt;
 use pathfinder_executor::types::to_starknet_api_transaction;
 use pathfinder_executor::{ClassInfo, IntoStarkFelt};
 use starknet_api::contract_class::SierraVersion;
 use starknet_api::core::PatriciaKey;
-use starknet_api::transaction::fields::Fee;
+use starknet_api::transaction::fields::{Fee, ValidResourceBounds};
 
+use crate::types::class::sierra::SierraContractClass;
 use crate::types::request::{
-    BroadcastedDeployAccountTransaction,
-    BroadcastedInvokeTransaction,
-    BroadcastedTransaction,
+    BroadcastedDeployAccountTransaction, BroadcastedInvokeTransaction, BroadcastedTransaction,
 };
 
 pub enum ExecutionStateError {
@@ -77,6 +81,8 @@ pub(crate) fn signature_elem_limit_exceeded(tx: &BroadcastedTransaction) -> bool
 pub(crate) fn map_broadcasted_transaction(
     transaction: &BroadcastedTransaction,
     chain_id: ChainId,
+    compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
     skip_validate: bool,
     skip_fee_charge: bool,
 ) -> anyhow::Result<pathfinder_executor::Transaction> {
@@ -89,8 +95,9 @@ pub(crate) fn map_broadcasted_transaction(
                 .serialize_to_json()
                 .context("Serializing Cairo class to JSON")?;
 
-            let contract_class =
-                pathfinder_executor::parse_deprecated_class_definition(contract_class_json)?;
+            let contract_class = pathfinder_executor::parse_deprecated_class_definition(
+                SerializedOpaqueClassDefinition::from_bytes(contract_class_json),
+            )?;
 
             Some(ClassInfo::new(
                 &contract_class,
@@ -105,8 +112,9 @@ pub(crate) fn map_broadcasted_transaction(
                 .serialize_to_json()
                 .context("Serializing Cairo class to JSON")?;
 
-            let contract_class =
-                pathfinder_executor::parse_deprecated_class_definition(contract_class_json)?;
+            let contract_class = pathfinder_executor::parse_deprecated_class_definition(
+                SerializedOpaqueClassDefinition::from_bytes(contract_class_json),
+            )?;
 
             Some(ClassInfo::new(
                 &contract_class,
@@ -116,14 +124,18 @@ pub(crate) fn map_broadcasted_transaction(
             )?)
         }
         BroadcastedTransaction::Declare(BroadcastedDeclareTransaction::V2(tx)) => {
-            let casm_contract_definition = pathfinder_compiler::compile_to_casm(
-                &tx.contract_class
-                    .serialize_to_json()
-                    .context("Serializing Sierra class definition")?,
-            )
-            .context("Compiling Sierra class definition to CASM")?;
             let sierra_version =
                 SierraVersion::extract_from_program(&tx.contract_class.sierra_program)?;
+            let sierra_definition = SerializedSierraDefinition::from_bytes(
+                serde_json::to_vec(&tx.contract_class)
+                    .context("Serializing Sierra class definition")?,
+            );
+            let casm_contract_definition = pathfinder_compiler::compile_sierra_to_casm(
+                &sierra_definition,
+                compiler_resource_limits,
+                blockifier_libfuncs,
+            )
+            .context("Compiling Sierra class definition to CASM")?;
 
             let casm_contract_definition = pathfinder_executor::parse_casm_definition(
                 casm_contract_definition,
@@ -138,14 +150,18 @@ pub(crate) fn map_broadcasted_transaction(
             )?)
         }
         BroadcastedTransaction::Declare(BroadcastedDeclareTransaction::V3(tx)) => {
-            let casm_contract_definition = pathfinder_compiler::compile_to_casm(
-                &tx.contract_class
-                    .serialize_to_json()
-                    .context("Serializing Sierra class definition")?,
-            )
-            .context("Compiling Sierra class definition to CASM")?;
             let sierra_version =
                 SierraVersion::extract_from_program(&tx.contract_class.sierra_program)?;
+            let sierra_definition = SerializedSierraDefinition::from_bytes(
+                serde_json::to_vec(&tx.contract_class)
+                    .context("Serializing Sierra class definition")?,
+            );
+            let casm_contract_definition = pathfinder_compiler::compile_sierra_to_casm(
+                &sierra_definition,
+                compiler_resource_limits,
+                blockifier_libfuncs,
+            )
+            .context("Compiling Sierra class definition to CASM")?;
 
             let casm_contract_definition = pathfinder_executor::parse_casm_definition(
                 casm_contract_definition,
@@ -275,8 +291,8 @@ pub fn compose_executor_transaction(
             let class_definition = db_transaction
                 .class_definition(tx.class_hash)?
                 .context("Fetching class definition")?;
-            let class_definition: crate::types::class::sierra::SierraContractClass =
-                serde_json::from_str(&String::from_utf8(class_definition)?)
+            let class_definition: SierraContractClass =
+                serde_json::from_slice(class_definition.as_bytes())
                     .context("Deserializing class definition")?;
             let sierra_version =
                 SierraVersion::extract_from_program(&class_definition.sierra_program)?;
@@ -297,8 +313,8 @@ pub fn compose_executor_transaction(
             let class_definition = db_transaction
                 .class_definition(tx.class_hash)?
                 .context("Fetching class definition")?;
-            let class_definition: crate::types::class::sierra::SierraContractClass =
-                serde_json::from_str(&String::from_utf8(class_definition)?)
+            let class_definition: SierraContractClass =
+                serde_json::from_slice(class_definition.as_bytes())
                     .context("Deserializing class definition")?;
             let sierra_version =
                 SierraVersion::extract_from_program(&class_definition.sierra_program)?;
@@ -359,6 +375,24 @@ pub fn compose_executor_transaction(
     tracing::trace!(%tx_hash, "Converting transaction");
 
     let transaction = to_starknet_api_transaction(transaction.variant.clone())?;
+    let mut charge_fee = true;
+    if transaction.version().0 == starknet_types_core::felt::Felt::ZERO {
+        // Only used during bootstrapper v1 bootstrapping
+        charge_fee = false;
+    } else if let Some(resource_bounds) = transaction.resource_bounds() {
+        match resource_bounds {
+            ValidResourceBounds::AllResources(all_resources) => {
+                if all_resources.l2_gas.max_amount.0 == 0 {
+                    charge_fee = false;
+                }
+            }
+            ValidResourceBounds::L1Gas(l1_gas) => {
+                if l1_gas.max_amount.0 == 0 {
+                    charge_fee = false;
+                }
+            }
+        }
+    }
 
     let tx = pathfinder_executor::Transaction::from_api(
         transaction,
@@ -366,7 +400,12 @@ pub fn compose_executor_transaction(
         class_info,
         paid_fee_on_l1,
         deployed_address,
-        pathfinder_executor::AccountTransactionExecutionFlags::default(),
+        pathfinder_executor::AccountTransactionExecutionFlags {
+            only_query: false,
+            charge_fee,
+            validate: true,
+            strict_nonce_check: true,
+        },
     )?;
 
     Ok(tx)

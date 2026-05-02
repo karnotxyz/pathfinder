@@ -1,5 +1,9 @@
 use blockifier::blockifier::config::TransactionExecutorConfig;
 use blockifier::state::errors::StateError;
+use pathfinder_common::class_definition::{
+    SerializedCasmDefinition,
+    SerializedOpaqueClassDefinition,
+};
 use pathfinder_common::{
     BlockHash,
     BlockId,
@@ -16,15 +20,19 @@ pub mod concurrent;
 pub mod rc;
 
 // Keep clippy happy
-type ClassDefinitionAtWithBlockNumber = Option<(BlockNumber, Vec<u8>)>;
-type ClassDefinitionWithBlockNumber = Option<(Option<BlockNumber>, Vec<u8>)>;
+type ClassDefinitionAtWithBlockNumber = Option<(BlockNumber, SerializedOpaqueClassDefinition)>;
+type ClassDefinitionWithBlockNumber =
+    Option<(Option<BlockNumber>, SerializedOpaqueClassDefinition)>;
 
 pub trait StorageAdapter {
     fn transaction_executor_config(&self) -> TransactionExecutorConfig;
 
     fn block_hash(&self, block: BlockId) -> anyhow::Result<Option<BlockHash>>;
 
-    fn casm_definition(&self, class_hash: ClassHash) -> Result<Option<Vec<u8>>, StateError>;
+    fn casm_definition(
+        &self,
+        class_hash: ClassHash,
+    ) -> Result<Option<SerializedCasmDefinition>, StateError>;
 
     fn class_definition_with_block_number(
         &self,
@@ -35,13 +43,13 @@ pub trait StorageAdapter {
         &self,
         block_id: BlockId,
         class_hash: ClassHash,
-    ) -> Result<Option<Vec<u8>>, StateError>;
+    ) -> Result<Option<SerializedCasmDefinition>, StateError>;
 
     fn class_definition_at_with_block_number(
         &self,
         block_id: BlockId,
         class_hash: ClassHash,
-    ) -> Result<Option<(BlockNumber, Vec<u8>)>, StateError>;
+    ) -> Result<ClassDefinitionAtWithBlockNumber, StateError>;
 
     fn storage_value(
         &self,

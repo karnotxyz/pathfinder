@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 mod block;
 mod class;
-pub mod consensus;
 mod ethereum;
 pub mod event;
 pub mod pruning;
@@ -30,6 +29,8 @@ pub use rusqlite::TransactionBehavior;
 pub use trie::{Node, NodeRef, RootIndexUpdate, StoredNode, TrieStorageIndex, TrieUpdate};
 
 use crate::bloom::AggregateBloomCache;
+use crate::params::RowExt;
+use crate::{StorageError, VERSION_KEY};
 
 type PooledConnection = r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>;
 
@@ -58,7 +59,7 @@ impl Connection {
         }
     }
 
-    pub fn transaction(&mut self) -> anyhow::Result<Transaction<'_>> {
+    pub fn transaction(&mut self) -> Result<Transaction<'_>, StorageError> {
         let tx = self.connection.transaction()?;
         Ok(Transaction {
             transaction: tx,
@@ -72,7 +73,7 @@ impl Connection {
     pub fn transaction_with_behavior(
         &mut self,
         behavior: TransactionBehavior,
-    ) -> anyhow::Result<Transaction<'_>> {
+    ) -> Result<Transaction<'_>, StorageError> {
         let tx = self.connection.transaction_with_behavior(behavior)?;
         Ok(Transaction {
             transaction: tx,
@@ -150,5 +151,12 @@ impl Transaction<'_> {
     pub fn reset_in_memory_state(&self, head: BlockNumber) -> anyhow::Result<()> {
         self.event_filter_cache.reset();
         self.rebuild_running_event_filter(head)
+    }
+
+    pub fn user_version(&self) -> anyhow::Result<i64> {
+        let user_version = self
+            .transaction
+            .pragma_query_value(None, VERSION_KEY, |row| row.get_i64(0))?;
+        Ok(user_version)
     }
 }

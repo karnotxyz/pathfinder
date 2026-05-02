@@ -13,7 +13,7 @@ use tokio::time::MissedTickBehavior;
 use super::REORG_SUBSCRIPTION_NAME;
 use crate::context::RpcContext;
 use crate::jsonrpc::{RpcError, RpcSubscriptionFlow, SubscriptionMessage};
-use crate::pending::PendingBlockVariant;
+use crate::pending::PendingBlocks;
 use crate::{tracker, PendingData, Reorg, RpcVersion};
 
 pub struct SubscribeTransactionStatus;
@@ -271,13 +271,19 @@ impl RpcSubscriptionFlow for SubscribeTransactionStatus {
                                     }
                                 }
 
+                                let status_in_l2 = l2_block.transactions_and_receipts
+                                    .iter()
+                                    .find_map(|(tx, receipt)| {
+                                        (tx.hash == tx_hash).then_some(&receipt.execution_status)
+                                    });
+
                                 // 2. Transactions accepted on L2.
-                                if let Some(receipt) = find_tx_receipt(&l2_block.transaction_receipts, tx_hash) {
+                                if let Some(status) = status_in_l2 {
                                     if sender
                                         .send_and_update(
-                                            l2_block.block_number,
+                                            l2_block.header.number,
                                             FinalityStatus::AcceptedOnL2,
-                                            Some(receipt.execution_status.clone()),
+                                            Some(status.clone()),
                                         )
                                         .await
                                         .is_err()
@@ -290,8 +296,8 @@ impl RpcSubscriptionFlow for SubscribeTransactionStatus {
                                 // 3. Transactions accepted on L1.
                                 let storage = state.storage.clone();
                                 let l1_state = util::task::spawn_blocking(move |_| -> Result<_, RpcError> {
-                                    let mut conn = storage.connection().map_err(RpcError::InternalError)?;
-                                    let db = conn.transaction().map_err(RpcError::InternalError)?;
+                                    let mut conn = storage.connection()?;
+                                    let db = conn.transaction()?;
                                     let l1_state = db.latest_l1_state().map_err(RpcError::InternalError)?;
                                     Ok(l1_state)
                                 }).await.map_err(|e| RpcError::InternalError(e.into()))??;
@@ -324,6 +330,7 @@ impl RpcSubscriptionFlow for SubscribeTransactionStatus {
                 }
             }
         }
+
         Ok(())
     }
 }
@@ -341,8 +348,8 @@ async fn current_known_tx_status(
     // pending data and DB, the DB would contain "fresher" transaction status
     // information.
     let (l1_state, tx_with_receipt) = util::task::spawn_blocking(move |_| -> Result<_, RpcError> {
-        let mut conn = storage.connection().map_err(RpcError::InternalError)?;
-        let db = conn.transaction().map_err(RpcError::InternalError)?;
+        let mut conn = storage.connection()?;
+        let db = conn.transaction()?;
         let l1_block_number = db.latest_l1_state().map_err(RpcError::InternalError)?;
         let tx_with_receipt = db
             .transaction_with_receipt(tx_hash)
@@ -397,46 +404,36 @@ fn pending_data_tx_status(
         if status_in_pre_latest.is_some() {
             return Some((
                 pre_latest_block.number,
-                FinalityStatus::AcceptedOnL2,
+                FinalityStatus::PreConfirmed,
                 status_in_pre_latest,
             ));
         }
     }
 
-    let block_number = pending_data.pending_block_number();
-    match pending_data.pending_block().as_ref() {
-        PendingBlockVariant::Pending(block) => {
-            find_tx_receipt(&block.transaction_receipts, tx_hash).map(|receipt| {
-                (
-                    block_number,
-                    FinalityStatus::AcceptedOnL2,
-                    Some(receipt.execution_status.clone()),
-                )
-            })
-        }
-        PendingBlockVariant::PreConfirmed {
-            block,
-            candidate_transactions,
-            ..
-        } => {
-            let is_candidate = candidate_transactions.iter().any(|tx| tx.hash == tx_hash);
-            if is_candidate {
-                return Some((block_number, FinalityStatus::Candidate, None));
-            }
+    let block_number = pending_data.pre_confirmed_block_number();
+    let pending_block = pending_data.pending_block();
+    let PendingBlocks {
+        pre_confirmed,
+        candidate_transactions,
+        ..
+    } = pending_block.as_ref();
 
-            let status_in_pre_confirmed = find_tx_receipt(&block.transaction_receipts, tx_hash)
-                .map(|r| r.execution_status.clone());
-            if status_in_pre_confirmed.is_some() {
-                return Some((
-                    block_number,
-                    FinalityStatus::PreConfirmed,
-                    status_in_pre_confirmed,
-                ));
-            }
-
-            None
-        }
+    let is_candidate = candidate_transactions.iter().any(|tx| tx.hash == tx_hash);
+    if is_candidate {
+        return Some((block_number, FinalityStatus::Candidate, None));
     }
+
+    let status_in_pre_confirmed = find_tx_receipt(&pre_confirmed.transaction_receipts, tx_hash)
+        .map(|r| r.execution_status.clone());
+    if status_in_pre_confirmed.is_some() {
+        return Some((
+            block_number,
+            FinalityStatus::PreConfirmed,
+            status_in_pre_confirmed,
+        ));
+    }
+
+    None
 }
 
 fn find_tx_receipt(
@@ -513,11 +510,12 @@ mod tests {
     use pathfinder_common::prelude::*;
     use pathfinder_common::receipt::{ExecutionStatus, Receipt};
     use pathfinder_common::transaction::Transaction;
+    use pathfinder_common::L2Block;
     use pathfinder_crypto::Felt;
     use pathfinder_ethereum::EthereumStateUpdate;
     use pathfinder_storage::StorageBuilder;
     use pretty_assertions_sorted::assert_eq;
-    use starknet_gateway_types::reply::{Block, PendingBlock, PreConfirmedBlock, PreLatestBlock};
+    use starknet_gateway_types::reply::{PreConfirmedBlock, PreLatestBlock};
     use tokio::sync::mpsc;
 
     use crate::context::{RpcContext, WebsocketContext};
@@ -557,7 +555,7 @@ mod tests {
 
         // Irrelevant pending update.
         pending_sender.send_modify(|pending| {
-            *pending.pending_block_number_mut() = BlockNumber::GENESIS + 1;
+            *pending.pre_confirmed_block_number_mut() = BlockNumber::GENESIS + 1;
         });
 
         // No message expected.
@@ -570,9 +568,12 @@ mod tests {
             .notifications
             .l2_blocks
             .send(
-                Block {
-                    block_number: BlockNumber::GENESIS + 1,
-                    block_hash: BlockHash(Felt::from_u64(1)),
+                L2Block {
+                    header: BlockHeader {
+                        number: BlockNumber::GENESIS + 1,
+                        hash: BlockHash(Felt::from_u64(1)),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }
                 .into(),
@@ -606,9 +607,12 @@ mod tests {
             .notifications
             .l2_blocks
             .send(
-                Block {
-                    block_number: BlockNumber::GENESIS + 2,
-                    block_hash: BlockHash(Felt::from_u64(2)),
+                L2Block {
+                    header: BlockHeader {
+                        number: BlockNumber::GENESIS + 2,
+                        hash: BlockHash(Felt::from_u64(2)),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 }
                 .into(),
@@ -735,67 +739,132 @@ mod tests {
     async fn transaction_status_streaming() {
         test_transaction_status_streaming(|subscription_id| {
             vec![
-                TestEvent::Pending(PendingData::from_pending_block(
-                    PendingBlock {
-                        transactions: vec![Transaction {
-                            hash: TransactionHash(Felt::from_u64(2)),
-                            variant: Default::default(),
-                        }],
-                        transaction_receipts: vec![(
-                            Receipt {
-                                transaction_hash: TransactionHash(Felt::from_u64(2)),
-                                execution_status: ExecutionStatus::Succeeded,
-                                ..Default::default()
-                            },
-                            vec![],
-                        )],
-                        ..Default::default()
-                    },
-                    StateUpdate::default(),
-                    BlockNumber::GENESIS + 1,
-                )),
+                TestEvent::Pending(
+                    PendingData::try_from_pre_confirmed_block(
+                        PreConfirmedBlock {
+                            transactions: vec![Transaction {
+                                hash: TransactionHash(Felt::from_u64(2)),
+                                variant: Default::default(),
+                            }],
+                            transaction_receipts: vec![Some((
+                                Receipt {
+                                    transaction_hash: TransactionHash(Felt::from_u64(2)),
+                                    execution_status: ExecutionStatus::Succeeded,
+                                    ..Default::default()
+                                },
+                                vec![],
+                            ))],
+                            ..Default::default()
+                        }
+                        .into(),
+                        BlockNumber::GENESIS + 1,
+                    )
+                    .unwrap(),
+                ),
                 TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 1,
-                        block_hash: BlockHash(Felt::from_u64(1)),
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 1,
+                            hash: BlockHash(Felt::from_u64(1)),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     }
                     .into(),
                 ),
-                TestEvent::Pending(PendingData::from_pending_block(
-                    PendingBlock {
-                        transactions: vec![Transaction {
-                            hash: TARGET_TX_HASH,
-                            variant: Default::default(),
-                        }],
-                        transaction_receipts: vec![(
-                            Receipt {
-                                transaction_hash: TARGET_TX_HASH,
-                                execution_status: ExecutionStatus::Succeeded,
-                                ..Default::default()
-                            },
-                            vec![],
-                        )],
-                        ..Default::default()
-                    },
-                    StateUpdate::default(),
-                    BlockNumber::GENESIS + 2,
-                )),
-                TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 2,
-                        block_hash: BlockHash(Felt::from_u64(2)),
-                        transactions: vec![Transaction {
-                            hash: TARGET_TX_HASH,
+                TestEvent::Pending(
+                    PendingData::try_from_pre_confirmed_block(
+                        PreConfirmedBlock {
+                            transactions: vec![Transaction {
+                                hash: TARGET_TX_HASH,
+                                variant: Default::default(),
+                            }],
+                            transaction_receipts: vec![Some((
+                                Receipt {
+                                    transaction_hash: TARGET_TX_HASH,
+                                    execution_status: ExecutionStatus::Succeeded,
+                                    ..Default::default()
+                                },
+                                vec![],
+                            ))],
                             ..Default::default()
-                        }],
-                        transaction_receipts: vec![(
+                        }
+                        .into(),
+                        BlockNumber::GENESIS + 2,
+                    )
+                    .unwrap(),
+                ),
+                TestEvent::L2Block(
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 2,
+                            hash: BlockHash(Felt::from_u64(2)),
+                            ..Default::default()
+                        },
+                        transactions_and_receipts: vec![(
+                            Transaction {
+                                hash: TARGET_TX_HASH,
+                                ..Default::default()
+                            },
                             Receipt {
                                 transaction_hash: TARGET_TX_HASH,
                                 ..Default::default()
                             },
-                            vec![],
                         )],
+                        events: vec![vec![]],
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                TestEvent::Message(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "starknet_subscriptionTransactionStatus",
+                    "params": {
+                        "result": {
+                            "transaction_hash": "0x1",
+                            "status": {
+                                "finality_status": "PRE_CONFIRMED",
+                                "execution_status": "SUCCEEDED",
+                            }
+                        },
+                        "subscription_id": subscription_id
+                    }
+                })),
+                // Irrelevant block.
+                TestEvent::L2Block(
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 3,
+                            hash: BlockHash(Felt::from_u64(3)),
+                            ..Default::default()
+                        },
+                        transactions_and_receipts: vec![(
+                            Transaction {
+                                hash: TransactionHash(Felt::from_u64(5)),
+                                ..Default::default()
+                            },
+                            Receipt {
+                                transaction_hash: TransactionHash(Felt::from_u64(5)),
+                                ..Default::default()
+                            },
+                        )],
+                        events: vec![vec![]],
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                TestEvent::L1State(EthereumStateUpdate {
+                    state_root: Default::default(),
+                    block_number: BlockNumber::GENESIS + 3,
+                    block_hash: Default::default(),
+                }),
+                TestEvent::L2Block(
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 4,
+                            hash: BlockHash(Felt::from_u64(4)),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     }
                     .into(),
@@ -808,45 +877,12 @@ mod tests {
                             "transaction_hash": "0x1",
                             "status": {
                                 "finality_status": "ACCEPTED_ON_L2",
-                                "execution_status": "SUCCEEDED",
+                                "execution_status": "SUCCEEDED"
                             }
                         },
                         "subscription_id": subscription_id
                     }
                 })),
-                // Irrelevant block.
-                TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 3,
-                        block_hash: BlockHash(Felt::from_u64(3)),
-                        transactions: vec![Transaction {
-                            hash: TransactionHash(Felt::from_u64(5)),
-                            ..Default::default()
-                        }],
-                        transaction_receipts: vec![(
-                            Receipt {
-                                transaction_hash: TransactionHash(Felt::from_u64(5)),
-                                ..Default::default()
-                            },
-                            vec![],
-                        )],
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                TestEvent::L1State(EthereumStateUpdate {
-                    state_root: Default::default(),
-                    block_number: BlockNumber::GENESIS + 3,
-                    block_hash: Default::default(),
-                }),
-                TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 4,
-                        block_hash: BlockHash(Felt::from_u64(4)),
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
                 TestEvent::Message(serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "starknet_subscriptionTransactionStatus",
@@ -900,94 +936,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_found_in_pending_block() {
-        test_transaction_status_streaming(|subscription_id| {
-            vec![
-                TestEvent::Pending(PendingData::from_pending_block(
-                    PendingBlock {
-                        transactions: vec![Transaction {
-                            hash: TransactionHash(Felt::from_u64(2)),
-                            variant: Default::default(),
-                        }],
-                        transaction_receipts: vec![(
-                            Receipt {
-                                transaction_hash: TransactionHash(Felt::from_u64(2)),
-                                execution_status: ExecutionStatus::Succeeded,
-                                ..Default::default()
-                            },
-                            vec![],
-                        )],
-                        ..Default::default()
-                    },
-                    StateUpdate::default(),
-                    BlockNumber::GENESIS + 1,
-                )),
-                TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 1,
-                        block_hash: BlockHash(Felt::from_u64(1)),
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                TestEvent::Pending(PendingData::from_pending_block(
-                    PendingBlock {
-                        transactions: vec![Transaction {
-                            hash: TARGET_TX_HASH,
-                            variant: Default::default(),
-                        }],
-                        transaction_receipts: vec![(
-                            Receipt {
-                                transaction_hash: TARGET_TX_HASH,
-                                execution_status: ExecutionStatus::Succeeded,
-                                ..Default::default()
-                            },
-                            vec![],
-                        )],
-                        ..Default::default()
-                    },
-                    StateUpdate::default(),
-                    BlockNumber::GENESIS + 2,
-                )),
-                TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 2,
-                        block_hash: BlockHash(Felt::from_u64(2)),
-                        transactions: vec![Transaction {
-                            hash: TARGET_TX_HASH,
-                            ..Default::default()
-                        }],
-                        transaction_receipts: vec![(
-                            Receipt {
-                                transaction_hash: TARGET_TX_HASH,
-                                ..Default::default()
-                            },
-                            vec![],
-                        )],
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                TestEvent::Message(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "starknet_subscriptionTransactionStatus",
-                    "params": {
-                        "result": {
-                            "transaction_hash": "0x1",
-                            "status": {
-                                "finality_status": "ACCEPTED_ON_L2",
-                                "execution_status": "SUCCEEDED",
-                            }
-                        },
-                        "subscription_id": subscription_id
-                    }
-                })),
-            ]
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn transaction_found_in_pre_confirmed_block() {
         test_transaction_status_streaming(|subscription_id| {
             vec![
@@ -1006,9 +954,12 @@ mod tests {
                     .unwrap(),
                 ),
                 TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 1,
-                        block_hash: BlockHash(Felt::from_u64(1)),
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 1,
+                            hash: BlockHash(Felt::from_u64(1)),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     }
                     .into(),
@@ -1037,20 +988,23 @@ mod tests {
                     .unwrap(),
                 ),
                 TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 2,
-                        block_hash: BlockHash(Felt::from_u64(2)),
-                        transactions: vec![Transaction {
-                            hash: TARGET_TX_HASH,
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 2,
+                            hash: BlockHash(Felt::from_u64(2)),
                             ..Default::default()
-                        }],
-                        transaction_receipts: vec![(
+                        },
+                        transactions_and_receipts: vec![(
+                            Transaction {
+                                hash: TARGET_TX_HASH,
+                                ..Default::default()
+                            },
                             Receipt {
                                 transaction_hash: TARGET_TX_HASH,
                                 ..Default::default()
                             },
-                            vec![],
                         )],
+                        events: vec![vec![]],
                         ..Default::default()
                     }
                     .into(),
@@ -1089,7 +1043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_found_in_pre_latest_and_and_l2_block_sends_update_once() {
+    async fn pre_confirmed_promoted_to_pre_latest_does_not_send_duplicate_notification() {
         test_transaction_status_streaming(|subscription_id| {
             vec![
                 TestEvent::Pending(
@@ -1107,9 +1061,12 @@ mod tests {
                     .unwrap(),
                 ),
                 TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 1,
-                        block_hash: BlockHash(Felt::from_u64(1)),
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 1,
+                            hash: BlockHash(Felt::from_u64(1)),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     }
                     .into(),
@@ -1170,7 +1127,9 @@ mod tests {
                         .into(),
                         BlockNumber::GENESIS + 3,
                         Some(Box::new((
-                            // Previous block promoted to pre-latest.
+                            // Previous block promoted to pre-latest. This should not result in
+                            // a notification because it would have a duplicate `PRE_CONFIRMED`
+                            // status.
                             BlockNumber::GENESIS + 2,
                             PreLatestBlock {
                                 parent_hash: BlockHash(Felt::from_u64(2)),
@@ -1209,6 +1168,30 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                // No message expected for the pre-latest update since it would be a duplicate
+                // of the pre-confirmed update.
+                TestEvent::L2Block(
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 2,
+                            hash: BlockHash(Felt::from_u64(2)),
+                            ..Default::default()
+                        },
+                        transactions_and_receipts: vec![(
+                            Transaction {
+                                hash: TARGET_TX_HASH,
+                                ..Default::default()
+                            },
+                            Receipt {
+                                transaction_hash: TARGET_TX_HASH,
+                                ..Default::default()
+                            },
+                        )],
+                        events: vec![vec![]],
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
                 TestEvent::Message(serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "starknet_subscriptionTransactionStatus",
@@ -1223,26 +1206,6 @@ mod tests {
                         "subscription_id": subscription_id
                     }
                 })),
-                TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 2,
-                        block_hash: BlockHash(Felt::from_u64(2)),
-                        transactions: vec![Transaction {
-                            hash: TARGET_TX_HASH,
-                            ..Default::default()
-                        }],
-                        transaction_receipts: vec![(
-                            Receipt {
-                                transaction_hash: TARGET_TX_HASH,
-                                ..Default::default()
-                            },
-                            vec![],
-                        )],
-                        ..Default::default()
-                    }
-                    .into(),
-                ),
-                // No message received with a duplicate ACCEPTED_ON_L2 status.
             ]
         })
         .await;
@@ -1267,9 +1230,12 @@ mod tests {
                     .unwrap(),
                 ),
                 TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 1,
-                        block_hash: BlockHash(Felt::from_u64(1)),
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 1,
+                            hash: BlockHash(Felt::from_u64(1)),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     }
                     .into(),
@@ -1292,20 +1258,23 @@ mod tests {
                     .unwrap(),
                 ),
                 TestEvent::L2Block(
-                    Block {
-                        block_number: BlockNumber::GENESIS + 2,
-                        block_hash: BlockHash(Felt::from_u64(2)),
-                        transactions: vec![Transaction {
-                            hash: TARGET_TX_HASH,
+                    L2Block {
+                        header: BlockHeader {
+                            number: BlockNumber::GENESIS + 2,
+                            hash: BlockHash(Felt::from_u64(2)),
                             ..Default::default()
-                        }],
-                        transaction_receipts: vec![(
+                        },
+                        transactions_and_receipts: vec![(
+                            Transaction {
+                                hash: TARGET_TX_HASH,
+                                ..Default::default()
+                            },
                             Receipt {
                                 transaction_hash: TARGET_TX_HASH,
                                 ..Default::default()
                             },
-                            vec![],
                         )],
+                        events: vec![vec![]],
                         ..Default::default()
                     }
                     .into(),
@@ -1406,49 +1375,58 @@ mod tests {
         handle_test_events(
             |subscription_id| {
                 vec![
-                    TestEvent::Pending(PendingData::from_pending_block(
-                        // Irrelevant pending update.
-                        PendingBlock {
-                            transactions: vec![Transaction {
-                                hash: TransactionHash(Felt::from_u64(2)),
-                                variant: Default::default(),
-                            }],
-                            transaction_receipts: vec![(
-                                Receipt {
-                                    transaction_hash: TransactionHash(Felt::from_u64(2)),
-                                    ..Default::default()
-                                },
-                                vec![],
-                            )],
-                            ..Default::default()
-                        },
-                        StateUpdate::default(),
-                        BlockNumber::GENESIS + 1,
-                    )),
+                    TestEvent::Pending(
+                        PendingData::try_from_pre_confirmed_block(
+                            // Irrelevant pending update.
+                            PreConfirmedBlock {
+                                transactions: vec![Transaction {
+                                    hash: TransactionHash(Felt::from_u64(2)),
+                                    variant: Default::default(),
+                                }],
+                                transaction_receipts: vec![Some((
+                                    Receipt {
+                                        transaction_hash: TransactionHash(Felt::from_u64(2)),
+                                        ..Default::default()
+                                    },
+                                    vec![],
+                                ))],
+                                ..Default::default()
+                            }
+                            .into(),
+                            BlockNumber::GENESIS + 1,
+                        )
+                        .unwrap(),
+                    ),
                     // Irrelevant block update.
                     TestEvent::L2Block(
-                        Block {
-                            block_number: BlockNumber::GENESIS + 1,
-                            block_hash: BlockHash(Felt::from_u64(1)),
+                        L2Block {
+                            header: BlockHeader {
+                                number: BlockNumber::GENESIS + 1,
+                                hash: BlockHash(Felt::from_u64(1)),
+                                ..Default::default()
+                            },
                             ..Default::default()
                         }
                         .into(),
                     ),
                     TestEvent::L2Block(
-                        Block {
-                            block_number: BlockNumber::GENESIS + 2,
-                            block_hash: BlockHash(Felt::from_u64(2)),
-                            transactions: vec![Transaction {
-                                hash: TARGET_TX_HASH,
+                        L2Block {
+                            header: BlockHeader {
+                                number: BlockNumber::GENESIS + 2,
+                                hash: BlockHash(Felt::from_u64(2)),
                                 ..Default::default()
-                            }],
-                            transaction_receipts: vec![(
+                            },
+                            transactions_and_receipts: vec![(
+                                Transaction {
+                                    hash: TARGET_TX_HASH,
+                                    ..Default::default()
+                                },
                                 Receipt {
                                     transaction_hash: TARGET_TX_HASH,
                                     ..Default::default()
                                 },
-                                vec![],
                             )],
+                            events: vec![vec![]],
                             ..Default::default()
                         }
                         .into(),
@@ -1574,22 +1552,16 @@ mod tests {
                             let mut conn = storage.connection().unwrap();
                             let db = conn.transaction().unwrap();
                             db.insert_block_header(&BlockHeader {
-                                hash: block.block_hash,
-                                number: block.block_number,
-                                parent_hash: BlockHash(block.block_hash.0 - Felt::from_u64(1)),
+                                hash: block.header.hash,
+                                number: block.header.number,
+                                parent_hash: BlockHash(block.header.hash.0 - Felt::from_u64(1)),
                                 ..Default::default()
                             })
                             .unwrap();
-                            let (transactions, events_per_tx): (Vec<_>, Vec<_>) = block
-                                .transactions
-                                .into_iter()
-                                .zip(block.transaction_receipts)
-                                .map(|(tx, (receipt, events))| ((tx, receipt), events))
-                                .unzip();
                             db.insert_transaction_data(
-                                block.block_number,
-                                &transactions,
-                                Some(&events_per_tx),
+                                block.header.number,
+                                &block.transactions_and_receipts,
+                                Some(&block.events),
                             )
                             .unwrap();
                             db.commit().unwrap();
@@ -1748,7 +1720,7 @@ mod tests {
     #[derive(Debug)]
     enum TestEvent {
         Pending(PendingData),
-        L2Block(Box<Block>),
+        L2Block(Box<L2Block>),
         Reorg(Reorg),
         L1State(EthereumStateUpdate),
         Message(serde_json::Value),

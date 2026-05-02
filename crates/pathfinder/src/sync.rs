@@ -52,6 +52,8 @@ pub struct Sync<P, G> {
     pub public_key: PublicKey,
     pub l1_checkpoint_override: Option<EthereumStateUpdate>,
     pub verify_tree_hashes: bool,
+    pub compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    pub blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
     pub block_hash_db: Option<BlockHashDb>,
 }
 
@@ -87,7 +89,6 @@ where
     /// errors are transient. We cannot proceed without a checkpoint, so we
     /// retry until we get one.
     async fn get_checkpoint(&self) -> pathfinder_ethereum::EthereumStateUpdate {
-        use pathfinder_ethereum::EthereumApi;
         if let Some(forced) = &self.l1_checkpoint_override {
             return *forced;
         }
@@ -128,6 +129,8 @@ where
                 chain_id: self.chain_id,
                 public_key: self.public_key,
                 verify_tree_hashes: self.verify_tree_hashes,
+                compiler_resource_limits: self.compiler_resource_limits,
+                blockifier_libfuncs: self.blockifier_libfuncs,
                 block_hash_db: self.block_hash_db.clone(),
             }
             .run(checkpoint)
@@ -189,6 +192,8 @@ where
                 chain_id: self.chain_id,
                 public_key: self.public_key,
                 verify_tree_hashes: self.verify_tree_hashes,
+                compiler_resource_limits: self.compiler_resource_limits,
+                blockifier_libfuncs: self.blockifier_libfuncs,
                 block_hash_db: self.block_hash_db.clone(),
             }
             .run(&mut next, &mut parent_hash, self.fgw_client.clone())
@@ -307,6 +312,18 @@ mod tests {
         StateDiffsError,
         TransactionData,
     };
+    use pathfinder_block_commitments::{
+        calculate_event_commitment,
+        calculate_receipt_commitment,
+        calculate_transaction_commitment,
+        compute_final_hash,
+    };
+    use pathfinder_common::class_definition::{
+        SerializedCairoDefinition,
+        SerializedCasmDefinition,
+        SerializedOpaqueClassDefinition,
+        SerializedSierraDefinition,
+    };
     use pathfinder_common::event::Event;
     use pathfinder_common::prelude::*;
     use pathfinder_common::receipt::Receipt;
@@ -326,12 +343,6 @@ mod tests {
     use starknet_gateway_types::error::SequencerError;
 
     use super::*;
-    use crate::state::block_hash::{
-        calculate_event_commitment,
-        calculate_receipt_commitment,
-        calculate_transaction_commitment,
-        compute_final_hash,
-    };
 
     const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -491,6 +502,8 @@ mod tests {
                 block_hash: last_checkpoint_header.hash,
             }),
             verify_tree_hashes: true,
+            compiler_resource_limits: pathfinder_compiler::ResourceLimits::for_test(),
+            blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs::default(),
             block_hash_db: None,
         };
 
@@ -606,7 +619,11 @@ mod tests {
                 );
                 pretty_assertions_sorted::assert_eq!(
                     cairo_defs,
-                    expected.cairo_defs.into_iter().collect::<HashMap<_, _>>(),
+                    expected
+                        .cairo_defs
+                        .into_iter()
+                        .map(|(h, d)| (h, SerializedOpaqueClassDefinition::from(d)))
+                        .collect::<HashMap<_, _>>(),
                     "block {}",
                     block_number
                 );
@@ -616,7 +633,15 @@ mod tests {
                         .sierra_defs
                         .into_iter()
                         // All sierra fixtures are not compile-able
-                        .map(|(h, s, _, _)| (h, (s, starknet_gateway_test_fixtures::class_definitions::CAIRO_1_1_0_BALANCE_CASM_JSON.to_vec())))
+                        .map(|(h, s, _, _)| (
+                            h,
+                            (
+                                SerializedOpaqueClassDefinition::from(s),
+                                SerializedCasmDefinition::from_slice(
+                                    starknet_gateway_test_fixtures::class_definitions::CAIRO_1_1_0_BALANCE_CASM_JSON
+                                ),
+                            )
+                        ))
                         .collect::<HashMap<_, _>>(),
                     "block {}",
                     block_number
@@ -1062,8 +1087,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayApi for FakeFgw {
-        async fn pending_casm_by_hash(&self, _: ClassHash) -> Result<bytes::Bytes, SequencerError> {
-            Ok(bytes::Bytes::from_static(
+        async fn casm_by_hash(
+            &self,
+            _: ClassHash,
+            _: BlockId,
+        ) -> Result<SerializedCasmDefinition, SequencerError> {
+            Ok(SerializedCasmDefinition::from_slice(
                 starknet_gateway_test_fixtures::class_definitions::CAIRO_1_1_0_BALANCE_CASM_JSON,
             ))
         }

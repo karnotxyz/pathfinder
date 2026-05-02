@@ -16,34 +16,34 @@ pub use enabled::*;
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum InjectFailureTrigger {
     ProposalInitRx,
+    ProposalFinRx,
     BlockInfoRx,
     TransactionBatchRx,
-    TransactionsFinRx,
-    ProposalCommitmentRx,
-    ProposalFinRx,
-    EntireProposalRx,
-    EntireProposalPersisted,
+    ExecutedTransactionCountRx,
+    ProposalFinalized,
     PrevoteRx,
     PrecommitRx,
     ProposalDecided,
     ProposalCommitted,
+    OutdatedVote,
+    CommittedVoteLost,
 }
 
 impl InjectFailureTrigger {
     pub fn as_str(&self) -> &'static str {
         match self {
             InjectFailureTrigger::ProposalInitRx => "proposal_init_rx",
+            InjectFailureTrigger::ProposalFinRx => "proposal_fin_rx",
             InjectFailureTrigger::BlockInfoRx => "block_info_rx",
             InjectFailureTrigger::TransactionBatchRx => "txn_batch_rx",
-            InjectFailureTrigger::TransactionsFinRx => "txns_fin_rx",
-            InjectFailureTrigger::ProposalCommitmentRx => "proposal_commitment_rx",
-            InjectFailureTrigger::ProposalFinRx => "proposal_fin_rx",
-            InjectFailureTrigger::EntireProposalRx => "entire_proposal_rx",
-            InjectFailureTrigger::EntireProposalPersisted => "entire_proposal_persisted",
+            InjectFailureTrigger::ExecutedTransactionCountRx => "executed_txn_count_rx",
+            InjectFailureTrigger::ProposalFinalized => "proposal_finalized",
             InjectFailureTrigger::PrevoteRx => "prevote_rx",
             InjectFailureTrigger::PrecommitRx => "precommit_rx",
             InjectFailureTrigger::ProposalDecided => "proposal_decided",
             InjectFailureTrigger::ProposalCommitted => "proposal_committed",
+            InjectFailureTrigger::OutdatedVote => "outdated_vote",
+            InjectFailureTrigger::CommittedVoteLost => "committed_vote_lost",
         }
     }
 }
@@ -54,17 +54,17 @@ impl FromStr for InjectFailureTrigger {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "proposal_init_rx" => Ok(InjectFailureTrigger::ProposalInitRx),
+            "proposal_fin_rx" => Ok(InjectFailureTrigger::ProposalFinRx),
             "block_info_rx" => Ok(InjectFailureTrigger::BlockInfoRx),
             "txn_batch_rx" => Ok(InjectFailureTrigger::TransactionBatchRx),
-            "txns_fin_rx" => Ok(InjectFailureTrigger::TransactionsFinRx),
-            "proposal_commitment_rx" => Ok(InjectFailureTrigger::ProposalCommitmentRx),
-            "proposal_fin_rx" => Ok(InjectFailureTrigger::ProposalFinRx),
-            "entire_proposal_rx" => Ok(InjectFailureTrigger::EntireProposalRx),
-            "entire_proposal_persisted" => Ok(InjectFailureTrigger::EntireProposalPersisted),
+            "executed_txn_count_rx" => Ok(InjectFailureTrigger::ExecutedTransactionCountRx),
+            "proposal_finalized" => Ok(InjectFailureTrigger::ProposalFinalized),
             "prevote_rx" => Ok(InjectFailureTrigger::PrevoteRx),
             "precommit_rx" => Ok(InjectFailureTrigger::PrecommitRx),
             "proposal_decided" => Ok(InjectFailureTrigger::ProposalDecided),
             "proposal_committed" => Ok(InjectFailureTrigger::ProposalCommitted),
+            "outdated_vote" => Ok(InjectFailureTrigger::OutdatedVote),
+            "committed_vote_lost" => Ok(InjectFailureTrigger::CommittedVoteLost),
             _ => Err(format!("Unknown inject failure event: {s}")),
         }
     }
@@ -84,6 +84,13 @@ mod enabled {
             default_value = "false"
         )]
         disable_db_verification: bool,
+
+        #[arg(
+            long = "integration-tests.disable-gas-price-validation",
+            action = clap::ArgAction::Set,
+            default_value = "false"
+        )]
+        disable_gas_price_validation: bool,
 
         #[arg(
             long = "integration-tests.inject-failure",
@@ -121,6 +128,7 @@ mod enabled {
     #[derive(Copy, Clone)]
     pub struct IntegrationTestingConfig {
         disable_db_verification: bool,
+        disable_gas_price_validation: bool,
         inject_failure: Option<InjectFailureConfig>,
     }
 
@@ -128,12 +136,17 @@ mod enabled {
         pub fn parse(cli: IntegrationTestingCli) -> Self {
             Self {
                 disable_db_verification: cli.disable_db_verification,
+                disable_gas_price_validation: cli.disable_gas_price_validation,
                 inject_failure: cli.inject_failure,
             }
         }
 
         pub fn is_db_verification_disabled(&self) -> bool {
             self.disable_db_verification
+        }
+
+        pub fn is_gas_price_validation_disabled(&self) -> bool {
+            self.disable_gas_price_validation
         }
 
         pub fn inject_failure_config(&self) -> Option<InjectFailureConfig> {
@@ -166,6 +179,10 @@ mod disabled {
         }
 
         pub fn is_db_verification_disabled(&self) -> bool {
+            false
+        }
+
+        pub fn is_gas_price_validation_disabled(&self) -> bool {
             false
         }
 

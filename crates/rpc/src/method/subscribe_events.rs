@@ -20,7 +20,7 @@ pub struct SubscribeEvents;
 
 #[derive(Debug, Clone, Default)]
 pub struct Params {
-    from_address: Option<ContractAddress>,
+    from_addresses: HashSet<ContractAddress>,
     keys: Option<Vec<Vec<EventKey>>>,
     block_id: Option<SubscriptionBlockId>,
     finality_status: NewTxnFinalityStatus,
@@ -28,10 +28,8 @@ pub struct Params {
 
 impl Params {
     fn matches(&self, event: &pathfinder_common::event::Event) -> bool {
-        if let Some(from_address) = self.from_address {
-            if event.from_address != from_address {
-                return false;
-            }
+        if !self.from_addresses.is_empty() && !self.from_addresses.contains(&event.from_address) {
+            return false;
         }
         if let Some(keys) = &self.keys {
             let no_key_constraints = keys.iter().flatten().count() == 0;
@@ -50,6 +48,12 @@ impl Params {
             true
         }
     }
+
+    fn get_addresses(&self) -> Vec<ContractAddress> {
+        let mut addresses: Vec<ContractAddress> = self.from_addresses.iter().cloned().collect();
+        addresses.sort();
+        addresses
+    }
 }
 
 impl crate::dto::DeserializeForVersion for Option<Params> {
@@ -60,6 +64,16 @@ impl crate::dto::DeserializeForVersion for Option<Params> {
         }
         let version = value.version;
         value.deserialize_map(|value| {
+            let raw_addresses = if version >= RpcVersion::V10 {
+                value.deserialize_optional_array_or_scalar("from_address", |v| v.deserialize())?
+            } else {
+                let mut opt_address = vec![];
+                if let Some(addr) = value.deserialize_optional("from_address")? {
+                    opt_address.push(addr);
+                }
+
+                opt_address
+            };
             let finality_status = if version < RpcVersion::V09 {
                 NewTxnFinalityStatus::default()
             } else {
@@ -68,9 +82,7 @@ impl crate::dto::DeserializeForVersion for Option<Params> {
                     .unwrap_or_default()
             };
             Ok(Some(Params {
-                from_address: value
-                    .deserialize_optional("from_address")?
-                    .map(ContractAddress),
+                from_addresses: HashSet::from_iter(raw_addresses.into_iter().map(ContractAddress)),
                 keys: value.deserialize_optional_array("keys", |value| {
                     value.deserialize_array(|value| Ok(EventKey(value.deserialize()?)))
                 })?,
@@ -169,8 +181,8 @@ impl RpcSubscriptionFlow for SubscribeEvents {
         let params = params.clone().unwrap_or_default();
         let storage = state.storage.clone();
         let (events, last_l1_block, last_block) = util::task::spawn_blocking(move |_| -> Result<_, RpcError> {
-            let mut conn = storage.connection().map_err(RpcError::InternalError)?;
-            let db = conn.transaction().map_err(RpcError::InternalError)?;
+            let mut conn = storage.connection()?;
+            let db = conn.transaction()?;
 
             if db.blockchain_pruning_enabled() {
                 let blockchain_history_tip = db
@@ -199,7 +211,7 @@ impl RpcSubscriptionFlow for SubscribeEvents {
                 .events_in_range(
                     from,
                     to,
-                    params.from_address,
+                    params.get_addresses(),
                     params.keys.unwrap_or_default(),
                 )
                 .map_err(RpcError::InternalError)?;
@@ -295,8 +307,8 @@ impl RpcSubscriptionFlow for SubscribeEvents {
                 block = blocks.recv() => {
                     match block {
                         Ok(block) => {
-                            let block_number = block.block_number;
-                            let block_hash = block.block_hash;
+                            let block_number = block.header.number;
+                            let block_hash = block.header.hash;
 
                             tracing::trace!(%block_number, %block_hash, "Received new block");
 
@@ -306,10 +318,15 @@ impl RpcSubscriptionFlow for SubscribeEvents {
                                 .remove(&block_number)
                                 .unwrap_or_default();
 
+                            let l2_txs_and_receipts = block
+                                .transactions_and_receipts
+                                .iter()
+                                .zip(block.events.iter());
+
                             // Send all events that might have been missed in the pending data. This should only
                             // happen if the subscription started after the transactions were already evicted
                             // from pending data but before receiving the L2 block that contains them.
-                            for (receipt, events) in &block.transaction_receipts {
+                            for ((_, receipt), events) in l2_txs_and_receipts {
                                 let tx_and_finality = (receipt.transaction_hash, TxnFinalityStatus::AcceptedOnL2);
                                 if sent_updates.contains(&tx_and_finality) {
                                     continue;
@@ -360,23 +377,23 @@ impl RpcSubscriptionFlow for SubscribeEvents {
 
                     let pending = pending_data.borrow_and_update().clone();
                     // pre-confirmed data is returned only if explicitly requested
-                    if pending.is_pre_confirmed() && !params.finality_status.is_pre_confirmed() {
+                    if  !params.finality_status.is_pre_confirmed() {
                         continue;
                     }
 
-                    tracing::trace!(block_number=%pending.pending_block_number(), "Received pending block update");
+                    tracing::trace!(block_number=%pending.pre_confirmed_block_number(), "Received pre-confirmed block update");
 
                     let pending_finality = pending.finality_status();
-                    let pending_block_number = pending.pending_block_number();
+                    let pre_confirmed_block_number = pending.pre_confirmed_block_number();
                     let sent_pending_updates = sent_updates_per_block
-                        .entry(pending_block_number)
+                        .entry(pre_confirmed_block_number)
                         .or_default();
 
                     if send_event_updates(
-                        pending.pending_tx_receipts_and_events(),
+                        pending.pre_confirmed_tx_receipts_and_events(),
                         sent_pending_updates,
                         None,
-                        pending_block_number,
+                        pre_confirmed_block_number,
                         pending_finality,
                         &params,
                         &tx
@@ -405,7 +422,7 @@ impl RpcSubscriptionFlow for SubscribeEvents {
                             sent_pre_latest_updates,
                             None,
                             pre_latest_block_number,
-                            TxnFinalityStatus::AcceptedOnL2,
+                            TxnFinalityStatus::PreConfirmed,
                             &params,
                             &tx,
                         )
@@ -473,9 +490,11 @@ mod tests {
     use pathfinder_common::prelude::*;
     use pathfinder_common::receipt::Receipt;
     use pathfinder_common::transaction::{Transaction, TransactionVariant};
+    use pathfinder_common::L2Block;
     use pathfinder_crypto::Felt;
     use pathfinder_storage::StorageBuilder;
-    use starknet_gateway_types::reply::{Block, PendingBlock, PreConfirmedBlock};
+    use pretty_assertions_sorted::assert_eq;
+    use starknet_gateway_types::reply::PreConfirmedBlock;
     use tokio::sync::mpsc;
 
     use crate::context::{RpcContext, WebsocketContext};
@@ -685,15 +704,16 @@ mod tests {
 
     #[tokio::test]
     async fn filter_from_address_and_keys() {
+        let rpc_version = RpcVersion::V10;
         let (router, _pending_data_tx) =
-            setup(SubscribeEvents::CATCH_UP_BATCH_SIZE + 10, RpcVersion::V08).await;
+            setup(SubscribeEvents::CATCH_UP_BATCH_SIZE + 10, rpc_version).await;
         let (sender_tx, mut sender_rx) = mpsc::channel(1024);
         let (receiver_tx, receiver_rx) = mpsc::channel(1024);
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
         let params = serde_json::json!(
             {
                 "block_id": {"block_number": 0},
-                "from_address": "0xdc",
+                "from_address": ["0xfe", "0xdc"],
                 "keys": [["0x16"], [], ["0x17", "0x18"]],
             }
         );
@@ -720,7 +740,7 @@ mod tests {
             }
             _ => panic!("Expected text message"),
         };
-        let expected = sample_event_message(0x16, subscription_id, RpcVersion::V08);
+        let expected = sample_event_message(0x16, subscription_id, rpc_version);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -742,7 +762,7 @@ mod tests {
             .l2_blocks
             .send(sample_block(0x16).into())
             .unwrap();
-        let expected = sample_event_message(0x16, subscription_id, RpcVersion::V08);
+        let expected = sample_event_message(0x16, subscription_id, rpc_version);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -753,9 +773,9 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn filter_keys_pending() {
+    async fn filter_keys_pre_confirmed() {
         let num_blocks = SubscribeEvents::CATCH_UP_BATCH_SIZE + 10;
-        let (router, pending_data_tx) = setup(num_blocks, RpcVersion::V08).await;
+        let (router, pending_data_tx) = setup(num_blocks, RpcVersion::V09).await;
         let (sender_tx, mut sender_rx) = mpsc::channel(1024);
         let (receiver_tx, receiver_rx) = mpsc::channel(1024);
         handle_json_rpc_socket(router.clone(), sender_tx, receiver_rx);
@@ -763,6 +783,7 @@ mod tests {
             {
                 "block_id": {"block_number": 0},
                 "keys": [["0x16", format!("{:x}", num_blocks), format!("{:x}", num_blocks + 1)]],
+                "finality_status": "PRE_CONFIRMED",
             }
         );
         receiver_tx
@@ -789,7 +810,7 @@ mod tests {
             _ => panic!("Expected text message"),
         };
 
-        let expected = sample_event_message(0x16, subscription_id, RpcVersion::V08);
+        let expected = sample_event_message(0x16, subscription_id, RpcVersion::V09);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -799,11 +820,13 @@ mod tests {
 
         let next_block_number = SubscribeEvents::CATCH_UP_BATCH_SIZE + 10;
         pending_data_tx
-            .send(crate::PendingData::from_pending_block(
-                sample_pending_block(next_block_number),
-                StateUpdate::default(),
-                BlockNumber::new_or_panic(next_block_number),
-            ))
+            .send(
+                crate::PendingData::try_from_pre_confirmed_block(
+                    sample_pre_confirmed_block(next_block_number).into(),
+                    BlockNumber::new_or_panic(next_block_number),
+                )
+                .unwrap(),
+            )
             .unwrap();
         let expected = sample_event_message_without_block_hash(next_block_number, subscription_id);
         let event = sender_rx.recv().await.unwrap().unwrap();
@@ -820,6 +843,14 @@ mod tests {
             .send(sample_block(next_block_number).into())
             .unwrap();
 
+        let expected = sample_event_message(next_block_number, subscription_id, RpcVersion::V09);
+        let event = sender_rx.recv().await.unwrap().unwrap();
+        let json: serde_json::Value = match event {
+            Message::Text(json) => serde_json::from_str(&json).unwrap(),
+            _ => panic!("Expected text message"),
+        };
+        assert_eq!(json, expected);
+
         let next_block_number = next_block_number + 1;
         assert_eq!(
             router
@@ -831,7 +862,7 @@ mod tests {
             1
         );
 
-        let expected = sample_event_message(next_block_number, subscription_id, RpcVersion::V08);
+        let expected = sample_event_message(next_block_number, subscription_id, RpcVersion::V09);
         let event = sender_rx.recv().await.unwrap().unwrap();
         let json: serde_json::Value = match event {
             Message::Text(json) => serde_json::from_str(&json).unwrap(),
@@ -1294,26 +1325,14 @@ mod tests {
         }
     }
 
-    fn sample_block(block_number: u64) -> Block {
-        Block {
-            block_hash: BlockHash(Felt::from_u64(100 * block_number)),
-            block_number: BlockNumber::new_or_panic(block_number),
-            transaction_receipts: vec![(
+    fn sample_block(block_number: u64) -> L2Block {
+        L2Block {
+            header: sample_header(block_number),
+            transactions_and_receipts: vec![(
+                sample_transaction(block_number),
                 sample_receipt(block_number),
-                vec![sample_event(block_number)],
             )],
-            transactions: vec![sample_transaction(block_number)],
-            ..Default::default()
-        }
-    }
-
-    fn sample_pending_block(block_number: u64) -> PendingBlock {
-        PendingBlock {
-            transaction_receipts: vec![(
-                sample_receipt(block_number),
-                vec![sample_event(block_number)],
-            )],
-            transactions: vec![sample_transaction(block_number)],
+            events: vec![vec![sample_event(block_number)]],
             ..Default::default()
         }
     }
@@ -1353,6 +1372,10 @@ mod tests {
         if version >= RpcVersion::V09 {
             result["finality_status"] = "ACCEPTED_ON_L2".into();
         }
+        if version >= RpcVersion::V10 {
+            result["transaction_index"] = 0.into();
+            result["event_index"] = 0.into();
+        }
         serde_json::json!({
             "jsonrpc":"2.0",
             "method":"starknet_subscriptionEvents",
@@ -1372,6 +1395,8 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("block_hash");
+        message["params"]["result"]["finality_status"] = "PRE_CONFIRMED".into();
+
         message
     }
 

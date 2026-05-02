@@ -1,7 +1,7 @@
 //! Structures used for deserializing replies from Starkware's sequencer REST
 //! API.
-use pathfinder_common::prelude::*;
-use pathfinder_serde::{EthereumAddressAsHexStr, GasPriceAsHexStr};
+use pathfinder_common::{SettlementLayerAddress, prelude::*};
+use pathfinder_serde::{GasPriceAsHexStr, SettlementLayerAddressAsHexStr};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 pub use transaction::DataAvailabilityMode;
@@ -55,10 +55,16 @@ pub struct Block {
     pub state_diff_length: Option<u64>,
 }
 
+/// Represents the "pre-latest" block in Starknet, which is a block that has
+/// been closed in consensus but is still awaiting commitment calculations
+/// before being finalized.
+///
+/// Obtained by querying the gateway for the pending block on Starknet >
+/// v0.14.0.
 #[serde_as]
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(serde::Serialize))]
-pub struct PendingBlock {
+pub struct PreLatestBlock {
     pub l1_gas_price: GasPrices,
     pub l1_data_gas_price: GasPrices,
     #[serde(default)] // TODO: Needed until the gateway provides the l2 gas price
@@ -83,14 +89,6 @@ pub struct PendingBlock {
     // Introduced in v0.13.1
     pub l1_da_mode: L1DataAvailabilityMode,
 }
-
-/// Represents the "pre-latest" block in Starknet, which is a block that has
-/// been closed in consensus but is still awaiting commitment calculations
-/// before being finalized.
-///
-/// Obtained by querying the gateway for the pending block on Starknet >
-/// v0.14.0.
-pub type PreLatestBlock = PendingBlock;
 
 #[serde_as]
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
@@ -269,12 +267,12 @@ pub mod transaction_status {
 /// Types used when deserializing L2 transaction related data.
 pub mod transaction {
     use fake::{Dummy, Fake, Faker};
-    use pathfinder_common::prelude::*;
+    use pathfinder_common::{prelude::*, ProofFactElem, SettlementLayerAddress};
     use pathfinder_crypto::Felt;
     use pathfinder_serde::{
         CallParamAsDecimalStr,
         ConstructorParamAsDecimalStr,
-        EthereumAddressAsHexStr,
+        SettlementLayerAddressAsHexStr,
         L1ToL2MessagePayloadElemAsDecimalStr,
         L2ToL1MessagePayloadElemAsDecimalStr,
         ResourceAmountAsHexStr,
@@ -535,8 +533,8 @@ pub mod transaction {
     #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct L1ToL2Message {
-        #[serde_as(as = "EthereumAddressAsHexStr")]
-        pub from_address: EthereumAddress,
+        #[serde_as(as = "SettlementLayerAddressAsHexStr")]
+        pub from_address: SettlementLayerAddress,
         #[serde_as(as = "Vec<L1ToL2MessagePayloadElemAsDecimalStr>")]
         pub payload: Vec<L1ToL2MessagePayloadElem>,
         pub selector: EntryPoint,
@@ -1130,6 +1128,7 @@ pub mod transaction {
                     account_deployment_data,
                     calldata,
                     sender_address,
+                    proof_facts,
                 }) => Self::Invoke(InvokeTransaction::V3(self::InvokeTransactionV3 {
                     nonce,
                     nonce_data_availability_mode: nonce_data_availability_mode.into(),
@@ -1142,6 +1141,7 @@ pub mod transaction {
                     transaction_hash,
                     calldata,
                     account_deployment_data,
+                    proof_facts,
                 })),
                 L1Handler(L1HandlerTransaction {
                     contract_address,
@@ -1383,6 +1383,7 @@ pub mod transaction {
                     transaction_hash: _,
                     calldata,
                     account_deployment_data,
+                    proof_facts,
                 })) => TransactionVariant::InvokeV3(
                     pathfinder_common::transaction::InvokeTransactionV3 {
                         signature,
@@ -1395,6 +1396,7 @@ pub mod transaction {
                         account_deployment_data,
                         calldata,
                         sender_address,
+                        proof_facts,
                     },
                 ),
                 Transaction::L1Handler(L1HandlerTransaction {
@@ -1922,6 +1924,9 @@ pub mod transaction {
         pub calldata: Vec<CallParam>,
 
         pub account_deployment_data: Vec<AccountDeploymentDataElem>,
+
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub proof_facts: Vec<ProofFactElem>,
     }
 
     /// Represents deserialized L2 "L1 handler" transaction data.
@@ -2244,8 +2249,8 @@ pub mod state_update {
 #[derive(Clone, Debug, Deserialize)]
 pub struct EthContractAddresses {
     #[serde(rename = "Starknet")]
-    #[serde_as(as = "EthereumAddressAsHexStr")]
-    pub starknet: EthereumAddress,
+    #[serde_as(as = "SettlementLayerAddressAsHexStr")]
+    pub starknet: SettlementLayerAddress,
 
     pub strk_l2_token_address: Option<ContractAddress>,
 

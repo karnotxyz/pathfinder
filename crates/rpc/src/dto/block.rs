@@ -1,4 +1,10 @@
-use pathfinder_common::{GasPrice, L1DataAvailabilityMode};
+use pathfinder_common::{
+    EventCommitment,
+    GasPrice,
+    L1DataAvailabilityMode,
+    StarknetVersion,
+    TransactionCommitment,
+};
 use serde::de::Error;
 
 use crate::dto::SerializeStruct;
@@ -12,8 +18,8 @@ impl crate::dto::DeserializeForVersion for crate::types::request::BlockId {
             match value.as_str() {
                 "latest" => Ok(Self::Latest),
                 "l1_accepted" => Ok(Self::L1Accepted),
-                "pending" if rpc_version < RpcVersion::V09 => Ok(Self::Pending),
-                "pre_confirmed" if rpc_version >= RpcVersion::V09 => Ok(Self::Pending),
+                "pending" if rpc_version < RpcVersion::V09 => Ok(Self::PreConfirmed),
+                "pre_confirmed" if rpc_version >= RpcVersion::V09 => Ok(Self::PreConfirmed),
                 _ => Err(serde_json::Error::custom("Invalid block id")),
             }
         } else {
@@ -83,6 +89,27 @@ impl crate::dto::SerializeForVersion for pathfinder_common::BlockHeader {
             )?;
         }
 
+        if serializer.version >= RpcVersion::V10 {
+            if self.starknet_version < StarknetVersion::V_0_13_2 {
+                // Pathfinder storage stores 0.13.2-style event and transaction commitments for
+                // pre-0.13.2 blocks. This is required so that we can serve the
+                // 0.13.2-style commitments over the P2P sync protocol. To avoid
+                // confusion, we return zeroed commitments for such blocks.
+                serializer.serialize_field("event_commitment", &EventCommitment::ZERO)?;
+                serializer
+                    .serialize_field("transaction_commitment", &TransactionCommitment::ZERO)?;
+            } else {
+                serializer.serialize_field("event_commitment", &self.event_commitment)?;
+                serializer
+                    .serialize_field("transaction_commitment", &self.transaction_commitment)?;
+            }
+            serializer.serialize_field("receipt_commitment", &self.receipt_commitment)?;
+            serializer.serialize_field("state_diff_commitment", &self.state_diff_commitment)?;
+            serializer.serialize_field("event_count", &self.event_count)?;
+            serializer.serialize_field("transaction_count", &self.transaction_count)?;
+            serializer.serialize_field("state_diff_length", &self.state_diff_length)?;
+        }
+
         serializer.end()
     }
 }
@@ -90,7 +117,7 @@ impl crate::dto::SerializeForVersion for pathfinder_common::BlockHeader {
 impl crate::dto::SerializeForVersion
     for (
         pathfinder_common::BlockNumber,
-        &starknet_gateway_types::reply::PendingBlock,
+        &starknet_gateway_types::reply::PreLatestBlock,
     )
 {
     fn serialize(
@@ -156,7 +183,11 @@ impl crate::dto::SerializeForVersion for crate::pending::PreConfirmedBlock {
         serializer: crate::dto::Serializer,
     ) -> Result<crate::dto::Ok, crate::dto::Error> {
         let mut serializer = serializer.serialize_struct()?;
-        serializer.serialize_field("block_number", &self.number.get())?;
+        // For backward compatibility with pre-0.9 rpc versions we mustn't include block
+        // number to mimic the behaviour of "pending" block
+        if serializer.version >= RpcVersion::V09 {
+            serializer.serialize_field("block_number", &self.number.get())?;
+        }
         serializer.serialize_field("timestamp", &self.timestamp.get())?;
         serializer.serialize_field("sequencer_address", &self.sequencer_address)?;
         serializer.serialize_field(
@@ -201,24 +232,23 @@ impl crate::dto::SerializeForVersion for crate::pending::PreConfirmedBlock {
 
 impl crate::dto::SerializeForVersion
     for (
-        pathfinder_common::BlockNumber,
-        &crate::pending::PendingBlockVariant,
+        &Option<pathfinder_common::BlockHash>,
+        &crate::pending::PreConfirmedBlock,
     )
 {
     fn serialize(
         &self,
         serializer: crate::dto::Serializer,
     ) -> Result<crate::dto::Ok, crate::dto::Error> {
-        let (block_number, pending_block) = *self;
-
-        match pending_block {
-            crate::pending::PendingBlockVariant::Pending(block) => {
-                (block_number, block).serialize(serializer)
-            }
-            crate::pending::PendingBlockVariant::PreConfirmed { block, .. } => {
-                block.serialize(serializer)
-            }
+        let mut serializer = serializer.serialize_struct()?;
+        if serializer.version < RpcVersion::V09 {
+            let parent_hash = self
+                .0
+                .ok_or_else(|| crate::dto::Error::custom("Missing parent block hash"))?;
+            serializer.serialize_field("parent_hash", &parent_hash)?;
         }
+        serializer.flatten(self.1)?;
+        serializer.end()
     }
 }
 
@@ -259,7 +289,7 @@ mod tests {
     use pathfinder_common::macro_prelude::*;
     use pathfinder_common::prelude::*;
     use serde_json::json;
-    use starknet_gateway_types::reply::{GasPrices, PendingBlock};
+    use starknet_gateway_types::reply::{GasPrices, PreLatestBlock};
 
     use crate::dto::{SerializeForVersion, Serializer};
     use crate::RpcVersion;
@@ -359,7 +389,7 @@ mod tests {
     #[test]
     fn pending_block() {
         let block_number = BlockNumber::new_or_panic(12345);
-        let pending = PendingBlock {
+        let pending = PreLatestBlock {
             l1_gas_price: GasPrices {
                 price_in_wei: GasPrice(0x34795c87c),
                 price_in_fri: GasPrice(0x59425e9d6d3c),

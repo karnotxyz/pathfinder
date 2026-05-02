@@ -85,7 +85,7 @@ pub async fn get_class(
             return Err(Error::ClassHashNotFound);
         };
 
-        let class = ContractClass::from_definition_bytes(&definition)
+        let class = ContractClass::from_serialized_def(&definition)
             .context("Parsing class definition")?
             .into();
 
@@ -153,15 +153,15 @@ mod tests {
     const RPC_VERSION: RpcVersion = RpcVersion::V09;
 
     #[tokio::test]
-    async fn pending() {
-        let context = RpcContext::for_tests_with_pending().await;
+    async fn pre_confirmed() {
+        let context = RpcContext::for_tests_with_pre_confirmed().await;
 
         // Cairo v0.x class
         let valid_v0 = class_hash_bytes!(b"class 0 hash");
         super::get_class(
             context.clone(),
             Input {
-                block_id: BlockId::Pending,
+                block_id: BlockId::PreConfirmed,
                 class_hash: valid_v0,
             },
             RPC_VERSION,
@@ -173,19 +173,19 @@ mod tests {
         super::get_class(
             context.clone(),
             Input {
-                block_id: BlockId::Pending,
+                block_id: BlockId::PreConfirmed,
                 class_hash: valid_v1,
             },
             RPC_VERSION,
         )
         .await
         .unwrap();
-        let valid_pending = class_hash_bytes!(b"pending class 0 hash");
+        let valid_pre_confirmed = class_hash_bytes!(b"preconfirmed class 0 hash");
         super::get_class(
             context.clone(),
             Input {
-                block_id: BlockId::Pending,
-                class_hash: valid_pending,
+                block_id: BlockId::PreConfirmed,
+                class_hash: valid_pre_confirmed,
             },
             RPC_VERSION,
         )
@@ -196,7 +196,7 @@ mod tests {
         let error = super::get_class(
             context,
             Input {
-                block_id: BlockId::Pending,
+                block_id: BlockId::PreConfirmed,
                 class_hash: invalid,
             },
             RPC_VERSION,
@@ -220,7 +220,7 @@ mod tests {
         let r = super::get_class(
             context.clone(),
             Input {
-                block_id: BlockId::Pending,
+                block_id: BlockId::PreConfirmed,
                 class_hash: valid_pre_latest,
             },
             version,
@@ -238,7 +238,7 @@ mod tests {
         let r = super::get_class(
             context.clone(),
             Input {
-                block_id: BlockId::Pending,
+                block_id: BlockId::PreConfirmed,
                 class_hash: valid_pre_confirmed,
             },
             version,

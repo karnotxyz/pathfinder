@@ -1,15 +1,25 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
+use alloy::network::Ethereum;
 use alloy::primitives::{Address, TxHash};
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::providers::fillers::{
+    BlobGasFiller,
+    ChainIdFiller,
+    FillProvider,
+    GasFiller,
+    JoinFill,
+    NonceFiller,
+};
+use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy::rpc::types::{FilteredParams, Log};
 use anyhow::Context;
 use pathfinder_common::prelude::*;
 use pathfinder_common::transaction::L1HandlerTransaction;
-use pathfinder_common::{EthereumChain, L1BlockNumber, L1TransactionHash};
+use pathfinder_common::{EthereumChain, L1BlockHash, L1BlockNumber, L1TransactionHash};
 use pathfinder_crypto::Felt;
 use primitive_types::{H160, U256};
 use reqwest::{IntoUrl, Url};
@@ -21,6 +31,16 @@ use crate::utils::*;
 
 mod starknet;
 mod utils;
+
+/// Type alias for the WebSocket provider returned by alloy when calling
+/// `ProviderBuilder::new().connect_ws()`
+type WsProvider = FillProvider<
+    JoinFill<
+        Identity,
+        JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+    >,
+    RootProvider<Ethereum>,
+>;
 
 /// Starknet core contract addresses
 pub mod core_addr {
@@ -47,34 +67,54 @@ pub struct EthereumStateUpdate {
     pub block_hash: BlockHash,
 }
 
-/// Ethereum API trait
-pub trait EthereumApi {
-    fn get_starknet_state(
-        &self,
-        address: &H160,
-    ) -> impl Future<Output = anyhow::Result<EthereumStateUpdate>>;
-    fn get_chain(&self) -> impl Future<Output = anyhow::Result<EthereumChain>>;
-    fn get_l1_handler_txs(
-        &self,
-        address: &H160,
-        tx_hash: &L1TransactionHash,
-    ) -> impl Future<Output = anyhow::Result<Vec<L1HandlerTransaction>>>;
-    fn sync_and_listen<F, Fut>(
-        &mut self,
-        address: &H160,
-        poll_interval: Duration,
-        callback: F,
-    ) -> impl Future<Output = anyhow::Result<()>>
-    where
-        F: Fn(EthereumStateUpdate) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static;
+/// Gas price data extracted from an L1 block header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L1GasPriceData {
+    /// The L1 block number
+    pub block_number: L1BlockNumber,
+    /// The block's own hash
+    pub block_hash: L1BlockHash,
+    /// The parent block's hash (used for reorg detection)
+    pub parent_hash: L1BlockHash,
+    /// Unix timestamp of the block
+    pub timestamp: u64,
+    /// EIP-1559 base fee per gas (wei)
+    pub base_fee_per_gas: u128,
+    /// EIP-4844 blob fee per gas (wei)
+    pub blob_fee: u128,
 }
 
+/// Computes the blob fee from excess_blob_gas
+fn compute_blob_fee(excess_blob_gas: Option<u64>) -> u128 {
+    excess_blob_gas
+        .map(alloy::eips::eip4844::calc_blob_gasprice)
+        .unwrap_or(alloy::eips::eip4844::BLOB_TX_MIN_BLOB_GASPRICE)
+}
+
+/// Delay between reconnection attempts to the Ethereum WebSocket provider.
+/// Alloy already retries internally (~30s with exponential backoff) before
+/// reporting a failure, so a short fixed delay here is sufficient.
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
 /// Ethereum client
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EthereumClient {
     url: Url,
+    /// Lazily initialized WebSocket connection for query methods (get_chain,
+    /// get_starknet_state, etc.). Note: `sync_and_listen` uses its own
+    /// dedicated connection for subscriptions.
+    provider: Arc<RwLock<Option<WsProvider>>>,
     pending_state_updates: BTreeMap<L1BlockNumber, EthereumStateUpdate>,
+}
+
+impl std::fmt::Debug for EthereumClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EthereumClient")
+            .field("url", &self.url)
+            .field("provider", &"<WsProvider>")
+            .field("pending_state_updates", &self.pending_state_updates)
+            .finish()
+    }
 }
 
 impl EthereumClient {
@@ -82,6 +122,7 @@ impl EthereumClient {
     pub fn new<U: IntoUrl>(url: U) -> anyhow::Result<Self> {
         Ok(Self {
             url: url.into_url()?,
+            provider: Arc::new(RwLock::new(None)),
             pending_state_updates: BTreeMap::new(),
         })
     }
@@ -94,25 +135,167 @@ impl EthereumClient {
         Self::new(url)
     }
 
-    /// Returns the block number of the last finalized block
-    async fn get_finalized_block_number(&self) -> anyhow::Result<L1BlockNumber> {
-        // Create a WebSocket connection
+    /// Gets or creates the shared WebSocket provider for query methods.
+    async fn provider(&self) -> anyhow::Result<WsProvider> {
+        {
+            let lock = self.provider.read().unwrap();
+            // If a provider exists, return it
+            if let Some(provider) = lock.as_ref() {
+                return Ok(provider.clone());
+            }
+        }
+
+        // Create a new WebSocket provider
         let ws = WsConnect::new(self.url.clone());
-        let provider = ProviderBuilder::new().connect_ws(ws).await?;
-        // Fetch the finalized block number
+        let new_provider = ProviderBuilder::new()
+            .connect_ws(ws)
+            .await
+            .context("Failed to establish WebSocket connection to Ethereum node")?;
+
+        let mut lock = self.provider.write().unwrap();
+        *lock = Some(new_provider.clone());
+        Ok(new_provider)
+    }
+
+    /// Returns the block number of the last finalized block
+    pub async fn get_finalized_block_number(&self) -> anyhow::Result<L1BlockNumber> {
+        let provider = self.provider().await?;
         provider
             .get_block_by_number(BlockNumberOrTag::Finalized)
             .await?
             .map(|block| L1BlockNumber::new_or_panic(block.header.number))
             .context("Failed to fetch finalized block hash")
     }
+
+    /// Returns the block number of the latest block
+    pub async fn get_latest_block_number(&self) -> anyhow::Result<L1BlockNumber> {
+        let provider = self.provider().await?;
+        provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await?
+            .map(|block| L1BlockNumber::new_or_panic(block.header.number))
+            .context("Failed to fetch latest block")
+    }
+
+    /// Fetches gas price data from a specific L1 block header.
+    pub async fn get_gas_price_data(
+        &self,
+        block_number: L1BlockNumber,
+    ) -> anyhow::Result<L1GasPriceData> {
+        let provider = self.provider().await?;
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Number(block_number.get()))
+            .await?
+            .context("Block not found")?;
+
+        let block_hash = L1BlockHash::from(block.header.hash.0);
+        let parent_hash = L1BlockHash::from(block.header.parent_hash.0);
+        let base_fee_per_gas = block.header.base_fee_per_gas.unwrap_or(0) as u128;
+        let blob_fee = compute_blob_fee(block.header.excess_blob_gas);
+
+        Ok(L1GasPriceData {
+            block_number,
+            block_hash,
+            parent_hash,
+            timestamp: block.header.timestamp,
+            base_fee_per_gas,
+            blob_fee,
+        })
+    }
+
+    /// Fetches gas price data for a range of blocks (inclusive).
+    ///
+    /// We use this to initialize our gas price buffer. After initialization we
+    /// subscribe to latest updates via subscribe_block_headers.
+    pub async fn get_gas_price_data_range(
+        &self,
+        start: L1BlockNumber,
+        end: L1BlockNumber,
+    ) -> anyhow::Result<Vec<L1GasPriceData>> {
+        let mut results = Vec::with_capacity((end.get() - start.get() + 1) as usize);
+
+        for block_num in start.get()..=end.get() {
+            let block_number = L1BlockNumber::new_or_panic(block_num);
+            let data = self
+                .get_gas_price_data(block_number)
+                .await
+                .with_context(|| format!("Fetching gas price data for block {block_num}"))?;
+            results.push(data);
+        }
+
+        Ok(results)
+    }
+
+    /// Subscribes to new block headers and sends gas price data to the
+    /// provided channel for each block as it arrives.
+    ///
+    /// This uses a dedicated WebSocket connection for the subscription stream.
+    /// Re-subscribes automatically if the stream ends due to errors.
+    /// If the underlying provider dies, creates a fresh connection and
+    /// re-subscribes.
+    /// Returns `Ok(())` if the receiver is dropped (clean shutdown).
+    pub async fn subscribe_block_headers(
+        &self,
+        tx: tokio::sync::mpsc::Sender<L1GasPriceData>,
+    ) -> anyhow::Result<()> {
+        loop {
+            // Create a dedicated WebSocket connection for subscriptions
+            let ws = WsConnect::new(self.url.clone());
+            let provider = match ProviderBuilder::new().connect_ws(ws).await {
+                Ok(provider) => provider,
+                Err(e) => {
+                    tracing::warn!(error=%e, "Failed to connect to Ethereum node for block header subscription, retrying in {RECONNECT_DELAY:?}");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    continue;
+                }
+            };
+
+            // Subscribe to new block headers
+            let mut block_stream = match provider.subscribe_blocks().await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    tracing::warn!(error=%e, "Failed to subscribe to block headers, retrying in {RECONNECT_DELAY:?}");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    continue;
+                }
+            };
+
+            let error: anyhow::Error = loop {
+                match block_stream.recv().await {
+                    Ok(header) => {
+                        let data = L1GasPriceData {
+                            block_number: L1BlockNumber::new_or_panic(header.number),
+                            block_hash: L1BlockHash::from(header.hash.0),
+                            parent_hash: L1BlockHash::from(header.parent_hash.0),
+                            timestamp: header.timestamp,
+                            base_fee_per_gas: header.base_fee_per_gas.unwrap_or(0) as u128,
+                            blob_fee: compute_blob_fee(header.excess_blob_gas),
+                        };
+                        if tx.send(data).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error=%e, "Block subscription ended, re-subscribing");
+                        match provider.subscribe_blocks().await {
+                            Ok(sub) => block_stream = sub,
+                            Err(e) => break e.into(),
+                        }
+                    }
+                }
+            };
+
+            tracing::warn!(error=%error, "Block header subscription connection lost, reconnecting in {RECONNECT_DELAY:?}");
+            tokio::time::sleep(RECONNECT_DELAY).await;
+        }
+    }
 }
 
-impl EthereumApi for EthereumClient {
+impl EthereumClient {
     /// Listens for Ethereum events and notifies the caller using the provided
     /// callback. State updates will only be emitted once they belong to a
     /// finalized block.
-    async fn sync_and_listen<F, Fut>(
+    pub async fn sync_and_listen<F, Fut>(
         &mut self,
         address: &H160,
         poll_interval: Duration,
@@ -122,124 +305,143 @@ impl EthereumApi for EthereumClient {
         F: Fn(EthereumStateUpdate) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        // Create a WebSocket connection
-        let ws = WsConnect::new(self.url.clone());
-        let provider = ProviderBuilder::new().connect_ws(ws).await?;
-
         // Fetch the current Starknet state from Ethereum
         let state_update = self.get_starknet_state(address).await?;
         let _ = callback(state_update).await;
 
-        // Create the StarknetCoreContract instance
         let core_address = Address::new((*address).into());
-        let core_contract = StarknetCoreContract::new(core_address, provider.clone());
 
-        // Listen for state update events
-        let filter = core_contract.LogStateUpdate_filter().filter;
-        let mut state_updates = provider.subscribe_logs(&filter).await?;
+        loop {
+            let ws = WsConnect::new(self.url.clone());
+            let provider = match ProviderBuilder::new().connect_ws(ws).await {
+                Ok(provider) => provider,
+                Err(e) => {
+                    tracing::warn!(error=%e, "Failed to connect to Ethereum node, retrying in {RECONNECT_DELAY:?}");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    continue;
+                }
+            };
 
-        // Poll regularly for finalized block number
-        let provider_clone = provider.clone();
-        let (finalized_block_tx, mut finalized_block_rx) =
-            tokio::sync::mpsc::channel::<L1BlockNumber>(1);
+            let core_contract = StarknetCoreContract::new(core_address, provider.clone());
 
-        util::task::spawn(async move {
-            let mut interval = tokio::time::interval(poll_interval);
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
+            // Listen for state update events
+            let filter = core_contract.LogStateUpdate_filter().filter;
+            let mut state_updates = match provider.subscribe_logs(&filter).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    tracing::warn!(error=%e, "Failed to subscribe to state update events, retrying in {RECONNECT_DELAY:?}");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    continue;
+                }
+            };
 
-                match provider_clone
-                    .get_block_by_number(BlockNumberOrTag::Finalized)
-                    .await
-                {
-                    Ok(Some(finalized_block)) => {
-                        let block_number =
-                            L1BlockNumber::new_or_panic(finalized_block.header.number);
-                        if finalized_block_tx.send(block_number).await.is_err() {
-                            tracing::debug!("L1 finalized block channel closed");
-                            return;
+            // Poll regularly for finalized block number
+            let provider_clone = provider.clone();
+            let (finalized_block_tx, mut finalized_block_rx) =
+                tokio::sync::mpsc::channel::<L1BlockNumber>(1);
+
+            util::task::spawn(async move {
+                let mut interval = tokio::time::interval(poll_interval);
+                // Don't fire missed ticks if a poll takes longer than the interval. We want to
+                // avoid rapid "catch up" bursts if for whatever reason there's a slow down.
+                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+
+                    match provider_clone
+                        .get_block_by_number(BlockNumberOrTag::Finalized)
+                        .await
+                    {
+                        Ok(Some(finalized_block)) => {
+                            let block_number =
+                                L1BlockNumber::new_or_panic(finalized_block.header.number);
+                            if finalized_block_tx.send(block_number).await.is_err() {
+                                tracing::debug!("L1 finalized block channel closed");
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::error!("No L1 finalized block found");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error=%e, "Error fetching L1 finalized block, will retry");
                         }
                     }
-                    Ok(None) => {
-                        tracing::error!("No L1 finalized block found");
-                    }
-                    Err(e) => {
-                        tracing::error!(error=%e, "Error fetching L1 finalized block");
-                        return;
-                    }
                 }
-            }
-        });
+            });
 
-        // Process incoming events
-        loop {
-            select! {
-                maybe_state_update = state_updates.recv() => {
-                    match maybe_state_update {
-                        Ok(state_update) => {
-                            tracing::trace!(?state_update, "Processing LogStateUpdate event");
-                            // one would expect this to always be true, but in fact it isn't...
-                            if filter.address.matches(&state_update.inner.address) {
-                                // Decode the state update
-                                let eth_block = L1BlockNumber::new_or_panic(
-                                    state_update.block_number.expect("missing eth block number")
-                                );
-                                let state_update: Log<StarknetCoreContract::LogStateUpdate> = state_update.log_decode()?;
-                                let block_number = get_block_number(state_update.inner.blockNumber);
-                                // Add or remove to/from pending state updates accordingly
-                                if !state_update.removed {
-                                    let state_update = EthereumStateUpdate {
-                                        block_number,
-                                        block_hash: get_block_hash(state_update.inner.blockHash),
-                                        state_root: get_state_root(state_update.inner.globalRoot),
-                                    };
-                                    self.pending_state_updates.insert(eth_block, state_update);
-                                } else {
-                                    self.pending_state_updates.remove(&eth_block);
+            // Process incoming events until the connection is lost
+            let error: anyhow::Error = loop {
+                select! {
+                    maybe_state_update = state_updates.recv() => {
+                        match maybe_state_update {
+                            Ok(state_update) => {
+                                tracing::trace!(?state_update, "Processing LogStateUpdate event");
+                                // One would expect this to always be true, but in fact it isn't...
+                                if filter.address.matches(&state_update.inner.address) {
+                                    // Decode the state update
+                                    let eth_block = L1BlockNumber::new_or_panic(
+                                        state_update.block_number.expect("missing eth block number")
+                                    );
+                                    let state_update: Log<StarknetCoreContract::LogStateUpdate> = state_update.log_decode()?;
+                                    let block_number = get_block_number(state_update.inner.blockNumber);
+                                    // Add or remove to/from pending state updates accordingly
+                                    if !state_update.removed {
+                                        let state_update = EthereumStateUpdate {
+                                            block_number,
+                                            block_hash: get_block_hash(state_update.inner.blockHash),
+                                            state_root: get_state_root(state_update.inner.globalRoot),
+                                        };
+                                        self.pending_state_updates.insert(eth_block, state_update);
+                                    } else {
+                                        self.pending_state_updates.remove(&eth_block);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(error=%e, "LogStateUpdate stream ended, re-subscribing");
+                                match provider.subscribe_logs(&filter).await {
+                                    Ok(sub) => state_updates = sub,
+                                    Err(e) => break e.into(),
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::debug!(error=%e, "LogStateUpdate stream ended, re-subscribing");
-                            state_updates = provider.subscribe_logs(&filter).await?;
-                        }
                     }
-                }
-                maybe_block_number = finalized_block_rx.recv() => {
-                    match maybe_block_number {
-                        Some(block_number) => {
-                            tracing::trace!(%block_number, "Processing L1 finalized block");
-                            // Collect all state updates up to (and including) the finalized block
-                            let pending_state_updates: Vec<EthereumStateUpdate> = self.pending_state_updates
-                                .range(..=block_number)
-                                .map(|(_, &update)| update)
-                                .collect();
-                            // Remove emitted updates from the map
-                            self.pending_state_updates.retain(|&k, _| k > block_number);
-                            // Emit the state updates
-                            for state_update in pending_state_updates {
-                                let _ = callback(state_update).await;
+                    maybe_block_number = finalized_block_rx.recv() => {
+                        match maybe_block_number {
+                            Some(block_number) => {
+                                tracing::trace!(%block_number, "Processing L1 finalized block");
+                                // Collect all state updates up to (and including) the finalized block
+                                let pending_state_updates: Vec<EthereumStateUpdate> = self.pending_state_updates
+                                    .range(..=block_number)
+                                    .map(|(_, &update)| update)
+                                    .collect();
+                                // Remove emitted updates from the map
+                                self.pending_state_updates.retain(|&k, _| k > block_number);
+                                // Emit the state updates
+                                for state_update in pending_state_updates {
+                                    let _ = callback(state_update).await;
+                                }
+                            }
+                            None => {
+                                break anyhow::anyhow!("L1 finalized block channel closed");
                             }
                         }
-                        None => {
-                            tracing::debug!("L1 finalized block channel closed");
-                            anyhow::bail!("L1 finalized block channel closed");
-                        }
                     }
                 }
-            }
+            };
+
+            tracing::warn!(error=%error, "L1 sync connection lost, reconnecting in {RECONNECT_DELAY:?}");
+            tokio::time::sleep(RECONNECT_DELAY).await;
         }
     }
 
-    async fn get_l1_handler_txs(
+    pub async fn get_l1_handler_txs(
         &self,
         address: &H160,
         tx_hash: &L1TransactionHash,
     ) -> anyhow::Result<Vec<L1HandlerTransaction>> {
-        // Create a WebSocket connection
-        let ws = WsConnect::new(self.url.clone());
-        let provider = ProviderBuilder::new().connect_ws(ws).await?;
+        let provider = self.provider().await?;
 
         let core_address = Address::new((*address).into());
         let core_contract = StarknetCoreContract::new(core_address, provider.clone());
@@ -301,10 +503,8 @@ impl EthereumApi for EthereumClient {
     }
 
     /// Get the Starknet state
-    async fn get_starknet_state(&self, address: &H160) -> anyhow::Result<EthereumStateUpdate> {
-        // Create a WebSocket connection
-        let ws = WsConnect::new(self.url.clone());
-        let provider = ProviderBuilder::new().connect_ws(ws).await?;
+    pub async fn get_starknet_state(&self, address: &H160) -> anyhow::Result<EthereumStateUpdate> {
+        let provider = self.provider().await?;
 
         // Create the StarknetCoreContract instance
         let address = Address::new((*address).into());
@@ -328,12 +528,8 @@ impl EthereumApi for EthereumClient {
     }
 
     /// Get the Ethereum chain
-    async fn get_chain(&self) -> anyhow::Result<EthereumChain> {
-        // Create a WebSocket connection
-        let ws = WsConnect::new(self.url.clone());
-        let provider = ProviderBuilder::new().connect_ws(ws).await?;
-
-        // Get the chain ID
+    pub async fn get_chain(&self) -> anyhow::Result<EthereumChain> {
+        let provider = self.provider().await?;
         let chain_id = provider.get_chain_id().await?;
         let chain_id = U256::from(chain_id);
 

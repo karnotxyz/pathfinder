@@ -12,13 +12,35 @@ use crate::{ByteCodeOffset, EntryPoint};
 
 pub const CLASS_DEFINITION_MAX_ALLOWED_SIZE: u64 = 4 * 1024 * 1024;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Dummy)]
+pub struct SerializedSierraDefinition(Vec<u8>);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Dummy)]
+pub struct SerializedCasmDefinition(Vec<u8>);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Dummy)]
+pub struct SerializedCairoDefinition(Vec<u8>);
+
+/// Carries the definition of a serialized contract class, either Sierra or
+/// Cairo. The caller does not care which class definition it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Dummy)]
+pub struct SerializedOpaqueClassDefinition(Vec<u8>);
+
+/// Carries the definition of a serialized contract class, either Sierra or
+/// Cairo.
+#[derive(Clone, Debug)]
+pub enum SerializedClassDefinition {
+    Sierra(SerializedSierraDefinition),
+    Cairo(SerializedCairoDefinition),
+}
+
 #[derive(Debug, Deserialize, Dummy)]
 pub enum ClassDefinition<'a> {
     Sierra(Sierra<'a>),
     Cairo(Cairo<'a>),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sierra<'a> {
     /// Contract ABI.
@@ -189,4 +211,90 @@ impl<T> Dummy<T> for SelectorAndOffset {
 pub struct SelectorAndFunctionIndex {
     pub selector: EntryPoint,
     pub function_idx: u64,
+}
+
+impl SerializedSierraDefinition {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl SerializedCasmDefinition {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl SerializedCairoDefinition {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl SerializedOpaqueClassDefinition {
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// We can use `From` because this is always safe.
+impl From<SerializedSierraDefinition> for SerializedOpaqueClassDefinition {
+    fn from(d: SerializedSierraDefinition) -> Self {
+        Self::from_bytes(d.into_bytes())
+    }
+}
+
+/// We can use `From` because this is always safe.
+impl From<SerializedCairoDefinition> for SerializedOpaqueClassDefinition {
+    fn from(d: SerializedCairoDefinition) -> Self {
+        Self::from_bytes(d.into_bytes())
+    }
 }

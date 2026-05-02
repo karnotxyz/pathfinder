@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use blockifier::blockifier_versioned_constants::VersionedConstants;
 use blockifier::execution::call_info::{CallInfo, OrderedL2ToL1Message};
-use blockifier::state::cached_state::StateMaps;
+use blockifier::state::cached_state::StateMaps as BlockifierStateMaps;
 use blockifier::state::errors::StateError;
 use blockifier::state::state_api::StateReader as _;
 use blockifier::transaction::transaction_execution::Transaction;
@@ -18,7 +18,7 @@ use pathfinder_common::state_update::{
 use pathfinder_common::transaction::TransactionVariant;
 use pathfinder_crypto::Felt;
 use starknet_api::block::FeeType;
-use starknet_api::core::PatriciaKey;
+use starknet_api::core::{CompiledClassHash, PatriciaKey};
 use starknet_api::execution_resources::{GasAmount, GasVector};
 use starknet_api::transaction::fields::{
     AccountDeploymentData,
@@ -35,8 +35,6 @@ use crate::execution_state::PathfinderExecutionState;
 use crate::state_reader::StorageAdapter;
 use crate::IntoStarkFelt as _;
 
-pub const ETH_TO_WEI_RATE: u128 = 1_000_000_000_000_000_000;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Receipt {
     pub actual_fee: Fee,
@@ -47,6 +45,8 @@ pub struct Receipt {
     pub execution_status: pathfinder_common::receipt::ExecutionStatus,
     pub transaction_index: TransactionIndex,
 }
+
+pub type ReceiptAndEvents = (Receipt, Vec<pathfinder_common::event::Event>);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BlockInfo {
@@ -94,13 +94,10 @@ pub struct ConsensusPriceConverter {
     pub l2_gas_price_fri: u128,
     pub l1_gas_price_wei: u128,
     pub l1_data_gas_price_wei: u128,
-    pub eth_to_fri_rate: u128,
+    pub l1_gas_price_fri: u128,
+    pub l1_data_gas_price_fri: u128,
 }
 
-// one eth_to_fri_rate is not suitable for current sepolia or integration data
-// where there are 3 pairs of gas prices in both wei & fri and they give
-// 2 different ethfri rates, often due to one of the prices in wei saturated at
-// 1
 pub enum BlockInfoPriceConverter {
     Legacy(LegacyPriceConverter),
     Consensus(ConsensusPriceConverter),
@@ -122,45 +119,38 @@ impl LegacyPriceConverter {
 
 impl ConsensusPriceConverter {
     pub fn strk_l1_gas_price(&self) -> u128 {
-        self.wei_to_fri(self.l1_gas_price_wei)
+        self.l1_gas_price_fri
     }
 
     pub fn strk_l1_data_gas_price(&self) -> u128 {
-        self.wei_to_fri(self.l1_data_gas_price_wei)
+        self.l1_data_gas_price_fri
     }
 
     pub fn eth_l2_gas_price(&self) -> u128 {
-        self.fri_to_wei(self.l2_gas_price_fri)
-    }
-
-    fn wei_to_fri(&self, wei: u128) -> u128 {
-        wei * self.eth_to_fri_rate / ETH_TO_WEI_RATE
-    }
-
-    fn fri_to_wei(&self, fri: u128) -> u128 {
-        fri * ETH_TO_WEI_RATE / self.eth_to_fri_rate
+        // Derive WEI price from the FRI price using the L1 gas price ratio.
+        // l2_gas_price_wei = l2_gas_price_fri * l1_gas_price_wei / l1_gas_price_fri
+        if self.l1_gas_price_fri == 0 {
+            0
+        } else {
+            self.l2_gas_price_fri * self.l1_gas_price_wei / self.l1_gas_price_fri
+        }
     }
 }
 
 impl BlockInfoPriceConverter {
     pub fn consensus(
         l2_gas_price_fri: u128,
+        l1_gas_price_fri: u128,
+        l1_data_gas_price_fri: u128,
         l1_gas_price_wei: u128,
         l1_data_gas_price_wei: u128,
-        eth_to_fri_rate: u128,
     ) -> Self {
-        // TODO(validator) obviously incorrect, but better than dividing by zero...
-        let cooked_rate = if eth_to_fri_rate == 0 {
-            tracing::error!("zero ETH/FRI rate");
-            1
-        } else {
-            eth_to_fri_rate
-        };
         Self::Consensus(ConsensusPriceConverter {
             l2_gas_price_fri,
             l1_gas_price_wei,
             l1_data_gas_price_wei,
-            eth_to_fri_rate: cooked_rate,
+            l1_gas_price_fri,
+            l1_data_gas_price_fri,
         })
     }
 
@@ -563,6 +553,66 @@ pub struct InnerCallExecutionResources {
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct StateMaps {
+    pub nonces: BTreeMap<ContractAddress, ContractNonce>,
+    pub class_hashes: BTreeMap<ContractAddress, ClassHash>,
+    pub storage: BTreeMap<(ContractAddress, StorageAddress), StorageValue>,
+    pub compiled_class_hashes: BTreeMap<ClassHash, CompiledClassHash>,
+    pub declared_contracts: BTreeMap<ClassHash, bool>,
+}
+
+impl From<blockifier::state::cached_state::StateMaps> for StateMaps {
+    fn from(value: blockifier::state::cached_state::StateMaps) -> Self {
+        Self {
+            nonces: value
+                .nonces
+                .into_iter()
+                .map(|(address, nonce)| {
+                    let address = ContractAddress::new_or_panic(address.key().into_felt());
+                    let nonce = ContractNonce(nonce.into_felt());
+                    (address, nonce)
+                })
+                .collect(),
+            class_hashes: value
+                .class_hashes
+                .into_iter()
+                .map(|(address, class_hash)| {
+                    let address = ContractAddress::new_or_panic(address.key().into_felt());
+                    let class_hash = ClassHash::new_or_panic(class_hash.into_felt());
+                    (address, class_hash)
+                })
+                .collect(),
+            storage: value
+                .storage
+                .into_iter()
+                .map(|((address, key), value)| {
+                    let address = ContractAddress::new_or_panic(address.key().into_felt());
+                    let key = StorageAddress::new_or_panic(key.into_felt());
+                    let value = StorageValue(value.into_felt());
+                    ((address, key), value)
+                })
+                .collect(),
+            compiled_class_hashes: value
+                .compiled_class_hashes
+                .into_iter()
+                .map(|(class_hash, compiled_class_hash)| {
+                    let class_hash = ClassHash::new_or_panic(class_hash.into_felt());
+                    (class_hash, compiled_class_hash)
+                })
+                .collect(),
+            declared_contracts: value
+                .declared_contracts
+                .into_iter()
+                .map(|(class_hash, declared)| {
+                    let class_hash = ClassHash::new_or_panic(class_hash.into_felt());
+                    (class_hash, declared)
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct StateDiff {
     pub storage_diffs: BTreeMap<ContractAddress, Vec<StorageDiff>>,
     pub deployed_contracts: Vec<DeployedContract>,
@@ -771,7 +821,7 @@ impl FunctionInvocation {
             events,
             messages,
             result,
-            computation_resources: call_info.resources.into(),
+            computation_resources: call_info.resources.vm_resources.into(),
             execution_resources: InnerCallExecutionResources {
                 l1_gas: gas_consumed.l1_gas.0.into(),
                 l2_gas: gas_consumed.l2_gas.0.into(),
@@ -1144,7 +1194,7 @@ pub(crate) fn transaction_declared_deprecated_class(
 }
 
 pub(crate) fn to_state_diff<S: StorageAdapter + Clone>(
-    state_maps: StateMaps,
+    state_maps: BlockifierStateMaps,
     initial_state: PathfinderExecutionState<S>,
     old_declared_contracts: impl Iterator<Item = ClassHash>,
 ) -> Result<StateDiff, StateError> {
@@ -1591,6 +1641,13 @@ pub fn to_starknet_api_transaction(
                         .iter()
                         .map(|a| a.0.into_starkfelt())
                         .collect(),
+                ),
+                proof_facts: starknet_api::transaction::fields::ProofFacts(
+                    tx.proof_facts
+                        .iter()
+                        .map(|p| p.0.into_starkfelt())
+                        .collect::<Vec<_>>()
+                        .into(),
                 ),
             };
 

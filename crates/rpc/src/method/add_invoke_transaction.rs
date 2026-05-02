@@ -90,6 +90,8 @@ impl Input {
                     fee_data_availability_mode: Default::default(),
                     sender_address: Default::default(),
                     calldata: Default::default(),
+                    proof_facts: Default::default(),
+                    proof: Default::default(),
                 },
             )),
         }
@@ -120,7 +122,9 @@ pub enum AddInvokeTransactionError {
     DuplicateTransaction,
     NonAccount,
     UnsupportedTransactionVersion,
+    InvalidProof,
     UnexpectedError(String),
+    ForwardedError(reqwest::Error),
 }
 
 impl From<anyhow::Error> for AddInvokeTransactionError {
@@ -147,7 +151,9 @@ impl From<AddInvokeTransactionError> for crate::error::ApplicationError {
             AddInvokeTransactionError::DuplicateTransaction => Self::DuplicateTransaction,
             AddInvokeTransactionError::NonAccount => Self::NonAccount,
             AddInvokeTransactionError::UnsupportedTransactionVersion => Self::UnsupportedTxVersion,
+            AddInvokeTransactionError::InvalidProof => Self::InvalidProof,
             AddInvokeTransactionError::UnexpectedError(data) => Self::UnexpectedError { data },
+            AddInvokeTransactionError::ForwardedError(error) => Self::ForwardedError(error),
         }
     }
 }
@@ -159,6 +165,7 @@ impl From<SequencerError> for AddInvokeTransactionError {
             EntryPointNotFound,
             InsufficientAccountBalance,
             InsufficientMaxFee,
+            InvalidProof,
             InvalidTransactionNonce,
             InvalidTransactionVersion,
             ValidateFailure,
@@ -188,6 +195,17 @@ impl From<SequencerError> for AddInvokeTransactionError {
             }
             SequencerError::StarknetError(e) if e.code == EntryPointNotFound.into() => {
                 AddInvokeTransactionError::NonAccount
+            }
+            SequencerError::StarknetError(e) if e.code == InvalidProof.into() => {
+                // Technically specific to JSON-RPC version >= 0.10,
+                // but for the earlier versions this error shouldn't
+                // occur, since there is no proof in the first place.
+                AddInvokeTransactionError::InvalidProof
+            }
+            SequencerError::ReqwestError(e)
+                if e.status() == Some(reqwest::StatusCode::PAYLOAD_TOO_LARGE) =>
+            {
+                AddInvokeTransactionError::ForwardedError(e)
             }
             _ => AddInvokeTransactionError::UnexpectedError(e.to_string()),
         }
@@ -283,6 +301,8 @@ pub(crate) async fn add_invoke_transaction_impl(
                         sender_address: tx.sender_address,
                         calldata: tx.calldata.clone(),
                         account_deployment_data: tx.account_deployment_data.clone(),
+                        proof_facts: tx.proof_facts.clone(),
+                        proof: tx.proof.clone(),
                     },
                 ))
                 .await?;
@@ -297,6 +317,7 @@ pub(crate) async fn add_invoke_transaction_impl(
                 account_deployment_data: tx.account_deployment_data,
                 calldata: tx.calldata,
                 sender_address: tx.sender_address,
+                proof_facts: tx.proof_facts,
             };
             (
                 response.transaction_hash,
@@ -322,7 +343,9 @@ impl crate::dto::SerializeForVersion for Output {
 mod tests {
     use pathfinder_common::macro_prelude::*;
     use pathfinder_common::transaction::{DataAvailabilityMode, ResourceBound, ResourceBounds};
-    use pathfinder_common::{ResourceAmount, ResourcePricePerUnit, Tip, TransactionVersion};
+    use pathfinder_common::{Proof, ResourceAmount, ResourcePricePerUnit, Tip, TransactionVersion};
+    use starknet_gateway_types::error::{test_response_from, KnownStarknetErrorCode};
+    use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::types::request::BroadcastedInvokeTransactionV1;
@@ -465,39 +488,33 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "gateway 429"]
     async fn duplicate_transaction() {
-        use crate::types::request::BroadcastedInvokeTransactionV1;
-
-        let context = RpcContext::for_tests();
-        let input = BroadcastedInvokeTransactionV1 {
-            version: TransactionVersion::ONE,
-            max_fee: fee!("0x630a0aff77"),
-            signature: vec![
-                transaction_signature_elem!(
-                    "07ccc81b438581c9360120e0ba0ef52c7d031bdf20a4c2bc3820391b29a8945f"
-                ),
-                transaction_signature_elem!(
-                    "02c11c60d11daaa0043eccdc824bb44f87bc7eb2e9c2437e1654876ab8fa7cad"
-                ),
-            ],
-            nonce: transaction_nonce!("0x2"),
-            sender_address: contract_address!(
-                "03fdcbeb68e607c8febf01d7ef274cbf68091a0bd1556c0b8f8e80d732f7850f"
-            ),
-            calldata: vec![
-                call_param!("0x1"),
-                call_param!("01d809111da75d5e735b6f9573a1ddff78fb6ff7633a0b34273e0c5ddeae349a"),
-                call_param!("0362398bec32bc0ebb411203221a35a0301193a96f317ebe5e40be9f60d15320"),
-                call_param!("0x0"),
-                call_param!("0x1"),
-                call_param!("0x1"),
-                call_param!("0x1"),
-            ],
-        };
+        let (body, code) = test_response_from(KnownStarknetErrorCode::DuplicatedTransaction);
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/gateway/add_transaction"))
+            .respond_with(ResponseTemplate::new(code).set_body_string(body))
+            .mount(&server)
+            .await;
+        let mut context = RpcContext::for_tests();
+        context.sequencer =
+            starknet_gateway_client::Client::for_test(server.uri().parse().unwrap())
+                .unwrap()
+                .disable_retry_for_tests();
 
         let input = Input {
-            invoke_transaction: Transaction::Invoke(BroadcastedInvokeTransaction::V1(input)),
+            invoke_transaction: Transaction::Invoke(BroadcastedInvokeTransaction::V1(
+                crate::types::request::BroadcastedInvokeTransactionV1 {
+                    version: TransactionVersion::ONE,
+                    max_fee: fee!("0x630a0aff77"),
+                    signature: vec![],
+                    nonce: transaction_nonce!("0x2"),
+                    sender_address: contract_address!(
+                        "03fdcbeb68e607c8febf01d7ef274cbf68091a0bd1556c0b8f8e80d732f7850f"
+                    ),
+                    calldata: vec![],
+                },
+            )),
         };
 
         let error = add_invoke_transaction(context, input).await.unwrap_err();
@@ -505,64 +522,51 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "gateway 429"]
     // https://external.integration.starknet.io/feeder_gateway/get_transaction?transactionHash=0x41906f1c314cca5f43170ea75d3b1904196a10101190d2b12a41cc61cfd17c
     async fn duplicate_v3_transaction() {
-        use crate::types::request::BroadcastedInvokeTransactionV3;
-
-        let context = RpcContext::for_tests_on(pathfinder_common::Chain::SepoliaIntegration);
-        let input = BroadcastedInvokeTransactionV3 {
-            version: TransactionVersion::THREE,
-            signature: vec![
-                transaction_signature_elem!(
-                    "0xef42616755b8a9b7c97d2deb1ba4a4176d3c838a20c367072f141af446ee7"
-                ),
-                transaction_signature_elem!(
-                    "0xc6514ea8a88bcb0f4b2a40ddc609461a35af802ba0b35586ade6d8a4be2934"
-                ),
-            ],
-            nonce: transaction_nonce!("0x8a9"),
-            resource_bounds: ResourceBounds {
-                l1_gas: ResourceBound {
-                    max_amount: ResourceAmount(0x186a0),
-                    max_price_per_unit: ResourcePricePerUnit(0x5af3107a4000),
-                },
-                l2_gas: ResourceBound {
-                    max_amount: ResourceAmount(0),
-                    max_price_per_unit: ResourcePricePerUnit(0),
-                },
-                l1_data_gas: None,
-            },
-            tip: Tip(0),
-            paymaster_data: vec![],
-            account_deployment_data: vec![],
-            nonce_data_availability_mode: DataAvailabilityMode::L1,
-            fee_data_availability_mode: DataAvailabilityMode::L1,
-            sender_address: contract_address!(
-                "0x3f6f3bc663aedc5285d6013cc3ffcbc4341d86ab488b8b68d297f8258793c41"
-            ),
-            calldata: vec![
-                call_param!("0x2"),
-                call_param!("0x4c312760dfd17a954cdd09e76aa9f149f806d88ec3e402ffaf5c4926f568a42"),
-                call_param!("0x31aafc75f498fdfa7528880ad27246b4c15af4954f96228c9a132b328de1c92"),
-                call_param!("0x0"),
-                call_param!("0x6"),
-                call_param!("0x450703c32370cf7ffff540b9352e7ee4ad583af143a361155f2b485c0c39684"),
-                call_param!("0xb17d8a2731ba7ca1816631e6be14f0fc1b8390422d649fa27f0fbb0c91eea8"),
-                call_param!("0x6"),
-                call_param!("0x0"),
-                call_param!("0x6"),
-                call_param!("0x6333f10b24ed58cc33e9bac40b0d52e067e32a175a97ca9e2ce89fe2b002d82"),
-                call_param!("0x3"),
-                call_param!("0x602e89fe5703e5b093d13d0a81c9e6d213338dc15c59f4d3ff3542d1d7dfb7d"),
-                call_param!("0x20d621301bea11ffd9108af1d65847e9049412159294d0883585d4ad43ad61b"),
-                call_param!("0x276faadb842bfcbba834f3af948386a2eb694f7006e118ad6c80305791d3247"),
-                call_param!("0x613816405e6334ab420e53d4b38a0451cb2ebca2755171315958c87d303cf6"),
-            ],
-        };
+        let (body, code) = test_response_from(KnownStarknetErrorCode::DuplicatedTransaction);
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/gateway/add_transaction"))
+            .respond_with(ResponseTemplate::new(code).set_body_string(body))
+            .mount(&server)
+            .await;
+        let mut context = RpcContext::for_tests_on(pathfinder_common::Chain::SepoliaIntegration);
+        context.sequencer =
+            starknet_gateway_client::Client::for_test(server.uri().parse().unwrap())
+                .unwrap()
+                .disable_retry_for_tests();
 
         let input = Input {
-            invoke_transaction: Transaction::Invoke(BroadcastedInvokeTransaction::V3(input)),
+            invoke_transaction: Transaction::Invoke(BroadcastedInvokeTransaction::V3(
+                crate::types::request::BroadcastedInvokeTransactionV3 {
+                    version: TransactionVersion::THREE,
+                    signature: vec![],
+                    nonce: transaction_nonce!("0x8a9"),
+                    resource_bounds: ResourceBounds {
+                        l1_gas: ResourceBound {
+                            max_amount: ResourceAmount(0x186a0),
+                            max_price_per_unit: ResourcePricePerUnit(0x5af3107a4000),
+                        },
+                        l2_gas: ResourceBound {
+                            max_amount: ResourceAmount(0),
+                            max_price_per_unit: ResourcePricePerUnit(0),
+                        },
+                        l1_data_gas: None,
+                    },
+                    tip: Tip(0),
+                    paymaster_data: vec![],
+                    account_deployment_data: vec![],
+                    nonce_data_availability_mode: DataAvailabilityMode::L1,
+                    fee_data_availability_mode: DataAvailabilityMode::L1,
+                    sender_address: contract_address!(
+                        "0x3f6f3bc663aedc5285d6013cc3ffcbc4341d86ab488b8b68d297f8258793c41"
+                    ),
+                    calldata: vec![],
+                    proof_facts: vec![],
+                    proof: Proof::default(),
+                },
+            )),
         };
 
         let error = add_invoke_transaction(context, input).await.unwrap_err();

@@ -98,8 +98,8 @@ pub async fn get_class_at(
             .context("Fetching class definition")?
             .context("Class definition missing from database")?;
 
-        let class = ContractClass::from_definition_bytes(&definition)
-            .context("Parsing class definition")?;
+        let class =
+            ContractClass::from_serialized_def(&definition).context("Parsing class definition")?;
 
         Ok(class)
     });
@@ -228,17 +228,6 @@ mod tests {
         assert_matches!(error, Error::BlockNotFound);
     }
 
-    #[tokio::test]
-    async fn pending() {
-        let context = RpcContext::for_tests_with_pending().await;
-        let input = Input {
-            block_id: BlockId::Pending,
-            contract_address: contract_address_bytes!(b"pending contract 0 address"),
-        };
-
-        get_class_at(context, input, RPC_VERSION).await.unwrap();
-    }
-
     #[rstest::rstest]
     #[case::v06(RpcVersion::V06)]
     #[case::v07(RpcVersion::V07)]
@@ -250,7 +239,7 @@ mod tests {
         let context = RpcContext::for_tests_with_pre_latest_and_pre_confirmed().await;
 
         let input = Input {
-            block_id: BlockId::Pending,
+            block_id: BlockId::PreConfirmed,
             contract_address: contract_address_bytes!(b"prelatest contract 0 address"),
         };
         let r = get_class_at(context.clone(), input, version).await;
@@ -263,7 +252,7 @@ mod tests {
         }
 
         let input = Input {
-            block_id: BlockId::Pending,
+            block_id: BlockId::PreConfirmed,
             contract_address: contract_address_bytes!(b"preconfirmed contract 0 address"),
         };
         let r = get_class_at(context, input, version).await;

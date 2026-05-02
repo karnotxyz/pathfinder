@@ -289,8 +289,8 @@ pub async fn get_storage_proof(context: RpcContext, input: Input) -> Result<Outp
         let tx = db.transaction().context("Creating database transaction")?;
 
         let block_id = match input.block_id {
-            BlockId::Pending => {
-                // Getting proof of a pending block is not supported.
+            BlockId::PreConfirmed => {
+                // Getting proof of a pre-confirmed block is not supported.
                 return Err(Error::ProofMissing);
             }
             other => other
@@ -506,6 +506,7 @@ mod tests {
     use pathfinder_common::*;
     use pathfinder_merkle_tree::starknet_state::update_starknet_state;
     use pathfinder_storage::fake::{Block, Config, OccurrencePerBlock};
+    use pathfinder_storage::TriePruneMode;
 
     use super::*;
     use crate::dto::SerializeForVersion;
@@ -782,10 +783,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_block() {
+    async fn pre_confirmed_block() {
         let context = RpcContext::for_tests();
         let input = Input {
-            block_id: BlockId::Pending,
+            block_id: BlockId::PreConfirmed,
             class_hashes: None,
             contract_addresses: None,
             contracts_storage_keys: None,
@@ -813,7 +814,12 @@ mod tests {
 
     #[tokio::test]
     async fn chain_without_declarations_and_contract_updates() {
-        let storage = pathfinder_storage::StorageBuilder::in_memory().unwrap();
+        let storage =
+            pathfinder_storage::StorageBuilder::in_tempdir_with_trie_pruning_and_pool_size(
+                TriePruneMode::Archive,
+                NonZeroU32::new(32).unwrap(),
+            )
+            .unwrap();
         let blocks = pathfinder_storage::fake::generate::with_config(
             1,
             Config {

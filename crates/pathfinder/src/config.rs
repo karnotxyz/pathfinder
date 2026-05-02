@@ -4,6 +4,7 @@ use std::fs::File;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use clap::{ArgAction, CommandFactory, Parser};
@@ -24,14 +25,96 @@ pub mod p2p;
 use p2p::cli::{P2PConsensusCli, P2PSyncCli};
 use p2p::{P2PConsensusConfig, P2PSyncConfig};
 
+const COMPILER_MEMORY_USAGE_ALLOWED_RANGE: std::ops::RangeInclusive<u64> =
+    (pathfinder_compiler::ResourceLimits::RECOMMENDED_MEMORY_USAGE_LIMIT_MIB / 2)
+        ..=(4 * pathfinder_compiler::ResourceLimits::RECOMMENDED_MEMORY_USAGE_LIMIT_MIB);
+
+const COMPILER_CPU_TIME_ALLOWED_RANGE: std::ops::RangeInclusive<u64> =
+    pathfinder_compiler::ResourceLimits::RECOMMENDED_CPU_TIME_LIMIT
+        ..=(4 * pathfinder_compiler::ResourceLimits::RECOMMENDED_CPU_TIME_LIMIT);
+
 #[derive(Parser)]
 #[command(name = "Pathfinder")]
 #[command(author = "Equilibrium Labs")]
 #[command(version = pathfinder_version::VERSION)]
+#[command(propagate_version = true)]
 #[command(
-    about = "A Starknet node implemented by Equilibrium Labs. Submit bug reports and issues at https://github.com/eqlabs/pathfinder."
+    about = "A Starknet node implemented by Equilibrium Labs. Submit bug reports and issues at https://github.com/equilibriumco/pathfinder."
 )]
-struct Cli {
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Parse command line arguments, defaulting to the `node` subcommand
+/// if no valid subcommand is provided.
+///
+/// NOTE: There are nicer ways to do this but they all involve setting
+/// the `#[command(flatten)]` attribute on [`NodeArgs`] which isn't possible
+/// as long as it has fields with `#[clap(skip)]`.
+pub fn parse_cli() -> Cli {
+    let mut os_args: Vec<_> = std::env::args_os().collect();
+    let arg1 = os_args.get(1).and_then(|arg1| arg1.to_str());
+
+    // If a valid subcommand was provided, run it. Otherwise, default to the
+    // `node` subcommand and let clap handle any errors.
+    match arg1 {
+        Some(arg1) if CommandKind::from_str(arg1).is_ok() => {}
+        _ => {
+            os_args.insert(1, "node".into());
+        }
+    }
+
+    Cli::parse_from(os_args)
+}
+
+#[derive(clap::Subcommand)]
+pub enum Command {
+    /// Run the Pathfinder node.
+    Node(Box<NodeArgs>),
+
+    /// Run the Sierra to CASM compiler. Raw Sierra class definitions are read
+    /// from stdin and the compiled CASM is written to stdout.
+    ///
+    /// This command is intended to be used as a subprocess by the main
+    /// `pathfinder` executable and is not generally useful to run directly.
+    Compile(CompileConfig),
+}
+
+enum CommandKind {
+    Node,
+    Compile,
+    Help,
+    Version,
+}
+
+impl FromStr for CommandKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "node" => Ok(CommandKind::Node),
+            "compile" => Ok(CommandKind::Compile),
+            "help" | "--help" | "-h" => Ok(CommandKind::Help),
+            "--version" | "-V" => Ok(CommandKind::Version),
+            _ => Err(()),
+        }
+    }
+}
+
+// Not actually used, but serves as a guarantee that every command has a
+// corresponding CommandKind.
+impl From<Command> for CommandKind {
+    fn from(command: Command) -> Self {
+        match command {
+            Command::Node(_) => CommandKind::Node,
+            Command::Compile(_) => CommandKind::Compile,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+pub struct NodeArgs {
     #[arg(
         long,
         value_name = "DIR",
@@ -160,7 +243,7 @@ Examples:
 
     #[arg(
         long = "log-output-json",
-        long_help = "This flag controls when to use colors in the output logs.",
+        long_help = "Enable JSON structured logging output.",
         default_value = "false",
         env = "PATHFINDER_LOG_OUTPUT_JSON",
         value_name = "BOOL"
@@ -298,6 +381,15 @@ This should only be enabled for debugging purposes as it adds substantial proces
     feeder_gateway_fetch_concurrency: std::num::NonZeroUsize,
 
     #[arg(
+        long = "gateway.check-for-dns-updates-interval",
+        value_name = "Seconds",
+        long_help = "Interval for checking DNS updates for the gateway and feeder gateway URLs",
+        env = "PATHFINDER_GATEWAY_CHECK_FOR_DNS_UPDATES_INTERVAL",
+        default_value = "60"
+    )]
+    gateway_dns_refresh_interval: std::num::NonZeroU64,
+
+    #[arg(
         long = "storage.event-filter-cache-size",
         long_help = format!(
             "The number of aggregate event bloom filters to cache in memory. Each filter covers a {} block range.
@@ -375,6 +467,31 @@ This should only be enabled for debugging purposes as it adds substantial proces
     custom_versioned_constants_path: Option<PathBuf>,
 
     #[arg(
+        long = "compiler.max-memory-usage-mib",
+        long_help = "Maximum memory usage for the compiler in MiB. 
+
+Setting this value too low may cause compilation of large classes to fail.",
+        env = "PATHFINDER_COMPILER_MAX_MEMORY_USAGE_MIB",
+        default_value_t = pathfinder_compiler::ResourceLimits::RECOMMENDED_MEMORY_USAGE_LIMIT_MIB,
+        value_parser = clap::value_parser!(u64).range(COMPILER_MEMORY_USAGE_ALLOWED_RANGE),
+    )]
+    compiler_max_memory_usage_mib: u64,
+
+    #[arg(
+        long = "compiler.max-cpu-time-secs",
+        long_help = "Maximum CPU time for the compiler in seconds. 
+
+Setting this value too low may cause compilation of large classes to fail.",
+        env = "PATHFINDER_COMPILER_MAX_CPU_TIME_SECONDS",
+        default_value_t = pathfinder_compiler::ResourceLimits::RECOMMENDED_CPU_TIME_LIMIT,
+        value_parser = clap::value_parser!(u64).range(COMPILER_CPU_TIME_ALLOWED_RANGE),
+    )]
+    compiler_max_cpu_time_secs: u64,
+
+    #[clap(flatten)]
+    compile_config: CompileConfig,
+
+    #[arg(
         long = "sync.fetch-casm-from-fgw",
         long_help = "Do not compile classes locally, instead fetch them from the feeder gateway",
         env = "PATHFINDER_SYNC_FETCH_CASM_FROM_FGW",
@@ -403,6 +520,14 @@ This should only be enabled for debugging purposes as it adds substantial proces
         value_parser = parse_fee_estimation_epsilon
     )]
     fee_estimation_epsilon: Percentage,
+
+    #[arg(
+        long = "rpc.block-trace-cache-size",
+        long_help = "Number of block traces to cache in memory for RPC calls.",
+        default_value = "128",
+        env = "PATHFINDER_RPC_BLOCK_TRACE_CACHE_SIZE"
+    )]
+    rpc_block_trace_cache_size: std::num::NonZeroUsize,
 
     #[cfg_attr(
         all(
@@ -442,6 +567,50 @@ impl Color {
             Color::Always => true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum BlockifierLibfuncs {
+    #[default]
+    Audited,
+    All,
+    Experimental,
+}
+
+fn parse_blockifier_libfuncs(s: &str) -> Result<BlockifierLibfuncs, String> {
+    match s {
+        "audited" => Ok(BlockifierLibfuncs::Audited),
+        "all" => Ok(BlockifierLibfuncs::All),
+        "experimental" => Ok(BlockifierLibfuncs::Experimental),
+        _ => Err("Unknown blockifier libfunc list".to_string()),
+    }
+}
+
+impl From<BlockifierLibfuncs> for pathfinder_compiler::BlockifierLibfuncs {
+    fn from(val: BlockifierLibfuncs) -> Self {
+        match val {
+            BlockifierLibfuncs::Audited => pathfinder_compiler::BlockifierLibfuncs::Audited,
+            BlockifierLibfuncs::All => pathfinder_compiler::BlockifierLibfuncs::All,
+            BlockifierLibfuncs::Experimental => {
+                pathfinder_compiler::BlockifierLibfuncs::Experimental
+            }
+        }
+    }
+}
+
+#[derive(clap::Args, Clone)]
+pub struct CompileConfig {
+    #[arg(
+        long = "blockifier.libfunc-list",
+        long_help = "This names the libfunc list to be used in Starknet program validation.
+
+The default is suitable for all uses except testing.",
+        default_value = "audited",
+        value_name = "audited | all | experimental",
+        value_parser = parse_blockifier_libfuncs,
+        env = "PATHFINDER_BLOCKIFIER_LIBFUNC_LIST"
+    )]
+    pub blockifier_libfuncs: BlockifierLibfuncs,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq)]
@@ -562,6 +731,16 @@ Note that 'custom' requires also setting the --gateway-url and --feeder-gateway-
         required_if_eq("network", Network::Custom)
     )]
     chain_id: Option<String>,
+
+    #[arg(
+        long = "is-l3",
+        long_help = "Set if the network is an L3 network",
+        env = "PATHFINDER_IS_L3",
+        required_if_eq("network", Network::Custom),
+        default_value = "false"
+    )]
+    is_l3: Option<bool>,
+
     #[arg(
         long = "feeder-gateway-url",
         value_name = "URL",
@@ -581,6 +760,14 @@ Note that 'custom' requires also setting the --gateway-url and --feeder-gateway-
         required_if_eq("network", Network::Custom),
     )]
     gateway: Option<Url>,
+
+    #[arg(
+        long = "gateway.compress-requests",
+        long_help = "Compress requests sent to the Starknet gateway, if they contain nonempty proofs. Requests that do not contain a proof are not compressed. Requires '--network custom'.",
+        action = clap::ArgAction::Set,
+        default_value = "true",
+    )]
+    compress_gateway_requests: bool,
 }
 
 #[cfg(feature = "p2p")]
@@ -625,6 +812,24 @@ struct NativeExecutionCli {
         env = "PATHFINDER_RPC_NATIVE_EXECUTION_CLASS_CACHE_SIZE"
     )]
     class_cache_size: NonZeroUsize,
+
+    #[arg(
+        long = "rpc.native-execution-compiler-optimization-level",
+        long_help = "Optimization level for the Cairo native compiler. Valid values are 0(none), 1 (less), 2 (default), and 3 (aggressive).",
+        action = clap::ArgAction::Set,
+        default_value = "2",
+        env = "PATHFINDER_RPC_NATIVE_EXECUTION_COMPILER_OPTIMIZATION_LEVEL"
+    )]
+    optimization_level: u8,
+
+    #[arg(
+        long = "rpc.native-execution-force-use-for-incompatible-classes",
+        long_help = "Force use of Cairo native execution even for Sierra classes before 1.7.0 that are known to result in incorrect cost calculation.",
+        action = clap::ArgAction::Set,
+        default_value = "false",
+        env = "PATHFINDER_RPC_NATIVE_EXECUTION_FORCE_USE_FOR_INCOMPATIBLE_CLASSES"
+    )]
+    force_use_for_incompatible_classes: bool,
 }
 
 #[cfg(feature = "p2p")]
@@ -672,7 +877,7 @@ struct ConsensusCli {
 
     #[arg(
         long = "consensus.history-depth",
-        long_help = "How many historical consensus engines (ie. those prior to the current one) to keep enabled. Warning!Setting this value to 0 may stall small networks in some circumstances.",
+        long_help = "How many historical consensus engines (ie. those prior to the current one) to keep enabled. Warning! Setting this value to below 2 may stall small networks in some circumstances.",
         action = clap::ArgAction::Set,
         default_value = "10",
         value_name = "DEPTH",
@@ -680,6 +885,28 @@ struct ConsensusCli {
         env = "PATHFINDER_CONSENSUS_HISTORY_DEPTH",
     )]
     history_depth: u64,
+
+    #[arg(
+        long = "consensus.l1-gas-price-tolerance",
+        value_name = "Percentage",
+        long_help = "Maximum allowed tolerance for L1 gas price changes from the rolling average when validating new proposals.",
+        action = clap::ArgAction::Set,
+        default_value = "20",
+        value_parser = clap::value_parser!(u8).range(0..=100),
+        env = "PATHFINDER_CONSENSUS_L1_GAS_PRICE_TOLERANCE",
+    )]
+    l1_gas_price_tolerance: u8,
+
+    #[arg(
+        long = "consensus.l1-gas-price-max-time-gap",
+        value_name = "Seconds",
+        long_help = "Maximum allowed time gap between the requested timestamp and the latest L1 gas price sample when validating new proposals. If exceeded, the data is considered stale.",
+        action = clap::ArgAction::Set,
+        default_value = "600",
+        value_parser = clap::value_parser!(u64),
+        env = "PATHFINDER_CONSENSUS_L1_GAS_PRICE_MAX_TIME_GAP",
+    )]
+    l1_gas_price_max_time_gap: u64,
 }
 
 #[derive(clap::ValueEnum, Clone, serde::Deserialize)]
@@ -860,11 +1087,14 @@ pub struct Config {
     pub is_rpc_enabled: bool,
     pub gateway_api_key: Option<String>,
     pub gateway_timeout: Duration,
+    pub gateway_dns_refresh_interval: Duration,
     pub event_filter_cache_size: NonZeroUsize,
     pub get_events_event_filter_block_range_limit: NonZeroUsize,
     pub blockchain_history: Option<BlockchainHistory>,
     pub state_tries: Option<StateTries>,
     pub versioned_constants_map: VersionedConstantsMap,
+    pub compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    pub blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
     pub feeder_gateway_fetch_concurrency: NonZeroUsize,
     pub fetch_casm_from_fgw: bool,
     pub shutdown_grace_period: Duration,
@@ -872,6 +1102,7 @@ pub struct Config {
     pub native_execution: NativeExecutionConfig,
     pub submission_tracker_time_limit: NonZeroU64,
     pub submission_tracker_size_limit: NonZeroUsize,
+    pub rpc_block_trace_cache_size: NonZeroUsize,
     pub consensus: Option<ConsensusConfig>,
     /// Integration testing config, only available on debug builds with `p2p`
     /// and `consensus-integration-tests` features enabled.
@@ -889,9 +1120,11 @@ pub enum NetworkConfig {
     SepoliaTestnet,
     SepoliaIntegration,
     Custom {
-        gateway: Url,
-        feeder_gateway: Url,
+        gateway: Box<Url>,
+        feeder_gateway: Box<Url>,
         chain_id: String,
+        compress_gateway_requests: bool,
+        is_l3: bool,
     },
 }
 
@@ -905,6 +1138,8 @@ pub struct DebugConfig {
 pub struct NativeExecutionConfig {
     enabled: bool,
     class_cache_size: NonZeroUsize,
+    optimization_level: u8,
+    force_use_for_incompatible_classes: bool,
 }
 
 #[cfg(not(feature = "cairo-native"))]
@@ -923,6 +1158,13 @@ pub struct ConsensusConfig {
     /// How many historical consensus engines (ie. those prior to the current
     /// one) to keep enabled.
     pub history_depth: u64,
+    /// Maximum allowed tolerance for L1 gas price changes from the rolling
+    /// average when validating new proposals.
+    pub l1_gas_price_tolerance: f64,
+    /// Maximum allowed time gap between the requested timestamp and the latest
+    /// L1 gas price sample when validating new proposals. If exceeded, the data
+    /// is considered stale.
+    pub l1_gas_price_max_time_gap: u64,
 }
 
 #[cfg(not(feature = "p2p"))]
@@ -937,22 +1179,25 @@ impl NetworkConfig {
             args.gateway,
             args.feeder_gateway,
             args.chain_id,
+            args.is_l3,
         ) {
-            (None, None, None, None) => return None,
-            (Some(Custom), Some(gateway), Some(feeder_gateway), Some(chain_id)) => {
+            (None, None, None, None, None) => return None,
+            (Some(Custom), Some(gateway), Some(feeder_gateway), Some(chain_id), Some(is_l3)) => {
                 NetworkConfig::Custom {
-                    gateway,
-                    feeder_gateway,
+                    gateway: Box::new(gateway),
+                    feeder_gateway: Box::new(feeder_gateway),
                     chain_id,
+                    compress_gateway_requests: args.compress_gateway_requests,
+                    is_l3,
                 }
             }
-            (Some(Custom), _, _, _) => {
+            (Some(Custom), _, _, _, _) => {
                 unreachable!("`--network custom` requirements are handled by clap derive")
             }
             // Handle non-custom variants in an inner match so that the compiler will force
             // us to handle a new network variants explicitly. Otherwise we end up with a
             // catch-all arm that would swallow new variants silently.
-            (Some(non_custom), None, None, None) => match non_custom {
+            (Some(non_custom), None, None, None, None) => match non_custom {
                 Mainnet => NetworkConfig::Mainnet,
                 SepoliaTestnet => NetworkConfig::SepoliaTestnet,
                 SepoliaIntegration => NetworkConfig::SepoliaIntegration,
@@ -1010,6 +1255,14 @@ impl NativeExecutionConfig {
     pub fn class_cache_size(&self) -> NonZeroUsize {
         NonZeroUsize::new(1).unwrap()
     }
+
+    pub fn optimization_level(&self) -> u8 {
+        0
+    }
+
+    pub fn force_use_for_incompatible_classes(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "cairo-native")]
@@ -1018,6 +1271,8 @@ impl NativeExecutionConfig {
         Self {
             enabled: args.is_native_execution_enabled,
             class_cache_size: args.class_cache_size,
+            optimization_level: args.optimization_level,
+            force_use_for_incompatible_classes: args.force_use_for_incompatible_classes,
         }
     }
 
@@ -1027,6 +1282,14 @@ impl NativeExecutionConfig {
 
     pub fn class_cache_size(&self) -> NonZeroUsize {
         self.class_cache_size
+    }
+
+    pub fn optimization_level(&self) -> u8 {
+        self.optimization_level
+    }
+
+    pub fn force_use_for_incompatible_classes(&self) -> bool {
+        self.force_use_for_incompatible_classes
     }
 }
 
@@ -1077,6 +1340,8 @@ impl ConsensusConfig {
                     .map(ContractAddress)
                     .collect(),
                 history_depth: consensus_cli.history_depth,
+                l1_gas_price_tolerance: consensus_cli.l1_gas_price_tolerance as f64 / 100.0,
+                l1_gas_price_max_time_gap: consensus_cli.l1_gas_price_max_time_gap,
             }
         })
     }
@@ -1084,64 +1349,72 @@ impl ConsensusConfig {
 
 impl Config {
     #[cfg_attr(not(feature = "cairo-native"), allow(clippy::unit_arg))]
-    pub fn parse() -> Self {
-        let cli = Cli::parse();
-
-        let network = NetworkConfig::from_components(cli.network);
+    pub fn parse(args: Box<NodeArgs>) -> Self {
+        let network = NetworkConfig::from_components(args.network);
 
         Config {
-            data_directory: cli.data_directory,
+            data_directory: args.data_directory,
             ethereum: Ethereum {
-                password: cli.ethereum_password,
-                url: cli.ethereum_url,
+                password: args.ethereum_password,
+                url: args.ethereum_url,
             },
-            rpc_address: cli.rpc_address,
-            rpc_cors_domains: parse_cors_or_exit(cli.rpc_cors_domains),
-            rpc_root_version: cli.rpc_root_version,
-            websocket: cli.websocket,
-            monitor_address: cli.monitor_address,
+            rpc_address: args.rpc_address,
+            rpc_cors_domains: parse_cors_or_exit(args.rpc_cors_domains),
+            rpc_root_version: args.rpc_root_version,
+            websocket: args.websocket,
+            monitor_address: args.monitor_address,
             network,
-            execution_concurrency: cli.execution_concurrency,
-            sqlite_wal: match cli.sqlite_wal {
+            execution_concurrency: args.execution_concurrency,
+            sqlite_wal: match args.sqlite_wal {
                 true => JournalMode::WAL,
                 false => JournalMode::Rollback,
             },
-            max_rpc_connections: cli.max_rpc_connections,
-            poll_interval: cli.poll_interval,
-            l1_poll_interval: Duration::from_secs(cli.l1_poll_interval.get()),
-            color: cli.color,
-            log_output_json: cli.log_output_json,
-            disable_version_update_check: cli.disable_version_update_check,
-            sync_p2p: P2PSyncConfig::parse_or_exit(cli.p2p_sync),
-            consensus_p2p: P2PConsensusConfig::parse_or_exit(cli.p2p_consensus),
-            debug: DebugConfig::parse(cli.debug),
-            verify_tree_hashes: cli.verify_tree_node_data,
-            rpc_batch_concurrency_limit: cli.rpc_batch_concurrency_limit,
-            disable_batch_requests: cli.disable_batch_requests,
-            is_sync_enabled: cli.is_sync_enabled,
-            is_rpc_enabled: cli.is_rpc_enabled,
-            gateway_api_key: cli.gateway_api_key,
-            event_filter_cache_size: cli.event_filter_cache_size,
-            get_events_event_filter_block_range_limit: cli
+            max_rpc_connections: args.max_rpc_connections,
+            poll_interval: args.poll_interval,
+            l1_poll_interval: Duration::from_secs(args.l1_poll_interval.get()),
+            color: args.color,
+            log_output_json: args.log_output_json,
+            disable_version_update_check: args.disable_version_update_check,
+            sync_p2p: P2PSyncConfig::parse_or_exit(args.p2p_sync),
+            consensus_p2p: P2PConsensusConfig::parse_or_exit(args.p2p_consensus),
+            debug: DebugConfig::parse(args.debug),
+            verify_tree_hashes: args.verify_tree_node_data,
+            rpc_batch_concurrency_limit: args.rpc_batch_concurrency_limit,
+            disable_batch_requests: args.disable_batch_requests,
+            is_sync_enabled: args.is_sync_enabled,
+            is_rpc_enabled: args.is_rpc_enabled,
+            gateway_api_key: args.gateway_api_key,
+            event_filter_cache_size: args.event_filter_cache_size,
+            get_events_event_filter_block_range_limit: args
                 .get_events_event_filter_block_range_limit,
-            gateway_timeout: Duration::from_secs(cli.gateway_timeout.get()),
-            feeder_gateway_fetch_concurrency: cli.feeder_gateway_fetch_concurrency,
-            blockchain_history: cli.blockchain_history,
-            state_tries: cli.state_tries,
-            versioned_constants_map: cli
+            gateway_timeout: Duration::from_secs(args.gateway_timeout.get()),
+            gateway_dns_refresh_interval: Duration::from_secs(
+                args.gateway_dns_refresh_interval.get(),
+            ),
+            feeder_gateway_fetch_concurrency: args.feeder_gateway_fetch_concurrency,
+            blockchain_history: args.blockchain_history,
+            state_tries: args.state_tries,
+            versioned_constants_map: args
                 .custom_versioned_constants_path
                 .map(|path| parse_versioned_constants_or_exit(&path))
                 .unwrap_or_default(),
-            fetch_casm_from_fgw: cli.fetch_casm_from_fgw,
-            shutdown_grace_period: Duration::from_secs(cli.shutdown_grace_period.get()),
-            fee_estimation_epsilon: cli.fee_estimation_epsilon,
+            compiler_resource_limits: pathfinder_compiler::ResourceLimits::new(
+                // Convert MiB to bytes for the general config.
+                args.compiler_max_memory_usage_mib * 1024 * 1024,
+                args.compiler_max_cpu_time_secs,
+            ),
+            blockifier_libfuncs: args.compile_config.blockifier_libfuncs.into(),
+            fetch_casm_from_fgw: args.fetch_casm_from_fgw,
+            shutdown_grace_period: Duration::from_secs(args.shutdown_grace_period.get()),
+            fee_estimation_epsilon: args.fee_estimation_epsilon,
             #[cfg_attr(not(feature = "cairo-native"), allow(clippy::unit_arg))]
-            native_execution: NativeExecutionConfig::parse(cli.native_execution),
-            submission_tracker_time_limit: cli.submission_tracker_time_limit,
-            submission_tracker_size_limit: cli.submission_tracker_size_limit,
-            consensus: ConsensusConfig::parse_or_exit(cli.consensus),
+            native_execution: NativeExecutionConfig::parse(args.native_execution),
+            submission_tracker_time_limit: args.submission_tracker_time_limit,
+            submission_tracker_size_limit: args.submission_tracker_size_limit,
+            rpc_block_trace_cache_size: args.rpc_block_trace_cache_size,
+            consensus: ConsensusConfig::parse_or_exit(args.consensus),
             integration_testing: integration_testing::IntegrationTestingConfig::parse(
-                cli.integration_testing,
+                args.integration_testing,
             ),
         }
     }

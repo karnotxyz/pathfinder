@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
     let start_time = std::time::Instant::now();
     let mut num_transactions: usize = 0;
 
-    let native_class_cache = NativeClassCache::spawn(NonZeroUsize::new(512).unwrap());
+    let native_class_cache = NativeClassCache::spawn(NonZeroUsize::new(512).unwrap(), 2);
 
     (first_block..=last_block)
         .map(|block_number| {
@@ -148,12 +148,14 @@ fn execute(
 
     let execution_state = ExecutionState::trace(
         chain_id,
+        false,
         work.header.clone(),
         None,
         Default::default(),
         ETH_FEE_TOKEN_ADDRESS,
         STRK_FEE_TOKEN_ADDRESS,
         Some(native_class_cache),
+        false,
     );
 
     let transactions = work
@@ -170,9 +172,16 @@ fn execute(
         }
     };
 
-    match pathfinder_executor::simulate(db_tx, execution_state, transactions, Percentage::new(0)) {
+    match pathfinder_executor::simulate(
+        db_tx,
+        execution_state,
+        transactions,
+        Percentage::new(0),
+        false,
+    ) {
         Ok(simulations) => {
             for (simulation, (receipt, transaction)) in simulations
+                .0
                 .iter()
                 .zip(work.receipts.iter().zip(work.transactions.iter()))
             {

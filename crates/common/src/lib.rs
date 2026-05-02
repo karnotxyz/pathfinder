@@ -8,7 +8,7 @@ use std::ops::Rem;
 use std::str::FromStr;
 
 use anyhow::Context;
-use fake::Dummy;
+use fake::{Dummy, Fake, Faker};
 use pathfinder_crypto::hash::HashChain;
 use pathfinder_crypto::Felt;
 use primitive_types::H160;
@@ -16,12 +16,14 @@ use serde::{Deserialize, Serialize};
 
 pub mod casm_class;
 pub mod class_definition;
+pub mod consensus_info;
 pub mod consts;
 pub mod event;
 pub mod hash;
 mod header;
 pub mod integration_testing;
 mod l1;
+mod l2;
 mod macros;
 pub mod prelude;
 pub mod receipt;
@@ -32,9 +34,18 @@ pub mod transaction;
 pub mod trie;
 
 pub use header::{BlockHeader, BlockHeaderBuilder, L1DataAvailabilityMode, SignedBlockHeader};
-pub use l1::{L1BlockNumber, L1TransactionHash};
+pub use l1::{L1BlockHash, L1BlockNumber, L1TransactionHash};
+pub use l2::{
+    ConsensusFinalizedBlockHeader,
+    ConsensusFinalizedL2Block,
+    DecidedBlock,
+    DecidedBlocks,
+    DeclaredClass,
+    L2Block,
+    L2BlockToCommit,
+};
 pub use signature::BlockCommitmentSignature;
-pub use state_update::StateUpdate;
+pub use state_update::{FoundStorageValue, StateUpdate};
 
 impl ContractAddress {
     /// The contract at 0x1 is special. It was never deployed and therefore
@@ -87,30 +98,42 @@ impl EntryPoint {
 }
 
 impl StateCommitment {
-    /// Calculates  global state commitment by combining the storage and class
+    /// Calculates global state commitment by combining the storage and class
     /// commitment.
     ///
     /// See
     /// <https://github.com/starkware-libs/cairo-lang/blob/12ca9e91bbdc8a423c63280949c7e34382792067/src/starkware/starknet/core/os/state.cairo#L125>
     /// for details.
+    ///
+    /// Starting from Starknet 0.14.0, the state commitment always uses the
+    /// Poseidon hash formula, even when `class_commitment` is zero. For older
+    /// versions, when `class_commitment` is zero, the state commitment equals
+    /// the storage commitment directly.
     pub fn calculate(
         storage_commitment: StorageCommitment,
         class_commitment: ClassCommitment,
+        version: StarknetVersion,
     ) -> Self {
-        if class_commitment == ClassCommitment::ZERO {
-            Self(storage_commitment.0)
-        } else {
-            const GLOBAL_STATE_VERSION: Felt = felt_bytes!(b"STARKNET_STATE_V0");
-
-            StateCommitment(
-                pathfinder_crypto::hash::poseidon::poseidon_hash_many(&[
-                    GLOBAL_STATE_VERSION.into(),
-                    storage_commitment.0.into(),
-                    class_commitment.0.into(),
-                ])
-                .into(),
-            )
+        if class_commitment == ClassCommitment::ZERO
+            && storage_commitment == StorageCommitment::ZERO
+        {
+            return StateCommitment::ZERO;
         }
+
+        if class_commitment == ClassCommitment::ZERO && version < StarknetVersion::V_0_14_0 {
+            return Self(storage_commitment.0);
+        }
+
+        const GLOBAL_STATE_VERSION: Felt = felt_bytes!(b"STARKNET_STATE_V0");
+
+        StateCommitment(
+            pathfinder_crypto::hash::poseidon::poseidon_hash_many(&[
+                GLOBAL_STATE_VERSION.into(),
+                storage_commitment.0.into(),
+                class_commitment.0.into(),
+            ])
+            .into(),
+        )
     }
 }
 
@@ -342,6 +365,22 @@ impl<T> Dummy<T> for EthereumAddress {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SettlementLayerAddress {
+    Ethereum(EthereumAddress),
+    Starknet(ContractAddress),
+}
+
+impl<T> Dummy<T> for SettlementLayerAddress {
+    fn dummy_with_rng<R: rand::Rng + ?Sized>(_: &T, rng: &mut R) -> Self {
+        if rng.gen_bool(0.5) {
+            Self::Ethereum(EthereumAddress(H160::random_using(rng)))
+        } else {
+            Self::Starknet(Faker.fake_with_rng(rng))
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("expected slice length of 16 or less, got {0}")]
 pub struct FromSliceError(usize);
@@ -482,11 +521,30 @@ impl StarknetVersion {
         StarknetVersion(a, b, c, d)
     }
 
+    #[inline]
+    pub fn major(&self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    pub fn minor(&self) -> u8 {
+        self.1
+    }
+
+    #[inline]
+    pub fn patch(&self) -> u8 {
+        self.2
+    }
+
     pub const V_0_13_2: Self = Self::new(0, 13, 2, 0);
 
     // TODO: version at which block hash definition changes taken from
     // Starkware implementation but might yet change
     pub const V_0_13_4: Self = Self::new(0, 13, 4, 0);
+    // A version at which the state commitment formula changed to always use the
+    // Poseidon hash, even when `class_commitment` is zero.
+    pub const V_0_14_0: Self = Self::new(0, 14, 0, 0);
+    pub const V_0_14_1: Self = Self::new(0, 14, 1, 0);
 }
 
 impl FromStr for StarknetVersion {
@@ -550,6 +608,7 @@ macros::felt_newtypes!(
         L1ToL2MessagePayloadElem,
         L2ToL1MessagePayloadElem,
         PaymasterDataElem,
+        ProofFactElem,
         ProposalCommitment,
         PublicKey,
         SequencerAddress,
@@ -672,10 +731,38 @@ pub fn calculate_class_commitment_leaf_hash(
     )
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ConsensusInfo {
-    pub highest_decided_height: BlockNumber,
-    pub highest_decided_value: ProposalCommitment,
+/// A SNOS stwo proof, serialized as a base64-encoded byte string.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Proof(pub Vec<u8>);
+
+impl Proof {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl serde::Serialize for Proof {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&self.0);
+        serializer.serialize_str(&encoded)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Proof {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use base64::Engine;
+
+        let s = String::deserialize(deserializer)?;
+        if s.is_empty() {
+            return Ok(Proof::default());
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&s)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Proof(bytes))
+    }
 }
 
 #[cfg(test)]
@@ -739,5 +826,37 @@ mod tests {
             )),
         );
         assert_eq!(actual_contract_address, expected_contract_address);
+    }
+
+    mod proof_serde {
+        use super::super::Proof;
+
+        #[test]
+        fn round_trip() {
+            let proof = Proof(vec![0, 0, 0, 0, 0, 0, 0, 123, 0, 0, 1, 200]);
+            let json = serde_json::to_string(&proof).unwrap();
+            assert_eq!(json, r#""AAAAAAAAAHsAAAHI""#);
+            let deserialized: Proof = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, proof);
+        }
+
+        #[test]
+        fn empty_string_deserializes_to_default() {
+            let proof: Proof = serde_json::from_str(r#""""#).unwrap();
+            assert_eq!(proof, Proof::default());
+        }
+
+        #[test]
+        fn invalid_base64_returns_error() {
+            let result = serde_json::from_str::<Proof>(r#""not-valid-base64!@#""#);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn empty_proof_serializes_to_empty_string() {
+            let proof = Proof::default();
+            let json = serde_json::to_string(&proof).unwrap();
+            assert_eq!(json, r#""""#);
+        }
     }
 }

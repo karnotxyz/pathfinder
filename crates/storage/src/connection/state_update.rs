@@ -626,11 +626,23 @@ impl Transaction<'_> {
         contract_address: ContractAddress,
         key: StorageAddress,
     ) -> anyhow::Result<Option<StorageValue>> {
+        self.storage_value_with_block(block, contract_address, key)
+            .map(|opt_pair| opt_pair.map(|pair| pair.0))
+    }
+
+    pub fn storage_value_with_block(
+        &self,
+        block: BlockId,
+        contract_address: ContractAddress,
+        key: StorageAddress,
+    ) -> anyhow::Result<Option<(StorageValue, BlockNumber)>> {
+        let handle_row =
+            |row: &rusqlite::Row<'_>| Ok((row.get_storage_value(0)?, row.get_block_number(1)?));
         match block {
             BlockId::Latest => {
                 let mut stmt = self.inner().prepare_cached(
                     r"
-                    SELECT storage_value
+                    SELECT storage_value, block_number
                     FROM storage_updates
                     JOIN contract_addresses ON contract_addresses.id = storage_updates.contract_address_id
                     JOIN storage_addresses ON storage_addresses.id = storage_updates.storage_address_id
@@ -638,14 +650,12 @@ impl Transaction<'_> {
                     ORDER BY block_number DESC LIMIT 1
                     ",
                 )?;
-                stmt.query_row(params![&contract_address, &key], |row| {
-                    row.get_storage_value(0)
-                })
+                stmt.query_row(params![&contract_address, &key], handle_row)
             }
             BlockId::Number(number) => {
                 let mut stmt = self.inner().prepare_cached(
                     r"
-                    SELECT storage_value
+                    SELECT storage_value, block_number
                     FROM storage_updates
                     JOIN contract_addresses ON contract_addresses.id = storage_updates.contract_address_id
                     JOIN storage_addresses ON storage_addresses.id = storage_updates.storage_address_id
@@ -653,14 +663,12 @@ impl Transaction<'_> {
                     ORDER BY block_number DESC LIMIT 1
                     ",
                 )?;
-                stmt.query_row(params![&contract_address, &key, &number], |row| {
-                    row.get_storage_value(0)
-                })
+                stmt.query_row(params![&contract_address, &key, &number], handle_row)
             }
             BlockId::Hash(hash) => {
                 let mut stmt = self.inner().prepare_cached(
                     r"
-                    SELECT storage_value
+                    SELECT storage_value, block_number
                     FROM storage_updates
                     JOIN contract_addresses ON contract_addresses.id = storage_updates.contract_address_id
                     JOIN storage_addresses ON storage_addresses.id = storage_updates.storage_address_id
@@ -670,9 +678,7 @@ impl Transaction<'_> {
                     ORDER BY block_number DESC LIMIT 1
                     ",
                 )?;
-                stmt.query_row(params![&contract_address, &key, &hash], |row| {
-                    row.get_storage_value(0)
-                })
+                stmt.query_row(params![&contract_address, &key, &hash], handle_row)
             }
         }
         .optional()
@@ -1045,10 +1051,35 @@ impl Transaction<'_> {
         rows.collect::<Result<Vec<_>, _>>()
             .context("Iterating over reverse Sierra declarations")
     }
+
+    pub fn deployed_contracts(
+        &self,
+        sierra_hash: SierraHash,
+        block_number: BlockNumber,
+    ) -> anyhow::Result<Vec<ContractAddress>> {
+        let mut stmt = self
+            .inner()
+            .prepare_cached(r"SELECT contract_address FROM contract_updates WHERE class_hash = ? AND block_number = ?")
+            .context("Preparing deployed contracts query statement")?;
+
+        let rows = stmt
+            .query_map(params![&sierra_hash, &block_number], |row| {
+                row.get_contract_address(0)
+            })
+            .context("Querying deployed contracts")?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("Iterating over deployed contracts")
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use pathfinder_common::class_definition::{
+        SerializedCairoDefinition,
+        SerializedCasmDefinition,
+        SerializedSierraDefinition,
+    };
     use pathfinder_common::macro_prelude::*;
     use pathfinder_common::BlockHeader;
 
@@ -1077,7 +1108,8 @@ mod tests {
 
         let state_update = StateUpdate::default().with_declared_cairo_class(target_class);
 
-        tx.insert_cairo_class_definition(target_class, &[]).unwrap();
+        tx.insert_cairo_class_definition(target_class, &SerializedCairoDefinition::from_slice(&[]))
+            .unwrap();
         tx.insert_block_header(&header_0).unwrap();
         tx.insert_block_header(&header_1).unwrap();
         tx.insert_state_update(header_0.number, &state_update)
@@ -1131,10 +1163,16 @@ mod tests {
         let diff_3 = StateUpdate::default();
         let diff_4 = StateUpdate::default();
 
-        tx.insert_cairo_class_definition(original_class, definition)
-            .unwrap();
-        tx.insert_cairo_class_definition(replaced_class, definition)
-            .unwrap();
+        tx.insert_cairo_class_definition(
+            original_class,
+            &SerializedCairoDefinition::from_slice(definition),
+        )
+        .unwrap();
+        tx.insert_cairo_class_definition(
+            replaced_class,
+            &SerializedCairoDefinition::from_slice(definition),
+        )
+        .unwrap();
 
         tx.insert_block_header(&header_0).unwrap();
         tx.insert_block_header(&header_1).unwrap();
@@ -1216,15 +1254,21 @@ mod tests {
 
             // Submit the class definitions since this occurs out of band of the header and
             // state diff.
-            tx.insert_cairo_class_definition(CAIRO_HASH, b"cairo definition")
-                .unwrap();
-            tx.insert_cairo_class_definition(CAIRO_HASH2, b"cairo definition 2")
-                .unwrap();
+            tx.insert_cairo_class_definition(
+                CAIRO_HASH,
+                &SerializedCairoDefinition::from_slice(b"cairo definition"),
+            )
+            .unwrap();
+            tx.insert_cairo_class_definition(
+                CAIRO_HASH2,
+                &SerializedCairoDefinition::from_slice(b"cairo definition 2"),
+            )
+            .unwrap();
 
             tx.insert_sierra_class_definition(
                 &SIERRA_HASH,
-                b"sierra definition",
-                b"casm definition",
+                &SerializedSierraDefinition::from_slice(b"sierra definition"),
+                &SerializedCasmDefinition::from_slice(b"casm definition"),
                 &CASM_HASH_V2,
             )
             .unwrap();
@@ -1297,7 +1341,10 @@ mod tests {
                 .casm_definition_at(BlockId::Latest, ClassHash(SIERRA_HASH.0))
                 .unwrap()
                 .unwrap();
-            assert_eq!(definition, b"casm definition");
+            assert_eq!(
+                definition,
+                SerializedCasmDefinition::from_slice(b"casm definition")
+            );
 
             // non-existent state update
             let non_existent = tx.state_update((header.number + 1).into()).unwrap();

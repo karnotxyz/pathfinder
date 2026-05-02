@@ -204,7 +204,7 @@ pub(crate) fn find_l2_gas_limit_and_execute_transaction(
     let (gas_limit, output, saved_state) =
         match simulate_transaction(tx, tx_index, tx_executor, &revert_behavior) {
             Ok((output, saved_state)) => {
-                metrics::increment_counter!("rpc_fee_estimation.without_binary_search");
+                metrics::counter!("rpc_fee_estimation.without_binary_search").increment(1);
                 // If 110% of the actual transaction gas fee is enough, we use that
                 // as the estimate and skip the binary search.
                 let gas_limit = GasVector {
@@ -216,7 +216,7 @@ pub(crate) fn find_l2_gas_limit_and_execute_transaction(
             Err(TransactionSimulationError::OutOfGas(saved_state)) => {
                 tx_executor.block_state = Some(saved_state);
 
-                metrics::increment_counter!("rpc_fee_estimation.with_binary_search");
+                metrics::counter!("rpc_fee_estimation.with_binary_search").increment(1);
 
                 let mut lower_bound = GasAmount(l2_gas_consumed);
                 let mut upper_bound = max_l2_gas_limit;
@@ -259,7 +259,7 @@ pub(crate) fn find_l2_gas_limit_and_execute_transaction(
                     }
                 };
 
-                metrics::histogram!("rpc_fee_estimation.steps_to_converge", steps as f64);
+                metrics::histogram!("rpc_fee_estimation.steps_to_converge").record(steps as f64);
 
                 let gas_limit = GasVector {
                     l2_gas: current_l2_gas_limit,
@@ -273,13 +273,12 @@ pub(crate) fn find_l2_gas_limit_and_execute_transaction(
             }
         };
 
-    metrics::histogram!(
-        "rpc_fee_estimation.l2_gas_difference_between_limit_and_consumed",
+    metrics::histogram!("rpc_fee_estimation.l2_gas_difference_between_limit_and_consumed",).record(
         gas_limit
             .l2_gas
             .0
             .checked_sub(l2_gas_consumed)
-            .expect("l2_gas_limit > l2_gas_consumed") as f64
+            .expect("l2_gas_limit > l2_gas_consumed") as f64,
     );
 
     let output = if execution_flags.charge_fee && gas_limit.l2_gas > initial_l2_gas_limit {
@@ -633,12 +632,14 @@ fn get_max_l2_gas_amount_covered_by_balance(
 
             if balance > max_possible_fee_without_l2_gas.0.into() {
                 // The maximum amount of L2 gas that can be bought with the balance.
-                let max_amount = (balance - max_possible_fee_without_l2_gas.0)
-                    / initial_resource_bounds
-                        .l2_gas
-                        .max_price_per_unit
-                        .0
-                        .max(1u64.into());
+                // max_possible_fee = max_amount * (max_price + tip).
+                let effective_l2_price: u128 = initial_resource_bounds
+                    .l2_gas
+                    .max_price_per_unit
+                    .0
+                    .saturating_add(get_tip(tx).0.into())
+                    .max(1u64.into());
+                let max_amount = (balance - max_possible_fee_without_l2_gas.0) / effective_l2_price;
                 Ok(u64::try_from(max_amount).unwrap_or(u64::MAX).into())
             } else {
                 // Balance is less than committed L1 gas and L1 data gas, tx will fail

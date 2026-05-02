@@ -25,6 +25,8 @@ use pathfinder_common::class_definition::{
     Cairo,
     SelectorAndFunctionIndex,
     SelectorAndOffset,
+    SerializedCairoDefinition,
+    SerializedSierraDefinition,
     Sierra,
 };
 use pathfinder_common::event::Event;
@@ -56,6 +58,7 @@ use pathfinder_common::transaction::{
     Transaction,
     TransactionVariant,
 };
+use pathfinder_common::ProofFactElem;
 use pathfinder_crypto::Felt;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -286,6 +289,7 @@ impl ToDto<p2p_proto::sync::transaction::TransactionVariant> for TransactionVari
                     nonce_data_availability_mode: x.nonce_data_availability_mode.to_dto(),
                     fee_data_availability_mode: x.fee_data_availability_mode.to_dto(),
                     nonce: x.nonce.0,
+                    proof_facts: x.proof_facts.into_iter().map(|p| p.0).collect(),
                 },
             ),
             L1Handler(x) => p2p_proto::sync::transaction::TransactionVariant::L1HandlerV0(
@@ -683,6 +687,7 @@ impl TryFromDto<p2p_proto::sync::transaction::TransactionVariant> for Transactio
                     .collect(),
                 calldata: x.calldata.into_iter().map(CallParam).collect(),
                 sender_address: ContractAddress(x.sender.0),
+                proof_facts: x.proof_facts.into_iter().map(ProofFactElem).collect(),
             }),
             L1HandlerV0(x) => Self::L1Handler(L1HandlerTransaction {
                 contract_address: ContractAddress(x.address.0),
@@ -882,10 +887,7 @@ impl TryFromDto<p2p_proto::common::L1DataAvailabilityMode> for L1DataAvailabilit
     }
 }
 
-#[derive(Debug)]
-pub struct CairoDefinition(pub Vec<u8>);
-
-impl TryFromDto<p2p_proto::class::Cairo0Class> for CairoDefinition {
+impl TryFromDto<p2p_proto::class::Cairo0Class> for SerializedCairoDefinition {
     fn try_from_dto(dto: p2p_proto::class::Cairo0Class) -> anyhow::Result<Self> {
         #[derive(Debug, Serialize)]
         struct SelectorAndOffset {
@@ -952,13 +954,11 @@ impl TryFromDto<p2p_proto::class::Cairo0Class> for CairoDefinition {
         };
         let class_def =
             serde_json::to_vec(&class_def).context("serialize cairo class definition")?;
-        Ok(Self(class_def))
+        Ok(Self::from_bytes(class_def))
     }
 }
 
-pub struct SierraDefinition(pub Vec<u8>);
-
-impl TryFromDto<p2p_proto::class::Cairo1Class> for SierraDefinition {
+impl TryFromDto<p2p_proto::class::Cairo1Class> for SerializedSierraDefinition {
     fn try_from_dto(dto: p2p_proto::class::Cairo1Class) -> anyhow::Result<Self> {
         #[derive(Debug, Serialize)]
         pub struct SelectorAndFunctionIndex {
@@ -1017,7 +1017,7 @@ impl TryFromDto<p2p_proto::class::Cairo1Class> for SierraDefinition {
 
         let sierra = serde_json::to_vec(&sierra).context("serialize sierra class definition")?;
 
-        Ok(Self(sierra))
+        Ok(Self::from_bytes(sierra))
     }
 }
 

@@ -10,10 +10,24 @@ pub enum SequencerError {
     /// Errors directly coming from reqwest
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
+    /// Gateway request construction related errors
+    #[error("error constructing gateway request: {0}")]
+    GatewayRequestCreationError(#[from] GatewayRequestCreationError),
     /// Custom errors that we fiddled with because the original error was either
     /// not informative enough or bloated
     #[error("error decoding response body: invalid error variant")]
     InvalidStarknetErrorVariant,
+}
+
+/// Errors related to constructing a request to the gateway.
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayRequestCreationError {
+    /// Error when serializing the request body.
+    #[error(transparent)]
+    SerializationError(#[from] serde_json::Error),
+    /// Error when compressing the request body.
+    #[error(transparent)]
+    CompressionError(#[from] std::io::Error),
 }
 
 /// Used for deserializing specific Starknet sequencer error data.
@@ -117,6 +131,23 @@ pub enum KnownStarknetErrorCode {
     DuplicatedTransaction,
     #[serde(rename = "StarknetErrorCode.INVALID_CONTRACT_CLASS_VERSION")]
     InvalidContractClassVersion,
+    #[serde(rename = "StarknetErrorCode.INVALID_PROOF")]
+    InvalidProof,
+}
+
+/// Helper function which allows for easy creation of a response tuple
+/// that contains a [StarknetError] for a given
+/// [KnownStarknetErrorCode].
+///
+/// The `message` field is always an empty string.
+/// The HTTP status code for this response is always `500` (`Internal Server
+/// Error`).
+pub fn test_response_from(code: KnownStarknetErrorCode) -> (String, u16) {
+    let e = StarknetError {
+        code: code.into(),
+        message: "".to_string(),
+    };
+    (serde_json::to_string(&e).unwrap(), 500)
 }
 
 #[cfg(test)]

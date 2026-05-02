@@ -2,10 +2,180 @@
 
 All notable changes to this project will be documented in this file.
 
-More expansive patch notes and explanations may be found in the specific [pathfinder release notes](https://github.com/eqlabs/pathfinder/releases).
+More expansive patch notes and explanations may be found in the specific [pathfinder release notes](https://github.com/equilibriumco/pathfinder/releases).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.22.3-karnot.1] - 2026-05-02
+
+### Changed
+
+- Ported Karnot-specific Pathfinder compatibility changes onto upstream Pathfinder 0.22.3.
+
+## [0.22.3] - 2026-04-20
+
+### Changed
+
+- `starknet_getEvents` now returns `block_number` for events from pre-confirmed and pre-latest blocks.
+
+### Fixed
+
+- `starknet_estimateFee` and `starknet_simulateTransactions` rejecting transactions with a non-zero tip when the account balance could cover the fee. The maximum L2 gas bound now accounts for the tip, matching the blockifier's fee calculation (`max_amount * (max_price_per_unit + tip)`).
+
+## [0.22.2] - 2026-04-07
+
+### Changed
+
+- The `blockifier` and `starknet_api` crates have been upgraded to 0.18.0-rc.1.
+
+### Added
+
+- Blockifier libfunc list used for compilation verification is now defaulting to `audited` and configurable with the new `--blockifier.libfunc-list` CLI option.
+
+## [0.22.1] - 2026-03-31
+
+### Fixed
+
+- The running Bloom filter for block events is now correctly rebuilt after unexpected shutdowns when blockchain pruning is enabled.
+- Preconfirmed classes are not downloaded because `get_class_by_hash` for `pending` is now mapped to `latest`.
+
+### Changed
+
+- The `proof` field in broadcasted invoke v3 transactions is now a base64-encoded byte blob (`Vec<u8>`) instead of base64-encoded packed `u32` values (`Vec<u32>`). This reflects the upstream change to use compressed proofs.
+- The `blockifier` crate has been upgraded to 0.18.0-rc.1 (and its dependencies to match that).
+- HTTP request bodies for `add_invoke_transaction` are compressed with `gzip` if the transaction contains a nonempty proof. Compression can be disabled in custom networks using the `gateway.compress-requests` CLI flag.
+
+## [0.22.0] - 2026-03-19
+
+### Fixed
+
+- The pre-latest block (introduced in Starknet 0.14.0) is now reported with `PRE_CONFIRMED` finality
+  status instead of `ACCEPTED_ON_L2`. This aligns with the changes to block hash and commitment
+  calculation in Starknet 0.14.2, where the pre-latest block can no longer be treated as fully
+  accepted on L2. Affected RPC methods:
+  - `starknet_getTransactionReceipt`
+  - `starknet_getTransactionStatus`
+  - `starknet_subscribeEvents`
+  - `starknet_subscribeNewTransactionReceipts`
+  - `starknet_subscribeNewTransactions`
+  - `starknet_subscribeTransactionStatus`
+
+### Changed
+
+- The v10 JSON-RPC endpoint now supports final JSON-RPC v0.10.1 spec.
+- `blockifier` has been upgraded to 0.18.0-dev.1, ensuring correctness of execution results on Starknet 0.14.2.
+
+## [0.22.0-beta.3] - 2026-03-11
+
+### Fixed
+
+- `starknet_traceBlockTransactions` parameter `trace_flags` is not optional (as required by the spec).
+- Starknet 0.14.2 blocks are now using the correct versioned constants.
+
+### Changed
+
+- The `--ethereum.url` option now requires a WebSocket URL (`ws://` or `wss://`). HTTP/HTTPS URLs are no longer automatically converted to WebSocket and will result in an error.
+- The Pathfinder binary now has two subcommands:
+  - `node` - runs the Pathfinder node as before, serving JSON-RPC and syncing with the network.
+    This is the default subcommand and will run if no subcommand is passed.
+  - `compile` - compile a Sierra class (passed via `stdin`) to CASM (output to `stdout`).
+
+### Added
+
+- Forwarding gateway HTTP error 413 when handling `starknet_addDeclareTransaction`, `starknet_addDeployAccountTransaction` and `starknet_addInvokeTransaction`.
+- Two new CLI options for the `node` subcommand:
+  - `compiler.max-memory-usage-mib` - maximum memory usage for the compiler process, in MiB.
+  - `compiler.max-cpu-time-secs` - maximum (active) CPU time for the compiler process, in seconds.
+- Pathfinder is now polling for DNS changes for the feeder gateway and gateway host name. By default the host names are resolved every 60s and the HTTP client connection pool is re-created to force reconnecting to the new address. The interval is configurable with the new `--gateway.check-for-dns-updates-interval` CLI option.
+- `starknet_getStorageAt` now returns the last update block (in addition to storage value) if the `INCLUDE_LAST_UPDATE_BLOCK` flag was set in its input.
+- `starknet_getStateUpdate` now supports an address filter.
+
+## [0.22.0-beta.2] - 2026-02-16
+
+### Fixed
+
+- JSON-RPC serialization of `INITIAL_READS` is not compliant with the specification. Pathfinder returns `storage_key` properties for storage reads instead of the `key` property required by the spec.
+- `starknet_addInvokeTransaction` is not forwarding `proof_facts` property to the Starknet gateway.
+
+## [0.22.0-beta.1] - 2026-01-30
+
+### Added
+
+- Added support for the "return initial reads" feature introduced in JSON-RPC version 0.10.1:
+  - Added `RETURN_INITIAL_READS` flag to `starknet_simulateTransactions` input simulation flags.
+    Only supported if JSON-RPC version is 0.10.0 or higher.
+  - Added a `trace_flags` field to `starknet_traceBlockTransactions` input. Currently the only available flag is `RETURN_INITIAL_READS`.
+    Only supported if JSON-RPC version is V10 or higher.
+
+- Preliminary support for JSON-RPC 0.10.1 `proof_facts` and `proof` transaction properties.
+
+### Changed
+
+- `starknet_simulateTransactions` now has a different response format based on whether or not
+  the `RETURN_INITIAL_READS` flag was set in the input:
+  1. If the flag was not set, the response is identical to previous RPC versions (an array of transaction simulations).
+  2. If the flag was set, the response is an object with two fields:
+     - "simulated_transactions" - an array of transaction simulations (previous RPC version output).
+     - "initial_reads" - an `INITIAL_READS` object, containing an aggregate of all initial reads for the simulated transactions.
+
+- `starknet_traceBlockTransactions` now has a different response format based on whether or not
+  the `RETURN_INITIAL_READS` flag was set in the input:
+  1. If the flag was not set, the response is identical to previous RPC versions (an array of transaction traces).
+  2. If the flag was set, the response is an object with two fields:
+     - "traces" - an array of transaction traces (previous RPC version output).
+     - "initial_reads" - an `INITIAL_READS` object, containing an aggregate of all initial reads for the traced transactions.
+
+## [0.21.5] - 2026-01-12
+
+### Added
+
+- Support for `deflate`-compressed responses from the feeder gateway.
+
+### Fixed
+
+- Pathfinder stops syncing on networks where response compression has been enabled on the feeder gateway.
+
+## [0.21.4] - 2026-01-08
+
+### Added
+
+- Support for gzip-compressed responses from the feeder gateway.
+- The new `--rpc.native-execution-force-use-for-incompatible-classes` CLI option can be used to force use of native execution even for pre-1.7.0 Sierra classes (where fee calculation is known to be inaccurate). Use this flag at your own risk.
+
+### Changed
+
+- `blockifier` has been upgraded to 0.16.0-rc.3.
+
+## [0.21.3] - 2025-12-03
+
+### Added
+
+- The new histogram metric `rpc_method_calls_duration_milliseconds` has been added to expose JSON-RPC method call latency data.
+
+### Changed
+
+- `blockifier` has been upgraded to 0.16.0-rc.2.
+- Pathfinder no longer returns `event_commitment` and `transaction_commitment` values for Starknet blocks older than Starknet version 0.13.2.
+
+### Fixed
+
+- `starknet_traceTransaction` times out for some transactions because fetching transaction traces from the feeder gateway fails due to some unknown fields in the response.
+
+## [0.21.2] - 2025-11-27
+
+### Changed
+
+- Pathfinder now serves the JSON-RPC 0.10.0 API on the `v0_10` routes.
+- The size of the block trace cache is now configurable by the new `--rpc.block-trace-cache-size` CLI argument.
+
+## [0.21.1] - 2025-11-20
+
+### Fixed
+
+- Pathfinder exits after receiving an internal server error from the feeder gateway.
+- `starknet_estimateFee` and `starknet_simulateTransactions` fails if one of the transactions is using a class that has been declared by a simulated DECLARE transaction in the batch.
+- Cairo Native is not working correctly with Docker images published on Docker Hub due to a linker error.
 
 ## [0.21.0] - 2025-11-11
 
@@ -87,7 +257,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The default JSON-RPC listen address has been changed to the IPv6 wildcard address in our Docker images. This avoids problems on IPv6-enabled hosts where `localhost` resolves to `::1`.
 - The default JSON-RPC version (served on the '/' route) has been changed to v08.
 - JSON-RPC `starknet_estimateFee` and `starknet_simulateTransactions` now use non-strict nonce checking when using the `SKIP_VALIDATE` flag. That is, the nonce value needs to be larger than the last used value but no exact match is required.
-- `starknet_getTransactionStatus` now returns ACCEPTED_* only when that status is known locally, not when it's received from the gateway for an otherwise-unknown transaction.
+- `starknet_getTransactionStatus` now returns ACCEPTED\_\* only when that status is known locally, not when it's received from the gateway for an otherwise-unknown transaction.
 - value of the `--sync.poll-interval` command-line option can now specify fractional seconds
 
 ### Fixed
@@ -105,7 +275,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - All WebSocket API routes (served on `/ws`) are now deprecated and will be removed on the next release. Additionally, Pathfinder no longer supports `pathfinder_subscribe` and `pathfinder_unsubscribe` methods on these routes.
 - Some of the CLI options that are no longer needed have also been removed:
-
   - `rpc.websocket.buffer-capacity`
   - `rpc.websocket.topic-capacity`
 
@@ -122,14 +291,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Pathfinder now supports _syncing_ from Starknet 0.14.0. Support is still incomplete, execution and compilation of new classes will likely fail for new classes until a further upgrade.
 - Pathfinder now supports storing only the latest state of the blockchain history. This can be configured with the '--storage.blockchain-history' CLI option.
-
   - Accepted values are:
-
     - "archive" (default) – Full history of the blockchain is stored.
     - "N" – An integer specifying the number of historical blocks to store, in addition to the latest block (N + 1 blocks will be stored).
 
   - Affected JSON-RPC methods are:
-
     - `starknet_call`
     - `starknet_estimateFee`
     - `starknet_estimateMessageFee`
@@ -157,10 +323,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     b. The latest L2 block if it is behind the latest L1 checkpoint or no L1 checkpoints have been received by the node (practically unreachable)
 
 - `starknet_getTransactionStatus` now returns RECEIVED even when the gateway cannot find the transaction, provided the transaction was successfully sent by the responding node within the last 5 minutes.
-- Pathfinder now allows the users to configure the number of historical messages to be streamed via the [webscoket API](https://eqlabs.github.io/pathfinder/interacting-with-pathfinder/websocket-api). This can be done using the `--rpc.websocket.max-history` CLI option.
-
+- Pathfinder now allows the users to configure the number of historical messages to be streamed via the [webscoket API](https://equilibriumco.github.io/pathfinder/interacting-with-pathfinder/websocket-api). This can be done using the `--rpc.websocket.max-history` CLI option.
   - Accepted values are:
-
     - "unlimited" - All historical messages will be streamed.
     - "N" - An integer specifying the number of historical messages to be streamed.
 
@@ -209,7 +373,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `starknet_subscribeEvents` subscriptions stop sending notifications.
-- Broken aggregate bloom filter migration has been updated to work properly. If you migrated from a database running in archived mode, please [re-download our latest snapshot](https://eqlabs.github.io/pathfinder/database-snapshots) and re-run the migrations.
+- Broken aggregate bloom filter migration has been updated to work properly. If you migrated from a database running in archived mode, please [re-download our latest snapshot](https://equilibriumco.github.io/pathfinder/database-snapshots) and re-run the migrations.
 - `starknet_getStateUpdate` has `new_root` and `old_root` swapped.
 
 ### Changed
@@ -883,7 +1047,6 @@ Users should not use this version.
   - `cairo-lang` upgraded to 0.11.2a0
 - Subscription to `newHead` events via websocket using the method `pathfinder_subscribe_newHeads`, which can
   be managed by the following command line options
-
   - `rpc.websocket`, which enables websocket transport
   - `rpc.websocket.capacity`, which sets the maximum number of websocket subscriptions per subscription type
 
@@ -999,10 +1162,10 @@ Users should not use this version.
 
 ### Removed
 
-- `--config` configuration option (deprecated in [v0.4.1](https://github.com/eqlabs/pathfinder/releases/tag/v0.4.1))
-- `--integration` configuration option (deprecated in [v0.4.1](https://github.com/eqlabs/pathfinder/releases/tag/v0.4.1))
-- `--sequencer-url` configuration option (deprecated in [v0.4.1](https://github.com/eqlabs/pathfinder/releases/tag/v0.4.1))
-- `--testnet2` configuration option (deprecated in [v0.4.1](https://github.com/eqlabs/pathfinder/releases/tag/v0.4.1))
+- `--config` configuration option (deprecated in [v0.4.1](https://github.com/equilibriumco/pathfinder/releases/tag/v0.4.1))
+- `--integration` configuration option (deprecated in [v0.4.1](https://github.com/equilibriumco/pathfinder/releases/tag/v0.4.1))
+- `--sequencer-url` configuration option (deprecated in [v0.4.1](https://github.com/equilibriumco/pathfinder/releases/tag/v0.4.1))
+- `--testnet2` configuration option (deprecated in [v0.4.1](https://github.com/equilibriumco/pathfinder/releases/tag/v0.4.1))
 - `starknet_addDeployTransaction` as this is no longer an allowed transaction
 - RPC api version `0.1`, which used to be served on path `/rpc/v0.1`
 
@@ -1083,4 +1246,4 @@ Users should not use this version.
 
 ## Ancient History
 
-Older history may be found in the [pathfinder release notes](https://github.com/eqlabs/pathfinder/releases).
+Older history may be found in the [pathfinder release notes](https://github.com/equilibriumco/pathfinder/releases).

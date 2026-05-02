@@ -23,6 +23,7 @@ use p2p_proto::sync::transaction::{
     TransactionsRequest,
     TransactionsResponse,
 };
+use pathfinder_block_commitments::calculate_transaction_commitment;
 use pathfinder_block_hashes::BlockHashDb;
 use pathfinder_common::prelude::*;
 use pathfinder_common::receipt::Receipt;
@@ -32,11 +33,10 @@ use pathfinder_ethereum::EthereumStateUpdate;
 use pathfinder_storage::Storage;
 use primitive_types::H160;
 use serde_json::de;
-use starknet_gateway_client::{Client, GatewayApi};
+use starknet_gateway_client::{BlockId, Client, GatewayApi};
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::state::block_hash::calculate_transaction_commitment;
 use crate::sync::error::SyncError;
 use crate::sync::stream::{InfallibleSource, Source, SyncReceiver, SyncResult};
 use crate::sync::{class_definitions, events, headers, state_updates, transactions};
@@ -53,6 +53,8 @@ pub struct Sync<P, G> {
     pub chain_id: ChainId,
     pub public_key: PublicKey,
     pub verify_tree_hashes: bool,
+    pub compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    pub blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
     pub block_hash_db: Option<pathfinder_block_hashes::BlockHashDb>,
 }
 
@@ -78,6 +80,8 @@ where
         public_key: PublicKey,
         l1_anchor_override: Option<EthereumStateUpdate>,
         verify_tree_hashes: bool,
+        compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+        blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
         block_hash_db: Option<BlockHashDb>,
     ) -> Self {
         Self {
@@ -89,6 +93,8 @@ where
             chain_id,
             public_key,
             verify_tree_hashes,
+            compiler_resource_limits,
+            blockifier_libfuncs,
             block_hash_db,
         }
     }
@@ -101,8 +107,6 @@ where
         &self,
         checkpoint: EthereumStateUpdate,
     ) -> Result<(BlockNumber, BlockHash), SyncError> {
-        use pathfinder_ethereum::EthereumApi;
-
         let local_state = LocalState::from_db(self.storage.clone(), checkpoint)
             .await
             .context("Querying local state")?;
@@ -264,6 +268,8 @@ where
             class_stream,
             self.storage.clone(),
             self.fgw_client.clone(),
+            self.compiler_resource_limits,
+            self.blockifier_libfuncs,
             expected_declarations,
         )
         .await?;
@@ -373,6 +379,8 @@ async fn handle_class_stream<SequencerClient: GatewayApi + Clone + Send + 'stati
     class_definitions: impl Stream<Item = StreamItem<ClassDefinition>> + Send + 'static,
     storage: Storage,
     fgw: SequencerClient,
+    compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
     expected_declarations: impl Stream<Item = anyhow::Result<(BlockNumber, HashSet<ClassHash>)>>
         + Send
         + 'static,
@@ -399,6 +407,8 @@ async fn handle_class_stream<SequencerClient: GatewayApi + Clone + Send + 'stati
                 x,
                 fgw.clone(),
                 tokio::runtime::Handle::current(),
+                compiler_resource_limits,
+                blockifier_libfuncs,
             )
         })
         .and_then(|x| class_definitions::persist(storage.clone(), x))
@@ -1360,6 +1370,12 @@ mod tests {
         use fake::{Dummy, Fake, Faker};
         use futures::{stream, SinkExt};
         use p2p::libp2p::PeerId;
+        use pathfinder_common::class_definition::{
+            SerializedCairoDefinition,
+            SerializedCasmDefinition,
+            SerializedOpaqueClassDefinition,
+            SerializedSierraDefinition,
+        };
         use pathfinder_common::event::Event;
         use pathfinder_common::macro_prelude::*;
         use pathfinder_common::prelude::*;
@@ -1388,11 +1404,12 @@ mod tests {
 
         #[async_trait::async_trait]
         impl GatewayApi for FakeFgw {
-            async fn pending_casm_by_hash(
+            async fn casm_by_hash(
                 &self,
                 _: ClassHash,
-            ) -> Result<bytes::Bytes, SequencerError> {
-                Ok(bytes::Bytes::from_static(CASM2))
+                _: BlockId,
+            ) -> Result<SerializedCasmDefinition, SequencerError> {
+                Ok(SerializedCasmDefinition::from_slice(CASM2))
             }
         }
 
@@ -1430,7 +1447,7 @@ mod tests {
         struct Setup {
             pub streamed_classes: Vec<Result<PeerData<ClassDefinition>, anyhow::Error>>,
             pub declared_classes: DeclaredClasses,
-            pub expected_defs: HashMap<ClassHash, Vec<u8>>,
+            pub expected_defs: HashMap<ClassHash, SerializedOpaqueClassDefinition>,
             pub storage: Storage,
         }
 
@@ -1466,19 +1483,20 @@ mod tests {
                     fake_block(1, state_update1),
                 ];
 
-                blocks[1].cairo_defs = vec![(cairo_hash, CAIRO.to_vec())];
+                blocks[1].cairo_defs =
+                    vec![(cairo_hash, SerializedCairoDefinition::from_slice(CAIRO))];
                 blocks[1].sierra_defs = vec![
                     // Does not compile
                     (
                         sierra0_hash,
-                        SIERRA0.to_vec(),
+                        SerializedSierraDefinition::from_slice(SIERRA0),
                         Default::default(),
                         Default::default(),
                     ),
                     // Compiles just fine
                     (
                         sierra2_hash,
-                        SIERRA2.to_vec(),
+                        SerializedSierraDefinition::from_slice(SIERRA2),
                         Default::default(),
                         Default::default(),
                     ),
@@ -1487,17 +1505,17 @@ mod tests {
                 let streamed_classes = vec![
                     Ok(PeerData::for_tests(ClassDefinition::Cairo {
                         block_number: BlockNumber::GENESIS + 1,
-                        definition: CAIRO.to_vec(),
+                        definition: SerializedCairoDefinition::from_slice(CAIRO),
                         hash: cairo_hash,
                     })),
                     Ok(PeerData::for_tests(ClassDefinition::Sierra {
                         block_number: BlockNumber::GENESIS + 1,
-                        sierra_definition: SIERRA0.to_vec(),
+                        sierra_definition: SerializedSierraDefinition::from_slice(SIERRA0),
                         hash: sierra0_hash,
                     })),
                     Ok(PeerData::for_tests(ClassDefinition::Sierra {
                         block_number: BlockNumber::GENESIS + 1,
-                        sierra_definition: SIERRA2.to_vec(),
+                        sierra_definition: SerializedSierraDefinition::from_slice(SIERRA2),
                         hash: sierra2_hash,
                     })),
                 ];
@@ -1518,9 +1536,18 @@ mod tests {
                 ]);
 
                 let expected_defs = [
-                    (cairo_hash, CAIRO.to_vec()),
-                    (ClassHash(sierra0_hash.0), SIERRA0.to_vec()),
-                    (ClassHash(sierra2_hash.0), SIERRA2.to_vec()),
+                    (
+                        cairo_hash,
+                        SerializedOpaqueClassDefinition::from_slice(CAIRO),
+                    ),
+                    (
+                        ClassHash(sierra0_hash.0),
+                        SerializedOpaqueClassDefinition::from_slice(SIERRA0),
+                    ),
+                    (
+                        ClassHash(sierra2_hash.0),
+                        SerializedOpaqueClassDefinition::from_slice(SIERRA2),
+                    ),
                 ]
                 .into();
 
@@ -1550,6 +1577,8 @@ mod tests {
                 stream::iter(streamed_classes),
                 storage.clone(),
                 FakeFgw,
+                pathfinder_compiler::ResourceLimits::for_test(),
+                pathfinder_compiler::BlockifierLibfuncs::default(),
                 declared_classes.to_stream(),
             )
             .await
@@ -1563,12 +1592,13 @@ mod tests {
                     db.casm_definition(ClassHash(SIERRA0_HASH.0))
                         .unwrap()
                         .unwrap(),
-                    CASM2
+                    SerializedCasmDefinition::from_slice(CASM2)
                 );
                 assert!(serde_json::from_slice::<serde_json::Value>(
-                    &db.casm_definition(ClassHash(SIERRA2_HASH.0))
+                    db.casm_definition(ClassHash(SIERRA2_HASH.0))
                         .unwrap()
                         .unwrap()
+                        .as_bytes()
                 )
                 .unwrap()["compiler_version"]
                     .is_string());
@@ -1608,6 +1638,8 @@ mod tests {
                         stream::once(std::future::ready(Ok(data))),
                         storage,
                         FakeFgw,
+                        pathfinder_compiler::ResourceLimits::for_test(),
+                        pathfinder_compiler::BlockifierLibfuncs::default(),
                         Faker.fake::<DeclaredClasses>().to_stream(),
                     )
                     .await,
@@ -1639,6 +1671,8 @@ mod tests {
                         stream::iter(streamed_classes),
                         storage,
                         FakeFgw,
+                        pathfinder_compiler::ResourceLimits::for_test(),
+                        pathfinder_compiler::BlockifierLibfuncs::default(),
                         declared_classes.to_stream(),
                     )
                     .await,
@@ -1652,6 +1686,8 @@ mod tests {
                     stream::once(std::future::ready(Err(anyhow::anyhow!("")))),
                     StorageBuilder::in_memory().unwrap(),
                     FakeFgw,
+                    pathfinder_compiler::ResourceLimits::for_test(),
+                    pathfinder_compiler::BlockifierLibfuncs::default(),
                     Faker.fake::<DeclaredClasses>().to_stream(),
                 )
                 .await,
@@ -1665,6 +1701,7 @@ mod tests {
         use fake::{Fake, Faker};
         use futures::stream;
         use p2p::libp2p::PeerId;
+        use pathfinder_block_commitments::calculate_event_commitment;
         use pathfinder_common::event::Event;
         use pathfinder_common::transaction::TransactionVariant;
         use pathfinder_common::{StarknetVersion, TransactionHash};
@@ -1674,7 +1711,6 @@ mod tests {
 
         use super::super::handle_event_stream;
         use super::*;
-        use crate::state::block_hash::calculate_event_commitment;
 
         type TransactionInfo = (TransactionHash, TransactionIndex);
 

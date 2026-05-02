@@ -123,6 +123,7 @@ fn get_proposer_contract_address(
 pub fn get_validators_at_height(
     storage: &Storage,
     chain_id: ChainId,
+    is_l3: bool,
     height: u64,
 ) -> Result<Vec<ValidatorInfo>, ConsensusFetcherError> {
     let mut db_conn = storage
@@ -146,6 +147,7 @@ pub fn get_validators_at_height(
     // Create execution state for call
     let execution_state = ExecutionState::simulation(
         chain_id,
+        is_l3,
         header,
         None, // No pending state for this call
         L1BlobDataAvailability::Disabled,
@@ -153,6 +155,7 @@ pub fn get_validators_at_height(
         ContractAddress::ZERO, // ETH fee address (not used for calls)
         ContractAddress::ZERO, // STRK fee address (not used for calls)
         None,                  // No native class cache
+        false,                 // Don't force native execution for incompatible classes
     );
 
     // The entry point selector for get_validators_at_height
@@ -182,6 +185,7 @@ pub fn get_validators_at_height(
 pub fn get_proposers_at_height(
     storage: &Storage,
     chain_id: ChainId,
+    is_l3: bool,
     height: u64,
 ) -> Result<Vec<ProposerInfo>, ConsensusFetcherError> {
     let mut db_conn = storage
@@ -205,6 +209,7 @@ pub fn get_proposers_at_height(
     // Create execution state for call
     let execution_state = ExecutionState::simulation(
         chain_id,
+        is_l3,
         header,
         None, // No pending state for this call
         L1BlobDataAvailability::Disabled,
@@ -212,6 +217,7 @@ pub fn get_proposers_at_height(
         ContractAddress::ZERO, // ETH fee address (not used for calls)
         ContractAddress::ZERO, // STRK fee address (not used for calls)
         None,                  // No native class cache
+        false,                 // Don't force native execution for incompatible classes
     );
 
     // The entry point selector for get_proposers_at_height

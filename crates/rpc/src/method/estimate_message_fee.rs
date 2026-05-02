@@ -77,14 +77,14 @@ pub async fn estimate_message_fee(
             .context("Creating database transaction")?;
 
         let (header, pending) = match input.block_id {
-            BlockId::Pending => {
+            BlockId::PreConfirmed => {
                 let pending = context
                     .pending_data
                     .get(&db_tx, rpc_version)
                     .context("Querying pending data")?;
 
                 (
-                    pending.pending_header(),
+                    pending.pre_confirmed_header(),
                     Some(pending.aggregated_state_update()),
                 )
             }
@@ -111,6 +111,7 @@ pub async fn estimate_message_fee(
 
         let state = ExecutionState::simulation(
             context.chain_id,
+            context.is_l3,
             header,
             pending,
             L1BlobDataAvailability::Enabled,
@@ -118,6 +119,9 @@ pub async fn estimate_message_fee(
             context.contract_addresses.eth_l2_token_address,
             context.contract_addresses.strk_l2_token_address,
             context.native_class_cache,
+            context
+                .config
+                .native_execution_force_use_for_incompatible_classes,
         );
 
         let transaction = create_executor_transaction(input, context.chain_id)?;
@@ -266,6 +270,10 @@ impl From<EstimateMessageFeeError> for ApplicationError {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
+    use pathfinder_common::class_definition::{
+        SerializedCasmDefinition,
+        SerializedSierraDefinition,
+    };
     use pathfinder_common::macro_prelude::*;
     use pathfinder_common::prelude::*;
     use pathfinder_common::L1DataAvailabilityMode;
@@ -306,8 +314,8 @@ mod tests {
                 class_hash!("0x032908a85d43275f8509ba5f2acae88811b293463a3521dc05ab06d534b40848");
             tx.insert_sierra_class_definition(
                 &SierraHash(class_hash.0),
-                sierra_json,
-                casm_json,
+                &SerializedSierraDefinition::from_slice(sierra_json),
+                &SerializedCasmDefinition::from_slice(casm_json),
                 &casm_hash_bytes!(b"casm hash blake"),
             )
             .expect("insert class");

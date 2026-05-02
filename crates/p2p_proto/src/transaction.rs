@@ -5,11 +5,20 @@ use crate::class::Cairo1Class;
 use crate::common::{Address, Hash, VolitionDomain};
 use crate::{ToProtobuf, TryFromProtobuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, ToProtobuf, TryFromProtobuf, Dummy)]
+#[derive(Debug, Clone, PartialEq, Eq, ToProtobuf, TryFromProtobuf)]
 #[protobuf(name = "crate::proto::transaction::ResourceLimits")]
 pub struct ResourceLimits {
     pub max_amount: Felt,
     pub max_price_per_unit: Felt,
+}
+
+impl<T> Dummy<T> for ResourceLimits {
+    fn dummy_with_rng<R: rand::Rng + ?Sized>(_: &T, rng: &mut R) -> Self {
+        Self {
+            max_amount: Felt::from_u64(rng.gen()),
+            max_price_per_unit: Felt::from_u128(rng.gen()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToProtobuf, TryFromProtobuf, Dummy)]
@@ -71,6 +80,14 @@ pub struct InvokeV3 {
     pub nonce_data_availability_mode: VolitionDomain,
     pub fee_data_availability_mode: VolitionDomain,
     pub nonce: Felt,
+    pub proof_facts: Vec<Felt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToProtobuf, TryFromProtobuf, Dummy)]
+#[protobuf(name = "crate::proto::transaction::InvokeV3WithProof")]
+pub struct InvokeV3WithProof {
+    pub invoke: InvokeV3,
+    pub proof: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToProtobuf, TryFromProtobuf, Dummy)]

@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use pathfinder_common::class_definition::SerializedCasmDefinition;
 use pathfinder_common::ClassHash;
 use pathfinder_crypto::Felt;
 use rayon::prelude::*;
@@ -44,7 +45,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let definition = zstd::decode_all(definition.as_slice())
                 .map_err(|e| rusqlite::types::FromSqlError::Other(e.into()))
                 .unwrap();
-            let computed_hash = pathfinder_compiler::casm_class_hash_v2(&definition).unwrap();
+            let computed_hash = pathfinder_compiler::casm_class_hash_v2(
+                &SerializedCasmDefinition::from_bytes(definition),
+            )
+            .unwrap();
             println!(
                 "Computed CASM hash for class {:?}: {:x?}",
                 class_hash, computed_hash.0

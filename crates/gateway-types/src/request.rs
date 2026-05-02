@@ -8,7 +8,14 @@ pub mod add_transaction {
         SelectorAndOffset,
     };
     use pathfinder_common::prelude::*;
-    use pathfinder_common::{CallParam, ContractAddress, Fee, TransactionSignatureElem};
+    use pathfinder_common::{
+        CallParam,
+        ContractAddress,
+        Fee,
+        Proof,
+        ProofFactElem,
+        TransactionSignatureElem,
+    };
     use pathfinder_serde::{CallParamAsDecimalStr, TransactionSignatureElemAsDecimalStr};
     use serde_with::serde_as;
 
@@ -99,6 +106,15 @@ pub mod add_transaction {
         V3(InvokeFunctionV3),
     }
 
+    impl InvokeFunction {
+        pub fn is_proof_empty(&self) -> bool {
+            match self {
+                InvokeFunction::V0(_) | InvokeFunction::V1(_) => true,
+                InvokeFunction::V3(v3) => v3.proof.is_empty(),
+            }
+        }
+    }
+
     #[serde_as]
     #[derive(Debug, serde::Serialize)]
     pub struct InvokeFunctionV0V1 {
@@ -131,6 +147,10 @@ pub mod add_transaction {
         pub sender_address: ContractAddress,
         pub calldata: Vec<CallParam>,
         pub account_deployment_data: Vec<AccountDeploymentDataElem>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub proof_facts: Vec<ProofFactElem>,
+        #[serde(default, skip_serializing_if = "Proof::is_empty")]
+        pub proof: Proof,
     }
 
     /// Declare transaction details.

@@ -289,12 +289,6 @@ mod dto {
 
     #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
-    pub enum EventsForBlock {
-        V0 { events: Vec<Vec<Event>> },
-    }
-
-    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-    #[serde(deny_unknown_fields)]
     pub struct Event {
         pub data: Vec<MinimalFelt>,
         pub from_address: MinimalFelt,
@@ -660,12 +654,6 @@ mod dto {
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-    pub struct TransactionWithReceipt {
-        pub transaction: Transaction,
-        pub receipt: Receipt,
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub enum Transaction {
         V0 {
@@ -963,6 +951,9 @@ mod dto {
                     account_deployment_data,
                     calldata,
                     sender_address,
+                    // There can be _no_ proof_facts in storage for invoke transactions before this
+                    // migration has been performed.
+                    proof_facts: _,
                 }) => Self::V0 {
                     hash: transaction_hash.as_inner().to_owned().into(),
                     variant: TransactionVariantV0::InvokeV3(self::InvokeTransactionV3 {
@@ -1322,6 +1313,7 @@ mod dto {
                             .collect(),
                         calldata: calldata.into_iter().map(|x| CallParam(x.into())).collect(),
                         sender_address: ContractAddress::new_or_panic(sender_address.into()),
+                        proof_facts: vec![],
                     },
                 ),
                 Transaction::V0 {
@@ -2166,6 +2158,9 @@ pub(crate) mod old_dto {
                     account_deployment_data,
                     calldata,
                     sender_address,
+                    // There can be _no_ proof_facts in storage for invoke transactions before this
+                    // migration has been performed.
+                    proof_facts: _,
                 }) => Self::Invoke(InvokeTransaction::V3(self::InvokeTransactionV3 {
                     nonce,
                     nonce_data_availability_mode: nonce_data_availability_mode.into(),
@@ -2432,6 +2427,7 @@ pub(crate) mod old_dto {
                         account_deployment_data,
                         calldata,
                         sender_address,
+                        proof_facts: vec![],
                     },
                 ),
                 Transaction::L1Handler(L1HandlerTransaction {
@@ -2887,13 +2883,5 @@ pub(crate) mod old_dto {
         pub calldata: Vec<CallParam>,
         pub transaction_hash: TransactionHash,
         pub version: TransactionVersion,
-    }
-
-    /// Describes L2 transaction failure details.
-    #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-    #[serde(deny_unknown_fields)]
-    pub struct Failure {
-        pub code: String,
-        pub error_message: String,
     }
 }

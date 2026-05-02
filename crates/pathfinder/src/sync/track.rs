@@ -40,6 +40,8 @@ pub struct Sync<L, P> {
     pub public_key: PublicKey,
     pub block_hash_db: Option<pathfinder_block_hashes::BlockHashDb>,
     pub verify_tree_hashes: bool,
+    pub compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    pub blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
 }
 
 impl<L, P> Sync<L, P> {
@@ -125,7 +127,12 @@ impl<L, P> Sync<L, P> {
         .pipe(class_definitions::VerifyLayout, 10)
         .pipe(class_definitions::VerifyHash, 10)
         .pipe(
-            class_definitions::CompileSierraToCasm::new(fgw, tokio::runtime::Handle::current()),
+            class_definitions::CompileSierraToCasm::new(
+                fgw,
+                tokio::runtime::Handle::current(),
+                self.compiler_resource_limits,
+                self.blockifier_libfuncs,
+            ),
             10,
         )
         .pipe(
@@ -810,7 +817,11 @@ impl ProcessStage for StoreBlock {
         .with_context(|| format!("Updating Starknet state, block_number {block_number}"))?;
 
         // Ensure that roots match.
-        let state_commitment = StateCommitment::calculate(storage_commitment, class_commitment);
+        let state_commitment = StateCommitment::calculate(
+            storage_commitment,
+            class_commitment,
+            header.starknet_version,
+        );
         let expected_state_commitment = header.state_commitment;
         if state_commitment != expected_state_commitment {
             tracing::debug!(

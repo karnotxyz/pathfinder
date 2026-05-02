@@ -106,7 +106,7 @@ pub async fn fetch_proposers(
     let span = tracing::Span::current();
     let proposers = util::task::spawn_blocking(move |_| {
         let _g = span.enter();
-        consensus_fetcher::get_proposers_at_height(&context.storage, context.chain_id, input.height)
+        consensus_fetcher::get_proposers_at_height(&context.storage, context.chain_id, context.is_l3, input.height)
     })
     .await
     .context("Database read panic or shutting down")?

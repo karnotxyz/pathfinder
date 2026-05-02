@@ -6,7 +6,7 @@ edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }
 description = "Pathfinder's class hash computation and verification"
-repository = "https://github.com/eqlabs/pathfinder"
+repository = "https://github.com/equilibriumco/pathfinder"
 keywords = ["starknet", "ethereum", "web3", "cryptography", "hash"]
 categories = [
     "cryptography",
@@ -17,14 +17,11 @@ categories = [
 
 [dependencies]
 anyhow = { workspace = true }
-pathfinder-common = { version = "0.21.0", path = "../common" }
-pathfinder-crypto = { version = "0.21.0", path = "../crypto" }
+pathfinder-common = { version = "0.22.3", path = "../common" }
+pathfinder-crypto = { version = "0.22.3", path = "../crypto" }
 primitive-types = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = [
-    "arbitrary_precision",
-    "raw_value",
-] }
+serde_json = { workspace = true, features = ["arbitrary_precision", "raw_value"] }
 serde_with = { workspace = true }
 sha3 = { workspace = true }
 thiserror = { workspace = true }

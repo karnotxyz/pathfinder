@@ -69,8 +69,8 @@ impl RpcSubscriptionFlow for SubscribeNewHeads {
     ) -> Result<CatchUp<Self::Notification>, RpcError> {
         let storage = state.storage.clone();
         let headers = util::task::spawn_blocking(move |_| -> Result<_, RpcError> {
-            let mut conn = storage.connection().map_err(RpcError::InternalError)?;
-            let db = conn.transaction().map_err(RpcError::InternalError)?;
+            let mut conn = storage.connection()?;
+            let db = conn.transaction()?;
             db.block_range(from, to).map_err(RpcError::InternalError)
         })
         .await

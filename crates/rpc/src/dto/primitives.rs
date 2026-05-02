@@ -241,6 +241,18 @@ mod numerics {
             serializer.serialize_u64(self.get())
         }
     }
+
+    impl SerializeForVersion for f32 {
+        fn serialize(&self, serializer: Serializer) -> Result<dto::Ok, dto::Error> {
+            serializer.serialize_f32(*self)
+        }
+    }
+
+    impl SerializeForVersion for f64 {
+        fn serialize(&self, serializer: Serializer) -> Result<dto::Ok, dto::Error> {
+            serializer.serialize_f64(*self)
+        }
+    }
 }
 
 mod strings {
@@ -723,6 +735,12 @@ mod pathfinder_common_types {
         }
     }
 
+    impl SerializeForVersion for pathfinder_common::StateDiffCommitment {
+        fn serialize(&self, serializer: Serializer) -> Result<crate::dto::Ok, crate::dto::Error> {
+            serializer.serialize_str(&hex_str::bytes_to_hex_str_stripped(self.0.as_be_bytes()))
+        }
+    }
+
     impl SerializeForVersion for pathfinder_common::StorageAddress {
         fn serialize(&self, serializer: Serializer) -> Result<dto::Ok, dto::Error> {
             serializer.serialize_str(&hex_str::bytes_to_hex_str_stripped(self.0.as_be_bytes()))
@@ -800,6 +818,21 @@ mod pathfinder_common_types {
     impl SerializeForVersion for &pathfinder_common::PaymasterDataElem {
         fn serialize(&self, serializer: Serializer) -> Result<crate::dto::Ok, crate::dto::Error> {
             serializer.serialize_str(&hex_str::bytes_to_hex_str_stripped(self.0.as_be_bytes()))
+        }
+    }
+
+    impl SerializeForVersion for &pathfinder_common::ProofFactElem {
+        fn serialize(&self, serializer: Serializer) -> Result<crate::dto::Ok, crate::dto::Error> {
+            serializer.serialize_str(&hex_str::bytes_to_hex_str_stripped(self.0.as_be_bytes()))
+        }
+    }
+
+    impl SerializeForVersion for &pathfinder_common::Proof {
+        fn serialize(&self, serializer: Serializer) -> Result<crate::dto::Ok, crate::dto::Error> {
+            use base64::Engine;
+
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&self.0);
+            serializer.serialize_str(&encoded)
         }
     }
 }

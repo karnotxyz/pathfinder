@@ -10,13 +10,21 @@ use p2p::sync::client::types::ClassDefinition as P2PClassDefinition;
 use p2p::PeerData;
 use p2p_proto::transaction;
 use pathfinder_class_hash::from_parts::{compute_cairo_class_hash, compute_sierra_class_hash};
-use pathfinder_common::class_definition::{Cairo, ClassDefinition as GwClassDefinition, Sierra};
+use pathfinder_common::class_definition::{
+    Cairo,
+    ClassDefinition as GwClassDefinition,
+    SerializedCairoDefinition,
+    SerializedCasmDefinition,
+    SerializedClassDefinition,
+    SerializedSierraDefinition,
+    Sierra,
+};
 use pathfinder_common::state_update::DeclaredClasses;
 use pathfinder_common::{BlockNumber, CasmHash, ClassHash, SierraHash};
 use pathfinder_storage::{Storage, Transaction};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::de;
-use starknet_gateway_client::GatewayApi;
+use starknet_gateway_client::{BlockId, GatewayApi};
 use starknet_gateway_types::error::SequencerError;
 use starknet_gateway_types::reply::call;
 use tokio::sync::mpsc::{self, Receiver};
@@ -30,22 +38,16 @@ use crate::sync::stream::ProcessStage;
 #[derive(Debug)]
 pub struct ClassWithLayout {
     pub block_number: BlockNumber,
-    pub definition: ClassDefinition,
+    pub definition: SerializedClassDefinition,
     pub layout: GwClassDefinition<'static>,
     pub hash: ClassHash,
-}
-
-#[derive(Debug)]
-pub(super) enum ClassDefinition {
-    Cairo(Vec<u8>),
-    Sierra(Vec<u8>),
 }
 
 #[derive(Debug)]
 pub struct Class {
     pub block_number: BlockNumber,
     pub hash: ClassHash,
-    pub definition: ClassDefinition,
+    pub definition: SerializedClassDefinition,
 }
 
 #[derive(Debug)]
@@ -57,10 +59,10 @@ pub struct CompiledClass {
 
 #[derive(Debug)]
 pub enum CompiledClassDefinition {
-    Cairo(Vec<u8>),
+    Cairo(SerializedCairoDefinition),
     Sierra {
-        sierra_definition: Vec<u8>,
-        casm_definition: Vec<u8>,
+        sierra_definition: SerializedSierraDefinition,
+        casm_definition: SerializedCasmDefinition,
         casm_hash_v2: CasmHash,
     },
 }
@@ -143,14 +145,14 @@ fn verify_layout_impl(
             hash,
         } => {
             let layout = GwClassDefinition::Cairo(
-                serde_json::from_slice::<Cairo<'_>>(&definition).map_err(|error| {
+                serde_json::from_slice::<Cairo<'_>>(definition.as_bytes()).map_err(|error| {
                     tracing::debug!(%peer, %block_number, %error, "Bad class layout");
                     SyncError::BadClassLayout(*peer)
                 })?,
             );
             Ok(ClassWithLayout {
                 block_number,
-                definition: ClassDefinition::Cairo(definition),
+                definition: SerializedClassDefinition::Cairo(definition),
                 layout,
                 hash,
             })
@@ -161,14 +163,16 @@ fn verify_layout_impl(
             hash,
         } => {
             let layout = GwClassDefinition::Sierra(
-                serde_json::from_slice::<Sierra<'_>>(&sierra_definition).map_err(|error| {
-                    tracing::debug!(%peer, %block_number, %error, "Bad class layout");
-                    SyncError::BadClassLayout(*peer)
-                })?,
+                serde_json::from_slice::<Sierra<'_>>(sierra_definition.as_bytes()).map_err(
+                    |error| {
+                        tracing::debug!(%peer, %block_number, %error, "Bad class layout");
+                        SyncError::BadClassLayout(*peer)
+                    },
+                )?,
             );
             Ok(ClassWithLayout {
                 block_number,
-                definition: ClassDefinition::Sierra(sierra_definition),
+                definition: SerializedClassDefinition::Sierra(sierra_definition),
                 layout,
                 hash: ClassHash(hash.0),
             })
@@ -416,11 +420,23 @@ pub(super) fn expected_declarations_stream(
 pub struct CompileSierraToCasm<T> {
     fgw: T,
     tokio_handle: tokio::runtime::Handle,
+    compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
 }
 
 impl<T> CompileSierraToCasm<T> {
-    pub fn new(fgw: T, tokio_handle: tokio::runtime::Handle) -> Self {
-        Self { fgw, tokio_handle }
+    pub fn new(
+        fgw: T,
+        tokio_handle: tokio::runtime::Handle,
+        compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+        blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
+    ) -> Self {
+        Self {
+            fgw,
+            tokio_handle,
+            compiler_resource_limits,
+            blockifier_libfuncs,
+        }
     }
 }
 
@@ -434,7 +450,13 @@ impl<T: GatewayApi + Clone + Send + 'static> ProcessStage for CompileSierraToCas
         input
             .into_par_iter()
             .map(|class| {
-                let compiled = compile_or_fetch_impl(class, &self.fgw, &self.tokio_handle)?;
+                let compiled = compile_or_fetch_impl(
+                    class,
+                    &self.fgw,
+                    &self.tokio_handle,
+                    self.compiler_resource_limits,
+                    self.blockifier_libfuncs,
+                )?;
                 Ok(compiled)
             })
             .collect::<Result<Vec<CompiledClass>, SyncError>>()
@@ -447,6 +469,8 @@ pub(super) async fn compile_sierra_to_casm_or_fetch<
     peer_data: Vec<PeerData<Class>>,
     fgw: SequencerClient,
     tokio_handle: tokio::runtime::Handle,
+    compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
 ) -> Result<Vec<PeerData<CompiledClass>>, SyncError> {
     use rayon::prelude::*;
     let (tx, rx) = oneshot::channel();
@@ -455,7 +479,13 @@ pub(super) async fn compile_sierra_to_casm_or_fetch<
             .into_par_iter()
             .map(|x| {
                 let PeerData { peer, data } = x;
-                let compiled = compile_or_fetch_impl(data, &fgw, &tokio_handle)?;
+                let compiled = compile_or_fetch_impl(
+                    data,
+                    &fgw,
+                    &tokio_handle,
+                    compiler_resource_limits,
+                    blockifier_libfuncs,
+                )?;
                 Ok(PeerData::new(peer, compiled))
             })
             .collect::<Result<Vec<PeerData<CompiledClass>>, SyncError>>();
@@ -468,6 +498,8 @@ fn compile_or_fetch_impl<SequencerClient: GatewayApi + Clone + Send + 'static>(
     class: Class,
     fgw: &SequencerClient,
     tokio_handle: &tokio::runtime::Handle,
+    compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
 ) -> Result<CompiledClass, SyncError> {
     let Class {
         block_number,
@@ -476,10 +508,14 @@ fn compile_or_fetch_impl<SequencerClient: GatewayApi + Clone + Send + 'static>(
     } = class;
 
     let definition = match definition {
-        ClassDefinition::Cairo(c) => CompiledClassDefinition::Cairo(c),
-        ClassDefinition::Sierra(sierra_definition) => {
-            let casm_definition = pathfinder_compiler::compile_to_casm(&sierra_definition)
-                .context("Compiling Sierra class");
+        SerializedClassDefinition::Cairo(c) => CompiledClassDefinition::Cairo(c),
+        SerializedClassDefinition::Sierra(sierra_definition) => {
+            let casm_definition = pathfinder_compiler::compile_sierra_to_casm(
+                &sierra_definition,
+                compiler_resource_limits,
+                blockifier_libfuncs,
+            )
+            .context("Compiling Sierra class");
 
             let casm_definition = match casm_definition {
                 Ok(x) => x,
@@ -487,12 +523,11 @@ fn compile_or_fetch_impl<SequencerClient: GatewayApi + Clone + Send + 'static>(
                 // that the class is declared and exists so if the gateway responds with an
                 // error we should restart the sync and retry later.
                 Err(_) => tokio_handle
-                    .block_on(fgw.pending_casm_by_hash(hash))
+                    .block_on(fgw.casm_by_hash(hash, BlockId::Latest))
                     .map_err(|error| {
                         tracing::debug!(%block_number, class_hash=%hash, %error, "Fetching casm from feeder gateway failed");
                         SyncError::FetchingCasmFailed
-                    })?
-                    .to_vec(),
+                    })?,
             };
 
             let casm_hash_v2 = pathfinder_casm_hashes::get_precomputed_casm_v2_hash(&hash);

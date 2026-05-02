@@ -3,6 +3,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use futures::{StreamExt, TryStreamExt};
+use pathfinder_block_commitments::{
+    calculate_event_commitment,
+    calculate_receipt_commitment,
+    calculate_transaction_commitment,
+    header_from_gateway_block,
+    verify_block_hash,
+};
 use pathfinder_common::prelude::*;
 use pathfinder_common::state_update::{ContractClassUpdate, StateUpdateData};
 use pathfinder_common::Chain;
@@ -10,18 +17,12 @@ use pathfinder_storage::Storage;
 use starknet_gateway_client::GatewayApi;
 use starknet_gateway_types::error::SequencerError;
 use starknet_gateway_types::reply::{Block, BlockSignature, Status};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::Instrument;
 
-use crate::state::block_hash::{
-    calculate_event_commitment,
-    calculate_receipt_commitment,
-    calculate_transaction_commitment,
-    header_from_gateway_block,
-    verify_block_hash,
-};
 use crate::state::sync::class::{download_class, DownloadedClass};
 use crate::state::sync::SyncEvent;
+use crate::{ConsensusChannels, SyncMessageToConsensus};
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Timings {
@@ -91,6 +92,8 @@ pub struct L2SyncContext<GatewayClient> {
     pub block_validation_mode: BlockValidationMode,
     pub storage: Storage,
     pub sequencer_public_key: PublicKey,
+    pub compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    pub blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
     pub fetch_concurrency: std::num::NonZeroUsize,
     pub fetch_casm_from_fgw: bool,
 }
@@ -100,7 +103,7 @@ pub async fn sync<GatewayClient>(
     context: L2SyncContext<GatewayClient>,
     mut head: Option<(BlockNumber, BlockHash, StateCommitment)>,
     mut blocks: BlockChain,
-    mut latest: tokio::sync::watch::Receiver<(BlockNumber, BlockHash)>,
+    mut latest: watch::Receiver<(BlockNumber, BlockHash)>,
 ) -> anyhow::Result<()>
 where
     GatewayClient: GatewayApi + Clone + Send + 'static,
@@ -123,6 +126,8 @@ where
         block_validation_mode,
         storage,
         sequencer_public_key,
+        compiler_resource_limits,
+        blockifier_libfuncs,
         fetch_concurrency: _,
         fetch_casm_from_fgw,
     } = context;
@@ -234,6 +239,8 @@ where
             &state_update,
             &sequencer,
             storage.clone(),
+            compiler_resource_limits,
+            blockifier_libfuncs,
             fetch_casm_from_fgw,
         )
         .await
@@ -330,7 +337,348 @@ where
         };
 
         tx_event
-            .send(SyncEvent::Block(
+            .send(SyncEvent::DownloadedBlock(
+                (block, commitments),
+                state_update,
+                Box::new(signature),
+                Box::new(state_diff_commitment),
+                timings,
+            ))
+            .await
+            .context("Event channel closed")?;
+    }
+}
+
+/// Same as [sync] with the key differences being:
+///   - has no bulk sync phase (PoC for consensus sync, keeping it as simple as
+///     possible)
+///   - interacts with consensus via [ConsensusChannels]
+pub async fn consensus_sync<GatewayClient>(
+    tx_event: mpsc::Sender<SyncEvent>,
+    consensus_channels: Option<ConsensusChannels>,
+    context: L2SyncContext<GatewayClient>,
+    mut head: Option<(BlockNumber, BlockHash, StateCommitment)>,
+    mut blocks: BlockChain,
+    mut latest: watch::Receiver<(BlockNumber, BlockHash)>,
+) -> anyhow::Result<()>
+where
+    GatewayClient: GatewayApi + Clone + Send + 'static,
+{
+    let L2SyncContext {
+        sequencer,
+        chain,
+        chain_id,
+        block_validation_mode,
+        storage,
+        sequencer_public_key,
+        compiler_resource_limits,
+        blockifier_libfuncs,
+        fetch_concurrency: _,
+        fetch_casm_from_fgw,
+    } = context;
+
+    let ConsensusChannels {
+        mut consensus_info_watch,
+        sync_to_consensus_tx,
+    } = consensus_channels
+        .expect("In consensus-aware L2 sync, consensus channels are always provided");
+
+    // In case of a freshly bootstrapped network both watched values will not be
+    // available, so we wait for either to yield a value to avoid busy-looping
+    // in the loop below.
+    let consensus_watch_fut = consensus_info_watch.wait_for(|info| info.highest_decision.is_some());
+    let fgw_watch_fut = latest.wait_for(|(number, hash)| {
+        // The watch does not wrap the missing value in an Option, because we want to
+        // avoid runtime checks in production sync (which is FGw only at the moment and
+        // assumes that the watch is always initialized with a valid value).
+        if number == &BlockNumber::GENESIS {
+            // Zero hash indicates an uninitialized watch
+            hash != &BlockHash::ZERO
+        } else {
+            true
+        }
+    });
+
+    tokio::select! {
+        biased;
+
+        _ = consensus_watch_fut => {}
+        _ = fgw_watch_fut => {}
+    }
+
+    // Start polling head of chain
+    'outer: loop {
+        // Get the next block from L2.
+        let (next, head_meta) = match &head {
+            Some(head) => (head.0 + 1, Some(head)),
+            None => (BlockNumber::GENESIS, None),
+        };
+
+        // Check if the Consensus engine has already committed this block
+        // to avoid redundant downloads.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request = SyncMessageToConsensus::GetConsensusFinalizedBlock {
+            number: next,
+            reply: tx,
+        };
+        sync_to_consensus_tx
+            .send(request)
+            .await
+            .context("Requesting committed block")?;
+
+        let reply = rx
+            .await
+            .context("Receiving committed block from consensus")?;
+
+        // IMPORTANT
+        // A race condition can occur in fast local networks:
+        // - Alice (the proposer) commits H
+        // - FGw uses Alice's DB directly, so it also serves H immediately
+        // - Bob hasn't committed H yet, he executed the proposal at H and voted on it,
+        //   but his internal consensus engine hasn't communicated the positive decision
+        //   yet, so he asks for the block from FGw
+        // - Bob downloads H from FGw, even though he will shortly have a confirmation
+        //   that he can commit the locally executed proposal at H.
+        if let Some(l2_block) = reply {
+            tracing::debug!("Block {next} already committed in consensus, skipping download");
+
+            let (state_tries_updated_tx, rx) = tokio::sync::oneshot::channel();
+
+            tx_event
+                .send(SyncEvent::FinalizedConsensusBlock {
+                    l2_block,
+                    state_tries_updated_tx,
+                })
+                .await
+                .context("Event channel closed")?;
+
+            let (block_hash, state_commitment) = rx
+                .await
+                .context("Waiting for state tries to be updated in consumer")?;
+
+            head = Some((next, block_hash, state_commitment));
+            blocks.push(next, block_hash, state_commitment);
+
+            continue 'outer;
+        }
+
+        tracing::debug!("Downloading block {next} from sequencer");
+
+        // We start downloading the signature for the block
+        let signature_handle = util::task::spawn({
+            let sequencer = sequencer.clone();
+            async move {
+                let t_signature = std::time::Instant::now();
+                let result = sequencer.signature(next.into()).await;
+                let t_signature = t_signature.elapsed();
+
+                Ok((result, t_signature))
+            }
+        });
+
+        let t_block = std::time::Instant::now();
+
+        let (block, commitments, state_update, state_diff_commitment) = loop {
+            match download_block(
+                next,
+                chain,
+                chain_id,
+                head_meta.map(|h| h.1),
+                &sequencer,
+                &blocks,
+                block_validation_mode,
+            )
+            .await?
+            {
+                DownloadBlock::Block(block, commitments, state_update, state_diff_commitment) => {
+                    break (block, commitments, state_update, state_diff_commitment)
+                }
+                DownloadBlock::Wait => {
+                    let fgw_fut = latest.wait_for(|(_, hash)| hash != &head.unwrap_or_default().1);
+                    let consensus_fut = consensus_info_watch.changed();
+
+                    tokio::select! {
+                        biased;
+
+                        res = consensus_fut => {
+                            match res {
+                                Ok(_) => continue 'outer,
+                                Err(_) => {
+                                    tracing::debug!("Consensus info watch closed, exiting");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        res = fgw_fut => {
+                            if res.is_err() {
+                                tracing::debug!("Feeder gateway latest watch closed, exiting");
+                                return Ok(());
+                            }
+                            // Otherwise we just retry downloading the block
+                        }
+                    }
+                }
+                DownloadBlock::Retry => {
+                    // Now try from consensus, and then retry downloading from the FGw
+                    continue 'outer;
+                }
+                DownloadBlock::Reorg => {
+                    head = match head {
+                        Some(some_head) => reorg(
+                            &some_head,
+                            chain,
+                            chain_id,
+                            &tx_event,
+                            &sequencer,
+                            &blocks,
+                            block_validation_mode,
+                        )
+                        .await
+                        .context("L2 reorg")?,
+                        None => None,
+                    };
+
+                    match &head {
+                        Some((number, hash, commitment)) => {
+                            blocks.push(*number, *hash, *commitment)
+                        }
+                        None => blocks.reset_to_genesis(),
+                    }
+
+                    continue 'outer;
+                }
+            }
+        };
+        let t_block = t_block.elapsed();
+
+        if let Some(some_head) = &head {
+            if some_head.1 != block.parent_block_hash {
+                head = reorg(
+                    some_head,
+                    chain,
+                    chain_id,
+                    &tx_event,
+                    &sequencer,
+                    &blocks,
+                    block_validation_mode,
+                )
+                .await
+                .context("L2 reorg")?;
+
+                match &head {
+                    Some((number, hash, commitment)) => blocks.push(*number, *hash, *commitment),
+                    None => blocks.reset_to_genesis(),
+                }
+
+                continue 'outer;
+            }
+        }
+
+        // Download and emit newly declared classes.
+        let t_declare = std::time::Instant::now();
+        let downloaded_classes = download_new_classes(
+            &state_update,
+            &sequencer,
+            storage.clone(),
+            compiler_resource_limits,
+            blockifier_libfuncs,
+            fetch_casm_from_fgw,
+        )
+        .await
+        .with_context(|| format!("Handling newly declared classes for block {next:?}"))?;
+        emit_events_for_downloaded_classes(
+            &tx_event,
+            downloaded_classes,
+            &state_update.declared_sierra_classes,
+        )
+        .await?;
+        let t_declare = t_declare.elapsed();
+
+        // Download signature
+        let (signature_result, t_signature) = signature_handle
+            .await
+            .context("Joining signature task")?
+            .context("Task cancelled")?;
+        let (signature, t_signature) = match signature_result {
+            Ok(signature) => (signature, t_signature),
+            Err(SequencerError::StarknetError(err))
+                if err.code
+                    == starknet_gateway_types::error::KnownStarknetErrorCode::BlockNotFound
+                        .into() =>
+            {
+                // There is a race condition here: if the query for the signature was made
+                // _before_ the block was published -- but by the time we
+                // actually queried for the block it was there. In this case
+                // we just retry the signature download until we get it.
+                let t_signature = std::time::Instant::now();
+                let signature = loop {
+                    match sequencer.signature(next.into()).await {
+                        Ok(s) => {
+                            break s;
+                        }
+                        Err(SequencerError::StarknetError(err))
+                            if err.code
+                                == starknet_gateway_types::error::KnownStarknetErrorCode::BlockNotFound
+                                    .into() =>
+                        {
+                            // Wait a bit and retry
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        Err(err) => {
+                                            return Err(err)
+                            .context(format!("Fetch signature for block {next:?} from sequencer"))
+                        }
+                    }
+                };
+                (signature, t_signature.elapsed())
+            }
+            Err(err) => {
+                return Err(err)
+                    .context(format!("Fetch signature for block {next:?} from sequencer"))
+            }
+        };
+
+        // An extra sanity check for the signature API.
+        anyhow::ensure!(
+            block.block_hash == signature.block_hash,
+            "Signature block hash mismatch, actual {:x}, expected {:x}",
+            signature.block_hash.0,
+            block.block_hash.0,
+        );
+
+        // Check block commitment signature
+        let signature: BlockCommitmentSignature = signature.signature();
+        let (signature, state_update) = match block_validation_mode {
+            BlockValidationMode::Strict => {
+                let block_hash = block.block_hash;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rayon::spawn(move || {
+                    let verify_result = signature.verify(sequencer_public_key, block_hash);
+                    let _ = tx.send((verify_result, signature, state_update));
+                });
+                let (verify_result, signature, state_update) =
+                    rx.await.context("Panic on rayon thread")?;
+
+                if let Err(error) = verify_result {
+                    tracing::warn!(%error, block_number=%block.block_number, "Block commitment signature mismatch");
+                }
+                (signature, state_update)
+            }
+            BlockValidationMode::AllowMismatch => (signature, state_update),
+        };
+
+        head = Some((next, block.block_hash, state_update.state_commitment));
+        blocks.push(next, block.block_hash, state_update.state_commitment);
+
+        let timings = Timings {
+            block_download: t_block,
+            class_declaration: t_declare,
+            signature_download: t_signature,
+        };
+
+        tx_event
+            .send(SyncEvent::DownloadedBlock(
                 (block, commitments),
                 state_update,
                 Box::new(signature),
@@ -350,7 +698,7 @@ where
 pub async fn poll_latest(
     gateway: impl GatewayApi,
     interval: Duration,
-    sender: tokio::sync::watch::Sender<(BlockNumber, BlockHash)>,
+    sender: watch::Sender<(BlockNumber, BlockHash)>,
 ) {
     let mut interval = tokio::time::interval(interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -390,6 +738,8 @@ pub async fn download_new_classes(
     state_update: &StateUpdate,
     sequencer: &impl GatewayApi,
     storage: Storage,
+    compiler_resource_limits: pathfinder_compiler::ResourceLimits,
+    blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs,
     fetch_casm_from_fgw: bool,
 ) -> Result<Vec<DownloadedClass>, anyhow::Error> {
     let deployed_classes = state_update
@@ -444,9 +794,15 @@ pub async fn download_new_classes(
 
     let futures = require_downloading.into_iter().map(|class_hash| {
         async move {
-            download_class(sequencer, class_hash, fetch_casm_from_fgw)
-                .await
-                .with_context(|| format!("Downloading class {}", class_hash.0))
+            download_class(
+                sequencer,
+                class_hash,
+                compiler_resource_limits,
+                blockifier_libfuncs,
+                fetch_casm_from_fgw,
+            )
+            .await
+            .with_context(|| format!("Downloading class {}", class_hash.0))
         }
         .in_current_span()
     });
@@ -524,6 +880,20 @@ async fn download_block(
                 let state_update = Box::new(state_update);
                 let state_diff_length = state_update.state_diff_length();
 
+                // TODO Currently empty proposals used for consensus integration tests carry an
+                // empty state diff commitment.
+                #[cfg(all(
+                    feature = "p2p",
+                    feature = "consensus-integration-tests",
+                    debug_assertions
+                ))]
+                let state_diff_commitment =
+                    if block.state_diff_commitment == Some(StateDiffCommitment::ZERO) {
+                        StateDiffCommitment::ZERO
+                    } else {
+                        state_diff_commitment
+                    };
+
                 let block_number = block.block_number;
                 let verify_result = verify_gateway_block_commitments_and_hash(
                     &block,
@@ -571,11 +941,20 @@ async fn download_block(
             }
         }
         Err(SequencerError::StarknetError(err)) if err.code == BlockNotFound.into() => {
-            // We've queried past the head of the chain.
-            let (seq_head_number, seq_head_hash) = sequencer
-                .head()
-                .await
-                .context("Query sequencer for latest block")?;
+            // We've queried past the head of the chain or the genesis block is not yet
+            // available.
+            let (seq_head_number, seq_head_hash) = match sequencer.head().await {
+                Ok(x) => x,
+                Err(SequencerError::StarknetError(err)) if err.code == BlockNotFound.into() => {
+                    return Ok(DownloadBlock::Wait);
+                }
+                // head() retries on non starknet errors so any other starknet error code indicates
+                // a problem with the feeder gateway
+                Err(error) => {
+                    tracing::error!(%error, "Error fetching latest block from gateway");
+                    Err(error).context("Fetching latest block from gateway")?
+                }
+            };
 
             if seq_head_number >= block_number {
                 // We were ahead of the sequencer but in the meantime it has caught up to us. We
@@ -635,6 +1014,8 @@ where
         block_validation_mode,
         storage,
         sequencer_public_key,
+        compiler_resource_limits,
+        blockifier_libfuncs,
         fetch_concurrency,
         fetch_casm_from_fgw,
     } = context;
@@ -734,12 +1115,18 @@ where
                     .context("Verifying block contents")?;
 
                 let t_declare = std::time::Instant::now();
-                let downloaded_classes =
-                    download_new_classes(&state_update, &sequencer, storage, fetch_casm_from_fgw)
-                        .await
-                        .with_context(|| {
-                            format!("Handling newly declared classes for block {block_number:?}")
-                        })?;
+                let downloaded_classes = download_new_classes(
+                    &state_update,
+                    &sequencer,
+                    storage,
+                    compiler_resource_limits,
+                    blockifier_libfuncs,
+                    fetch_casm_from_fgw,
+                )
+                .await
+                .with_context(|| {
+                    format!("Handling newly declared classes for block {block_number:?}")
+                })?;
                 let t_declare = t_declare.elapsed();
 
                 let timings = Timings {
@@ -861,7 +1248,7 @@ where
                 .await?;
 
                 tx_event
-                    .send(SyncEvent::Block(
+                    .send(SyncEvent::DownloadedBlock(
                         (
                             Box::new(block),
                             (transaction_commitment, event_commitment, receipt_commitment),
@@ -1063,6 +1450,7 @@ fn verify_gateway_block_commitments_and_hash(
 
     let computed_transaction_commitment =
         calculate_transaction_commitment(&block.transactions, block.starknet_version)?;
+    let block_number = block.block_number;
 
     // Older blocks on mainnet don't carry a precalculated transaction commitment.
     if block.transaction_commitment == TransactionCommitment::ZERO {
@@ -1070,7 +1458,7 @@ fn verify_gateway_block_commitments_and_hash(
         // possible.
         header.transaction_commitment = computed_transaction_commitment;
     } else if computed_transaction_commitment != header.transaction_commitment {
-        tracing::debug!(%computed_transaction_commitment, actual_transaction_commitment=%header.transaction_commitment, "Transaction commitment mismatch");
+        tracing::debug!(%block_number, %computed_transaction_commitment, actual_transaction_commitment=%header.transaction_commitment, "Transaction commitment mismatch");
         return Ok(VerifyResult::Mismatch);
     }
 
@@ -1084,7 +1472,7 @@ fn verify_gateway_block_commitments_and_hash(
     // Older blocks on mainnet don't carry a precalculated receipt commitment.
     if let Some(receipt_commitment) = block.receipt_commitment {
         if computed_receipt_commitment != receipt_commitment {
-            tracing::debug!(%computed_receipt_commitment, actual_receipt_commitment=%receipt_commitment, "Receipt commitment mismatch");
+            tracing::debug!(%block_number, %computed_receipt_commitment, actual_receipt_commitment=%receipt_commitment, "Receipt commitment mismatch");
             return Ok(VerifyResult::Mismatch);
         }
     } else {
@@ -1098,6 +1486,7 @@ fn verify_gateway_block_commitments_and_hash(
         .iter()
         .map(|(receipt, events)| (receipt.transaction_hash, events.as_slice()))
         .collect::<Vec<_>>();
+
     let event_commitment =
         calculate_event_commitment(&events_with_tx_hashes, block.starknet_version)?;
 
@@ -1108,12 +1497,12 @@ fn verify_gateway_block_commitments_and_hash(
         // possible.
         header.event_commitment = event_commitment;
     } else if event_commitment != block.event_commitment {
-        tracing::debug!(computed_event_commitment=%event_commitment, actual_event_commitment=%block.event_commitment, "Event commitment mismatch");
+        tracing::debug!(%block_number, computed_event_commitment=%event_commitment, actual_event_commitment=%block.event_commitment, "Event commitment mismatch");
         return Ok(VerifyResult::Mismatch);
     }
 
     Ok(match verify_block_hash(header, chain, chain_id)? {
-        crate::state::block_hash::VerifyResult::Match => {
+        pathfinder_block_commitments::VerifyResult::Match => {
             // For pre-0.13.2 blocks we actually have to re-compute some commitments: after
             // we've verified that the block hash is correct we no longer need
             // the legacy commitments. The P2P protocol requires that all
@@ -1144,7 +1533,7 @@ fn verify_gateway_block_commitments_and_hash(
 
             VerifyResult::Match((transaction_commitment, event_commitment, receipt_commitment))
         }
-        crate::state::block_hash::VerifyResult::Mismatch => VerifyResult::Mismatch,
+        pathfinder_block_commitments::VerifyResult::Mismatch => VerifyResult::Mismatch,
     })
 }
 
@@ -1213,6 +1602,7 @@ mod tests {
         use std::sync::LazyLock;
 
         use assert_matches::assert_matches;
+        use pathfinder_common::class_definition::SerializedOpaqueClassDefinition;
         use pathfinder_common::macro_prelude::*;
         use pathfinder_common::prelude::*;
         use pathfinder_common::Chain;
@@ -1366,6 +1756,8 @@ mod tests {
                 block_validation_mode: MODE,
                 storage,
                 sequencer_public_key: PublicKey::ZERO,
+                compiler_resource_limits: pathfinder_compiler::ResourceLimits::for_test(),
+                blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs::default(),
                 fetch_concurrency: std::num::NonZeroUsize::new(1).unwrap(),
                 fetch_casm_from_fgw: false,
             };
@@ -1408,6 +1800,8 @@ mod tests {
                 block_validation_mode: MODE,
                 storage,
                 sequencer_public_key: PublicKey::ZERO,
+                compiler_resource_limits: pathfinder_compiler::ResourceLimits::for_test(),
+                blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs::default(),
                 fetch_concurrency: std::num::NonZeroUsize::new(1).unwrap(),
                 fetch_casm_from_fgw: false,
             };
@@ -1439,6 +1833,8 @@ mod tests {
                 storage,
                 sequencer_public_key: PublicKey::ZERO,
                 fetch_concurrency: std::num::NonZeroUsize::new(2).unwrap(),
+                compiler_resource_limits: pathfinder_compiler::ResourceLimits::for_test(),
+                blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs::default(),
                 fetch_casm_from_fgw: false,
             };
 
@@ -1458,12 +1854,15 @@ mod tests {
             })
         }
 
-        static CONTRACT0_DEF: LazyLock<bytes::Bytes> =
-            LazyLock::new(|| format!("{DEF0}0{DEF1}").into());
-        static CONTRACT0_DEF_V2: LazyLock<bytes::Bytes> =
-            LazyLock::new(|| format!("{DEF0}0 v2{DEF1}").into());
-        static CONTRACT1_DEF: LazyLock<bytes::Bytes> =
-            LazyLock::new(|| format!("{DEF0}1{DEF1}").into());
+        static CONTRACT0_DEF: LazyLock<SerializedOpaqueClassDefinition> = LazyLock::new(|| {
+            SerializedOpaqueClassDefinition::from_bytes(format!("{DEF0}0{DEF1}").into_bytes())
+        });
+        static CONTRACT0_DEF_V2: LazyLock<SerializedOpaqueClassDefinition> = LazyLock::new(|| {
+            SerializedOpaqueClassDefinition::from_bytes(format!("{DEF0}0 v2{DEF1}").into_bytes())
+        });
+        static CONTRACT1_DEF: LazyLock<SerializedOpaqueClassDefinition> = LazyLock::new(|| {
+            SerializedOpaqueClassDefinition::from_bytes(format!("{DEF0}1{DEF1}").into_bytes())
+        });
 
         static BLOCK0: LazyLock<reply::Block> = LazyLock::new(|| reply::Block {
             block_hash: BLOCK0_HASH,
@@ -1739,36 +2138,36 @@ mod tests {
             mock: &mut MockGatewayApi,
             seq: &mut mockall::Sequence,
             class_hash: ClassHash,
-            returned_result: Result<bytes::Bytes, SequencerError>,
+            returned_result: Result<SerializedOpaqueClassDefinition, SequencerError>,
         ) {
-            mock.expect_pending_class_by_hash()
-                .withf(move |x| x == &class_hash)
+            mock.expect_class_by_hash()
+                .withf(move |x, _| x == &class_hash)
                 .times(1)
                 .in_sequence(seq)
-                .return_once(|_| returned_result);
+                .return_once(|_, _| returned_result);
         }
 
         /// Convenience wrapper
         fn expect_class_by_hash_no_sequence(
             mock: &mut MockGatewayApi,
             class_hash: ClassHash,
-            returned_result: Result<bytes::Bytes, SequencerError>,
+            returned_result: Result<SerializedOpaqueClassDefinition, SequencerError>,
         ) {
-            mock.expect_pending_class_by_hash()
-                .withf(move |x| x == &class_hash)
+            mock.expect_class_by_hash()
+                .withf(move |x, _| x == &class_hash)
                 .times(1)
-                .return_once(|_| returned_result);
+                .return_once(|_, _| returned_result);
         }
 
         fn expect_class_by_hash_no_sequence_at_most_once(
             mock: &mut MockGatewayApi,
             class_hash: ClassHash,
-            returned_result: Result<bytes::Bytes, SequencerError>,
+            returned_result: Result<SerializedOpaqueClassDefinition, SequencerError>,
         ) {
-            mock.expect_pending_class_by_hash()
-                .withf(move |x| x == &class_hash)
+            mock.expect_class_by_hash()
+                .withf(move |x, _| x == &class_hash)
                 .times(..=1)
-                .return_once(|_| returned_result);
+                .return_once(|_, _| returned_result);
         }
 
         /// Convenience wrapper
@@ -1869,7 +2268,7 @@ mod tests {
                     SyncEvent::CairoClass { hash, .. } => {
                         assert_eq!(hash, CONTRACT0_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, signature, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, signature, _, _) => {
                     assert_eq!(*block, *BLOCK0);
                     assert_eq_sorted!(*state_update, *STATE_UPDATE0);
                     // assert_eq!(*signature, BLOCK0_COMMITMENT_SIGNATURE);
@@ -1879,7 +2278,7 @@ mod tests {
                     SyncEvent::CairoClass { hash, .. } => {
                     assert_eq!(hash, CONTRACT1_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, signature, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, signature, _, _) => {
                     assert_eq!(*block, *BLOCK1);
                     assert_eq_sorted!(*state_update, *STATE_UPDATE1);
                     // assert_eq!(*signature, BLOCK1_COMMITMENT_SIGNATURE);
@@ -1947,6 +2346,8 @@ mod tests {
                     )
                     .unwrap(),
                     sequencer_public_key: PublicKey::ZERO,
+                    compiler_resource_limits: pathfinder_compiler::ResourceLimits::for_test(),
+                    blockifier_libfuncs: pathfinder_compiler::BlockifierLibfuncs::default(),
                     fetch_concurrency: std::num::NonZeroUsize::new(1).unwrap(),
                     fetch_casm_from_fgw: false,
                 };
@@ -1967,7 +2368,7 @@ mod tests {
                 SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT1_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK1);
                     assert_eq!(*state_update, *STATE_UPDATE1);
                 });
@@ -2133,7 +2534,7 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT0_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK0);
                     assert_eq!(*state_update, *STATE_UPDATE0);
                 });
@@ -2141,7 +2542,7 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT1_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK1);
                     assert_eq!(*state_update, *STATE_UPDATE1);
                 });
@@ -2151,7 +2552,7 @@ mod tests {
                 latest_tx.send((BLOCK2_NUMBER, BLOCK2_HASH)).unwrap();
 
                 assert_matches!(rx_event.recv().await.unwrap(),
-                SyncEvent::Block((block, _), state_update, _, _, _) => {
+                SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK2);
                     assert_eq!(*state_update, *STATE_UPDATE2);
                 });
@@ -2273,7 +2674,7 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT0_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK0);
                     assert_eq_sorted!(*state_update, *STATE_UPDATE0);
                 });
@@ -2285,7 +2686,7 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT0_HASH_V2);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK0_V2);
                     assert_eq_sorted!(*state_update, *STATE_UPDATE0_V2);
                 });
@@ -2504,7 +2905,7 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT0_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK0);
                     assert_eq!(*state_update, *STATE_UPDATE0);
                     insert_block_header(&storage, *block);
@@ -2513,12 +2914,12 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT1_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK1);
                     assert_eq!(*state_update, *STATE_UPDATE1);
                     insert_block_header(&storage, *block);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK2);
                     assert_eq!(*state_update, *STATE_UPDATE2);
                     insert_block_header(&storage, *block);
@@ -2542,12 +2943,12 @@ mod tests {
                     .send((block1_v2.block_number, block1_v2.block_hash))
                     .unwrap();
 
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK0_V2);
                     assert_eq!(*state_update, *STATE_UPDATE0_V2);
                     insert_block_header(&storage, *block);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, block1_v2);
                     assert!(state_update.contract_updates.is_empty());
                     insert_block_header(&storage, *block);
@@ -2847,7 +3248,7 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT0_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK0);
                     assert_eq!(*state_update, *STATE_UPDATE0);
                     insert_block_header(&storage, *block);
@@ -2856,17 +3257,17 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT1_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK1);
                     assert_eq!(*state_update, *STATE_UPDATE1);
                     insert_block_header(&storage, *block);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK2);
                     assert_eq!(*state_update, *STATE_UPDATE2);
                     insert_block_header(&storage, *block);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, block3);
                     assert_eq!(*state_update, *STATE_UPDATE3);
                     insert_block_header(&storage, *block);
@@ -2884,12 +3285,12 @@ mod tests {
                     l2_reorg(&tx, tail).unwrap();
                     tx.commit().unwrap();
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, block1_v2);
                     assert_eq!(*state_update, *STATE_UPDATE1_V2);
                     insert_block_header(&storage, *block);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, block2_v2);
                     assert_eq!(*state_update, *STATE_UPDATE2_V2);
                     insert_block_header(&storage, *block);
@@ -3079,7 +3480,7 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT0_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK0);
                     assert_eq!(*state_update, *STATE_UPDATE0);
                 });
@@ -3087,11 +3488,11 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT1_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK1);
                     assert_eq!(*state_update, *STATE_UPDATE1);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK2);
                     assert_eq!(*state_update, *STATE_UPDATE2);
                 });
@@ -3104,7 +3505,7 @@ mod tests {
                 assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Reorg(tail) => {
                     assert_eq!(tail, BLOCK2_NUMBER);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, block2_v2);
                     assert_eq!(*state_update, *STATE_UPDATE2_V2);
                 });
@@ -3309,7 +3710,7 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT0_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK0);
                     assert_eq!(*state_update, *STATE_UPDATE0);
                 });
@@ -3317,7 +3718,7 @@ mod tests {
                     SyncEvent::CairoClass{hash, ..} => {
                         assert_eq!(hash, CONTRACT1_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, *BLOCK1);
                     assert_eq!(*state_update, *STATE_UPDATE1);
                 });
@@ -3325,11 +3726,11 @@ mod tests {
                 assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Reorg(tail) => {
                     assert_eq!(tail, BLOCK1_NUMBER);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, block1_v2);
                     assert_eq!(*state_update, *STATE_UPDATE1_V2);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, _, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, _, _, _) => {
                     assert_eq!(*block, block2);
                     assert_eq!(*state_update, *STATE_UPDATE2);
                 });
@@ -3428,7 +3829,7 @@ mod tests {
                     SyncEvent::CairoClass { hash, .. } => {
                         assert_eq!(hash, CONTRACT0_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, signature, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, signature, _, _) => {
                     assert_eq!(*block, *BLOCK0);
                     assert_eq_sorted!(*state_update, *STATE_UPDATE0);
                     assert_eq!(*signature, BLOCK0_SIGNATURE.signature());
@@ -3437,7 +3838,7 @@ mod tests {
                     SyncEvent::CairoClass { hash, .. } => {
                     assert_eq!(hash, CONTRACT1_HASH);
                 });
-                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::Block((block, _), state_update, signature, _, _) => {
+                assert_matches!(rx_event.recv().await.unwrap(), SyncEvent::DownloadedBlock((block, _), state_update, signature, _, _) => {
                     assert_eq!(*block, *BLOCK1);
                     assert_eq_sorted!(*state_update, *STATE_UPDATE1);
                     assert_eq!(*signature, BLOCK1_SIGNATURE.signature());
