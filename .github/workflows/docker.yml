@@ -16,9 +16,72 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
+  manual-build-image:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    env:
+      BLACKSMITH_DOCKER_CACHE_KEY: ${{ github.repository }}-docker-pathfinder
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Generate version
+        id: generate_version
+        run: |
+          git fetch --force --tags https://github.com/eqlabs/pathfinder.git 'refs/tags/v*:refs/tags/v*'
+          echo -n "pathfinder_version=" >> "$GITHUB_OUTPUT"
+          git describe --tags --dirty --always >> "$GITHUB_OUTPUT"
+
+      - name: Tags
+        id: tag
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/pathfinder"
+          SHA=$(git rev-parse --short=7 "$GITHUB_SHA")
+          MANUAL_SHA="$IMAGE:manual-$SHA"
+          TAGS="$MANUAL_SHA"
+
+          echo "manual-sha=$MANUAL_SHA" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            MANUAL_LATEST="$IMAGE:manual-latest"
+            echo "manual-latest=$MANUAL_LATEST" >> "$GITHUB_OUTPUT"
+            TAGS="$TAGS"$'\n'"$MANUAL_LATEST"
+          fi
+
+          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$TAGS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: useblacksmith/setup-docker-builder@v1
+        env:
+          GITHUB_REPO_NAME: ${{ env.BLACKSMITH_DOCKER_CACHE_KEY }}
+
+      - name: Build Docker Image and Publish
+        uses: useblacksmith/build-push-action@v2
+        env:
+          GITHUB_REPO_NAME: ${{ env.BLACKSMITH_DOCKER_CACHE_KEY }}
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            PATHFINDER_FORCE_VERSION=${{ steps.generate_version.outputs.pathfinder_version }}
+          tags: ${{ steps.tag.outputs.tags }}
+
   # Build a docker image unless this was triggered by a release.
   build-image:
-    if: github.event_name != 'release'
+    if: github.event_name == 'push'
     runs-on: pathfinder-large-ubuntu
     steps:
       - name: Determine Docker image metadata
