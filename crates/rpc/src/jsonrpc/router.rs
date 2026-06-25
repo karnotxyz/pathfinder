@@ -23,6 +23,20 @@ mod subscription;
 
 pub use method::handle_json_rpc_body;
 
+const SNOS_RPC_METHOD_DURATION_SECONDS: &str = "pathfinder_snos_rpc_method_duration_seconds";
+const SNOS_RPC_METHODS: &[&str] = &[
+    "starknet_chainId",
+    "starknet_getBlockWithReceipts",
+    "starknet_getBlockWithTxHashes",
+    "starknet_getBlockWithTxs",
+    "starknet_getClass",
+    "starknet_getClassHashAt",
+    "starknet_getNonce",
+    "starknet_getStateUpdate",
+    "starknet_getStorageAt",
+    "starknet_getStorageProof",
+];
+
 #[derive(Clone)]
 pub struct RpcRouter {
     pub context: RpcContext,
@@ -134,6 +148,7 @@ impl RpcRouter {
         let result = std::panic::AssertUnwindSafe(method).catch_unwind().await;
 
         let duration = start.elapsed();
+        record_snos_rpc_method_duration(method_name, duration);
         metrics::histogram!("rpc_method_calls_duration_milliseconds", "method" => method_name, "version" => self.version.to_str()).record(duration.as_millis() as f64);
 
         let output = match result {
@@ -156,6 +171,15 @@ impl RpcRouter {
             version: self.version,
         })
     }
+}
+
+fn record_snos_rpc_method_duration(method_name: &'static str, duration: std::time::Duration) {
+    if !SNOS_RPC_METHODS.contains(&method_name) {
+        return;
+    }
+
+    metrics::histogram!(SNOS_RPC_METHOD_DURATION_SECONDS, "method" => method_name)
+        .record(duration.as_secs_f64());
 }
 
 // A slight variation on the axum json extractor.
