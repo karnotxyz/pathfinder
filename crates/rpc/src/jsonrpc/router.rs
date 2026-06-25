@@ -25,9 +25,16 @@ pub use method::handle_json_rpc_body;
 
 const SNOS_RPC_METHOD_DURATION_SECONDS: &str = "pathfinder_snos_rpc_method_duration_seconds";
 const SNOS_RPC_METHODS: &[&str] = &[
-    "starknet_getStorageProof",
+    "starknet_chainId",
+    "starknet_getBlockWithReceipts",
+    "starknet_getBlockWithTxHashes",
+    "starknet_getBlockWithTxs",
     "starknet_getClass",
     "starknet_getClassHashAt",
+    "starknet_getNonce",
+    "starknet_getStateUpdate",
+    "starknet_getStorageAt",
+    "starknet_getStorageProof",
 ];
 
 #[derive(Clone)]
