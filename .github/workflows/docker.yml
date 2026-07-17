@@ -19,7 +19,7 @@ jobs:
   # Build a docker image unless this was triggered by a release.
   build-image:
     if: github.event_name != 'release'
-    runs-on: pathfinder-large-ubuntu
+    runs-on: blacksmith-8vcpu-ubuntu-2204
     steps:
       - name: Determine Docker image metadata
         id: meta
