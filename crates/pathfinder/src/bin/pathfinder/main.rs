@@ -288,6 +288,7 @@ Hint: This is usually caused by exceeding the file descriptor limit of your syst
             address,
             readiness.clone(),
             sync_state.clone(),
+            config.ready_synced_block_tolerance.get(),
             &config.data_directory,
         )
         .await
@@ -817,6 +818,7 @@ async fn spawn_monitoring(
     address: SocketAddr,
     readiness: Arc<AtomicBool>,
     sync_state: Arc<SyncState>,
+    ready_synced_block_tolerance: u64,
     data_directory: &Path,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let prometheus_handle = PrometheusBuilder::new()
@@ -838,6 +840,7 @@ async fn spawn_monitoring(
         readiness,
         sync_state,
         prometheus_handle,
+        ready_synced_block_tolerance,
         data_directory,
     )
     .await?;

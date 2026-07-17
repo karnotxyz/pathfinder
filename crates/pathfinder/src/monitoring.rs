@@ -13,6 +13,7 @@ struct State {
     readiness: Arc<AtomicBool>,
     sync: Arc<SyncState>,
     prometheus: PrometheusHandle,
+    ready_synced_block_tolerance: u64,
 }
 
 /// Spawns a server which hosts a `/health` endpoint.
@@ -21,6 +22,7 @@ pub async fn spawn_server(
     readiness: Arc<AtomicBool>,
     sync_state: Arc<SyncState>,
     prometheus_handle: PrometheusHandle,
+    ready_synced_block_tolerance: u64,
     data_directory: &Path,
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let app = axum::Router::new()
@@ -32,6 +34,7 @@ pub async fn spawn_server(
             readiness,
             sync: sync_state,
             prometheus: prometheus_handle,
+            ready_synced_block_tolerance,
         });
     let listener = tokio::net::TcpListener::bind(addr.into()).await?;
     let addr = listener.local_addr()?;
@@ -70,7 +73,8 @@ async fn synced_route(
     let status = { state.sync.status.read().await.clone() };
     match status {
         Syncing::Status(status)
-            if status.highest.number.get() - status.current.number.get() < 6 =>
+            if status.highest.number.get() - status.current.number.get()
+                < state.ready_synced_block_tolerance =>
         {
             http::StatusCode::OK
         }
@@ -120,6 +124,7 @@ mod tests {
             readiness.clone(),
             Default::default(),
             handle,
+            6,
             &PathBuf::default(),
         )
         .await
@@ -141,6 +146,7 @@ mod tests {
             readiness.clone(),
             Default::default(),
             handle,
+            6,
             &PathBuf::default(),
         )
         .await
@@ -162,7 +168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synced() {
+    async fn synced_respects_configured_block_tolerance() {
         let readiness = Arc::new(AtomicBool::new(false));
         let handle = PrometheusBuilder::new().build_recorder().handle();
         let sync_state = Arc::new(SyncState {
@@ -173,6 +179,7 @@ mod tests {
             readiness.clone(),
             sync_state.clone(),
             handle,
+            100,
             &PathBuf::default(),
         )
         .await
@@ -199,7 +206,7 @@ mod tests {
             },
             current: NumberedBlock {
                 hash: Default::default(),
-                number: BlockNumber::new_or_panic(1),
+                number: BlockNumber::new_or_panic(0),
             },
             highest: NumberedBlock {
                 hash: Default::default(),
@@ -216,7 +223,7 @@ mod tests {
             },
             current: NumberedBlock {
                 hash: Default::default(),
-                number: BlockNumber::new_or_panic(98),
+                number: BlockNumber::new_or_panic(1),
             },
             highest: NumberedBlock {
                 hash: Default::default(),
@@ -246,6 +253,7 @@ mod tests {
             readiness.clone(),
             Default::default(),
             handle,
+            6,
             &PathBuf::default(),
         )
         .await
