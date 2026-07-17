@@ -5,6 +5,11 @@ name: Docker
 
 on:
   workflow_dispatch:
+    inputs:
+      pathfinder_force_version:
+        description: 'Set version for pathfinder via PATHFINDER_FORCE_VERSION (defaults to `git describe --tags --dirty`)'
+        type: string
+        default: ''
   push:
     tags:
       - 'v*'
@@ -15,32 +20,36 @@ env:
   # Workaround for https://github.com/rust-lang/cargo/issues/8719#issuecomment-1516492970
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   # Build a docker image unless this was triggered by a release.
   build-image:
     if: github.event_name != 'release'
-    runs-on: pathfinder-large-ubuntu
+    runs-on: blacksmith-8vcpu-ubuntu-2204
     steps:
       - name: Determine Docker image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: eqlabs/pathfinder
+          images: ghcr.io/karnotxyz/pathfinder
       - name: Checkout sources
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Generate version
         id: generate_version
+        env:
+          PATHFINDER_FORCE_VERSION: ${{ inputs.pathfinder_force_version }}
         run: |
-          echo -n "pathfinder_version=" >> $GITHUB_OUTPUT
-          git describe --tags --dirty >> $GITHUB_OUTPUT
-      - name: Set up QEMU
-        id: qemu
-        uses: docker/setup-qemu-action@v3
-        with:
-          image: tonistiigi/binfmt:latest
-          platforms: all
+          if [ -n "$PATHFINDER_FORCE_VERSION" ]; then
+            echo "pathfinder_version=$PATHFINDER_FORCE_VERSION" >> $GITHUB_OUTPUT
+          else
+            echo -n "pathfinder_version=" >> $GITHUB_OUTPUT
+            git describe --tags --dirty >> $GITHUB_OUTPUT
+          fi
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
@@ -48,11 +57,12 @@ jobs:
           buildkitd-config-inline: |
             [worker.oci]
               max-parallelism = 4
-      - name: Login to Docker Hub
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       # Required for git security reasons. See https://github.com/rustyhorde/vergen/pull/126#issuecomment-1201088162
       - name: Vergen git safe directory
         run: git config --global --add safe.directory /workspace
@@ -61,16 +71,14 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: |
-            linux/amd64
-            linux/arm64
+          platforms: linux/amd64
           file: ./Dockerfile
           build-args: |
             PATHFINDER_FORCE_VERSION=${{ steps.generate_version.outputs.pathfinder_version }}
           builder: ${{ steps.buildx.outputs.name }}
           push: true
           labels: ${{ steps.meta.outputs.labels }}
-          tags: eqlabs/pathfinder:snapshot-${{ github.sha }}
+          tags: ghcr.io/karnotxyz/pathfinder:snapshot-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -79,14 +87,15 @@ jobs:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
-      - name: Login to Docker Hub
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Tag image with release name
-        run: docker buildx imagetools create -t eqlabs/pathfinder:${{ github.event.release.tag_name }} eqlabs/pathfinder:snapshot-${{ github.sha }}
+        run: docker buildx imagetools create -t ghcr.io/karnotxyz/pathfinder:${{ github.event.release.tag_name }} ghcr.io/karnotxyz/pathfinder:snapshot-${{ github.sha }}
         # Only tag the image as 'latest' if its a release i.e. not a prerelease.
       - name: Tag image with 'latest'
         if: ${{ !github.event.release.prerelease }}
-        run: docker buildx imagetools create -t eqlabs/pathfinder:latest eqlabs/pathfinder:snapshot-${{ github.sha }}
+        run: docker buildx imagetools create -t ghcr.io/karnotxyz/pathfinder:latest ghcr.io/karnotxyz/pathfinder:snapshot-${{ github.sha }}

@@ -195,6 +195,15 @@ Examples:
     )]
     monitor_address: Option<SocketAddr>,
 
+    #[arg(
+        long = "monitor.ready-synced-block-tolerance",
+        long_help = "The /ready/synced endpoint returns ready when Pathfinder is fewer than this \
+                     many blocks behind the network tip",
+        default_value = "6",
+        env = "PATHFINDER_READY_SYNCED_BLOCK_TOLERANCE"
+    )]
+    ready_synced_block_tolerance: NonZeroU64,
+
     #[clap(flatten)]
     network: NetworkCli,
 
@@ -1058,6 +1067,7 @@ pub struct Config {
     pub rpc_root_version: RootRpcVersion,
     pub websocket: WebsocketConfig,
     pub monitor_address: Option<SocketAddr>,
+    pub ready_synced_block_tolerance: NonZeroU64,
     pub network: Option<NetworkConfig>,
     pub execution_concurrency: Option<std::num::NonZeroU32>,
     pub sqlite_wal: JournalMode,
@@ -1350,6 +1360,7 @@ impl Config {
             rpc_root_version: args.rpc_root_version,
             websocket: args.websocket,
             monitor_address: args.monitor_address,
+            ready_synced_block_tolerance: args.ready_synced_block_tolerance,
             network,
             execution_concurrency: args.execution_concurrency,
             sqlite_wal: match args.sqlite_wal {
