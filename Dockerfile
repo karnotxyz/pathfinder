@@ -21,6 +21,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM --platform=$BUILDPLATFORM cargo-chef AS rust-builder
 ARG CARGO_EXTRA_ARGS
 ARG TARGETARCH
+# Avoid SQLite's shared page-cache group mutex. Apply during both dependency
+# compilation and the final build; retain SQLite's existing thread-safety mode.
+ENV LIBSQLITE3_FLAGS="-USQLITE_ENABLE_MEMORY_MANAGEMENT"
 COPY ./build/prepare.sh prepare.sh
 RUN TARGETARCH=${TARGETARCH} ./prepare.sh
 
@@ -51,6 +54,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certi
 RUN groupadd --gid 1000 pathfinder && useradd --no-log-init --uid 1000 --gid pathfinder --no-create-home pathfinder
 
 COPY --from=rust-builder /usr/src/pathfinder/pathfinder-${TARGETARCH} /usr/local/bin/pathfinder
+
+# Check the linked SQLite compile-option strings before publishing the image.
+RUN strings /usr/local/bin/pathfinder > /tmp/pathfinder-strings \
+    && ! grep -Fxq 'ENABLE_MEMORY_MANAGEMENT' /tmp/pathfinder-strings \
+    && grep -Fxq 'THREADSAFE=1' /tmp/pathfinder-strings \
+    && rm /tmp/pathfinder-strings
 
 # Hack to enable `ld` link with glibc without the libc6-dev package being installed
 RUN if [ "${TARGETARCH}" = "amd64" ]; then ln -s /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libc.so; fi
