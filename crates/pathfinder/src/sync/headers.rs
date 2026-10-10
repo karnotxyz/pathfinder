@@ -238,6 +238,7 @@ impl VerifyHashAndSignature {
             if computed_hash == expected_hash {
                 true
             } else {
+                metrics::counter!("pathfinder_block_hash_mismatch_total").increment(1);
                 tracing::debug!(block_number=%header.number, expected_block_hash=%expected_hash, actual_block_hash=%computed_hash, "Block hash mismatch");
                 false
             }
