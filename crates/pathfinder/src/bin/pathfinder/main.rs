@@ -882,6 +882,9 @@ async fn spawn_monitoring(
         .install_recorder()
         .context("Creating Prometheus recorder")?;
 
+    // Initialize rare-event counters so the first occurrence has a zero baseline
+    // for Prometheus `increase()` alerts.
+    metrics::counter!("pathfinder_block_hash_mismatch_total").increment(0);
     metrics::gauge!("pathfinder_build_info", "version" => pathfinder_version::VERSION).set(1.0);
 
     match SystemTime::now().duration_since(UNIX_EPOCH) {
