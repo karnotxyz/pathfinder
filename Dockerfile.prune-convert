@@ -4,7 +4,7 @@ FROM --platform=$TARGETPLATFORM lukemathwalker/cargo-chef:0.1.73-rust-1.91.1-sli
 WORKDIR /usr/src/pathfinder
 
 FROM chef AS planner
-COPY --exclude=rust-toolchain.toml . .
+COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -17,7 +17,7 @@ COPY --from=planner /usr/src/pathfinder/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json \
     --package pathfinder-prune-converter \
     --bin pathfinder-prune-convert
-COPY --exclude=rust-toolchain.toml . .
+COPY . .
 RUN cargo build --locked --release \
     --package pathfinder-prune-converter \
     --bin pathfinder-prune-convert \
