@@ -140,6 +140,16 @@ impl Transaction<'_> {
         )
     }
 
+    /// Atomically records progress for the offline archive converter in the
+    /// same SQLite transaction as the trie update it describes.
+    pub fn set_archive_conversion_checkpoint(&self, block: BlockNumber) -> anyhow::Result<()> {
+        self.inner().execute(
+            "UPDATE archive_conversion SET value=? WHERE key='last_replayed'",
+            [block.get().to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Store the in-memory [`Storage`](crate::Storage) state in the database.
     /// To be performed on shutdown.
     pub fn store_in_memory_state(self) -> anyhow::Result<()> {

@@ -8703,6 +8703,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathfinder-prune-converter"
+version = "0.22.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jemallocator",
+ "pathfinder-common",
+ "pathfinder-merkle-tree",
+ "pathfinder-storage",
+ "rusqlite",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pathfinder-retry"
 version = "0.22.2"
 dependencies = [

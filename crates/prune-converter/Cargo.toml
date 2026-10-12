@@ -1,0 +1,26 @@
+[package]
+name = "pathfinder-prune-converter"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+publish = false
+
+[[bin]]
+name = "pathfinder-prune-convert"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive", "env", "wrap_help"] }
+jemallocator = { workspace = true }
+pathfinder-common = { path = "../common" }
+pathfinder-merkle-tree = { path = "../merkle-tree" }
+pathfinder-storage = { path = "../storage" }
+rusqlite = { workspace = true, features = ["bundled"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time", "ansi"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

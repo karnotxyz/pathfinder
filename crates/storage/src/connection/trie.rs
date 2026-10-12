@@ -869,7 +869,11 @@ impl StoredNode {
         bincode::encode_into_slice(helper, buffer, Self::CODEC_CFG)
     }
 
-    fn decode(data: &[u8]) -> Result<Self, bincode::error::DecodeError> {
+    /// Decodes the on-disk representation of a trie node.
+    ///
+    /// This is public for offline database maintenance tools. Runtime code
+    /// should normally use the typed trie accessors on [`Transaction`].
+    pub fn decode(data: &[u8]) -> Result<Self, bincode::error::DecodeError> {
         let helper = bincode::borrow_decode_from_slice(data, Self::CODEC_CFG)?;
 
         let node = match helper.0 {
@@ -894,6 +898,15 @@ impl StoredNode {
         };
 
         Ok(node)
+    }
+
+    /// Returns the persisted child indices referenced by this node.
+    pub fn children(&self) -> [Option<TrieStorageIndex>; 2] {
+        match self {
+            Self::Binary { left, right } => [Some(*left), Some(*right)],
+            Self::Edge { child, .. } => [Some(*child), None],
+            Self::LeafBinary | Self::LeafEdge { .. } => [None, None],
+        }
     }
 }
 

@@ -1,0 +1,38 @@
+name: Build archive-to-pruned converter
+
+on:
+  push:
+    branches:
+      - codex/archive-to-pruned-converter
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push converter
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.prune-convert
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/karnotxyz/pathfinder:prune-converter-0c292158-20261012
+          cache-from: type=gha,scope=archive-to-pruned-converter
+          cache-to: type=gha,mode=max,scope=archive-to-pruned-converter
