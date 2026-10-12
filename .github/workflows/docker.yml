@@ -72,13 +72,13 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          file: ./Dockerfile.prune-convert
+          file: ./Dockerfile
           build-args: |
             PATHFINDER_FORCE_VERSION=${{ steps.generate_version.outputs.pathfinder_version }}
           builder: ${{ steps.buildx.outputs.name }}
           push: true
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ghcr.io/karnotxyz/pathfinder:prune-converter-0c292158-20261012
+          tags: ghcr.io/karnotxyz/pathfinder:snapshot-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
